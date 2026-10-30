@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -99,6 +100,62 @@ type PostgresCollector struct {
 }
 
 type Option func(*PostgresCollector) error
+
+// clusterScopedCollectors names the collectors whose data is a property of the
+// cluster rather than of the database the exporter happens to be connected to:
+// the same connection returns the same answer from any database. Collecting
+// them once per database duplicates them for no new information.
+//
+// Only the cluster set is listed. Everything else is treated as database-scoped
+// by DatabaseScopedCollectors, which is the safe direction for the default: a
+// collector added later and forgotten here is collected once per database,
+// which is redundant, rather than once per cluster, which would silently lose
+// that collector's data for every database but one.
+var clusterScopedCollectors = map[string]bool{
+	"database":                  true, // pg_database
+	"database_wraparound":       true, // pg_database
+	"locks":                     true, // pg_locks, reports every database
+	"long_running_transactions": true, // pg_stat_activity
+	"postmaster":                true, // pg_postmaster_start_time()
+	"process_idle":              true, // pg_stat_activity
+	"replication":               true, // pg_is_in_recovery()
+	"replication_slot":          true, // pg_replication_slots
+	"stat_activity_autovacuum":  true, // pg_stat_activity
+	"stat_bgwriter":             true, // pg_stat_bgwriter, pg_stat_checkpointer
+	"stat_database":             true, // pg_stat_database, reports every database
+	"stat_io":                   true, // pg_stat_io
+	"stat_statements":           true, // joins pg_database on dbid, reports every database
+	"stat_wal_receiver":         true, // pg_stat_wal_receiver
+	"wal":                       true, // pg_ls_waldir()
+}
+
+// scopedCollectors returns the enabled collectors on the requested side of that
+// split. Disabled collectors are left out rather than reported as an error: a
+// group is a request for "whatever of this kind you have", unlike naming a
+// collector explicitly, which should say so if it is turned off.
+func scopedCollectors(cluster bool) []string {
+	var names []string
+	for name, enabled := range collectorState {
+		if enabled == nil || !*enabled {
+			continue
+		}
+		if clusterScopedCollectors[name] == cluster {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ClusterScopedCollectors returns the enabled collectors whose data is the same
+// from any database in the cluster, so they only need collecting once per
+// server however many databases are being monitored.
+func ClusterScopedCollectors() []string { return scopedCollectors(true) }
+
+// DatabaseScopedCollectors returns the enabled collectors whose data depends on
+// which database the exporter is connected to, and which therefore have to be
+// collected once per database.
+func DatabaseScopedCollectors() []string { return scopedCollectors(false) }
 
 // NewPostgresCollector creates a new PostgresCollector.
 func NewPostgresCollector(logger log.Logger, excludeDatabases []string, dsn string, filters []string, options ...Option) (*PostgresCollector, error) {

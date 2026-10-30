@@ -57,33 +57,18 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		filters := r.URL.Query()["collect[]"]
 		level.Debug(logger).Log("msg", "Collect query", "filters", filters)
 
-		var f Filters
-		if len(filters) == 0 {
-			f.EnableAllCollectors = true
-		} else {
-			for _, filter := range filters {
-				switch filter {
-				case "standard.process":
-					f.EnableProcessCollector = true
-				case "standard.go":
-					f.EnableGoCollector = true
-				case "version":
-					f.EnableVersionCollector = true
-				case "exporter":
-					f.EnableDefaultCollector = true
-				case "custom_query.hr":
-					f.EnableHRCollector = true
-				case "custom_query.mr":
-					f.EnableMRCollector = true
-				case "custom_query.lr":
-					f.EnableLRCollector = true
-				case "postgres":
-					f.EnablePostgresCollector = true
-				}
-			}
-		}
+		f := parseCollectFilters(filters)
 
-		registry := makeRegistry(ctx, dsns, connSema, globalCollectors, f)
+		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f)
+		// Only a per-collector selection turns this into a client error: the
+		// name came from the request, so a typo should be visible as a 400
+		// rather than a successful scrape with no metrics in it. Every other
+		// failure keeps the previous behaviour of logging and serving what
+		// could be built.
+		if err != nil && len(f.PostgresCollectors) > 0 {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
 		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
@@ -93,6 +78,55 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 
 		h.ServeHTTP(w, r)
 	})
+}
+
+// parseCollectFilters turns the collect[] query parameters into a Filters.
+// An empty selection means "everything", matching the behaviour of a scrape
+// that passes no collect[] at all.
+func parseCollectFilters(filters []string) Filters {
+	var f Filters
+	if len(filters) == 0 {
+		f.EnableAllCollectors = true
+		return f
+	}
+	for _, filter := range filters {
+		switch filter {
+		case "standard.process":
+			f.EnableProcessCollector = true
+		case "standard.go":
+			f.EnableGoCollector = true
+		case "version":
+			f.EnableVersionCollector = true
+		case "exporter":
+			f.EnableDefaultCollector = true
+		case "custom_query.hr":
+			f.EnableHRCollector = true
+		case "custom_query.mr":
+			f.EnableMRCollector = true
+		case "custom_query.lr":
+			f.EnableLRCollector = true
+		case "postgres":
+			f.EnablePostgresCollector = true
+		case "postgres.cluster":
+			// Collectors whose data is the same from any database, so one job
+			// can scrape them once per server however many databases are
+			// monitored. See collector.ClusterScopedCollectors.
+			f.addPostgresCollectors(collector.ClusterScopedCollectors())
+		case "postgres.database":
+			// Collectors whose data depends on the connected database, so they
+			// have to be scraped once per database.
+			f.addPostgresCollectors(collector.DatabaseScopedCollectors())
+		default:
+			// collect[]=postgres.<collector> selects a single collector of the
+			// postgres framework. The name is not validated here:
+			// NewPostgresCollector owns the list of collectors, and the handler
+			// turns its error into a 400.
+			if name, ok := strings.CutPrefix(filter, "postgres."); ok && name != "" {
+				f.addPostgresCollectors([]string{name})
+			}
+		}
+	}
+	return f
 }
 
 // Filters is a struct to enable or disable collectors.
@@ -106,11 +140,35 @@ type Filters struct {
 	EnableVersionCollector  bool
 	EnableProcessCollector  bool
 	EnablePostgresCollector bool
+
+	// PostgresCollectors optionally narrows the postgres collector framework to
+	// specific collectors, selected per request as collect[]=postgres.<name>
+	// (e.g. collect[]=postgres.stat_user_indexes). Empty means every collector
+	// that is enabled by flag, which is what a bare collect[]=postgres selects.
+	//
+	// This lets one exporter serve several Prometheus jobs at different
+	// intervals: the expensive high-cardinality collectors on a slow job, the
+	// cheap ones on a fast job. Each scrape then builds a smaller response,
+	// which is what actually bounds the exporter's peak memory.
+	PostgresCollectors []string
+}
+
+// addPostgresCollectors records a group expansion. An empty group is NOT the
+// same as no selection: NewPostgresCollector reads an empty filter list as
+// "every enabled collector", so expanding a group to nothing must leave the
+// postgres framework switched off rather than silently collecting all of it.
+func (f *Filters) addPostgresCollectors(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	f.EnablePostgresCollector = true
+	f.PostgresCollectors = append(f.PostgresCollectors, names...)
 }
 
 // makeRegistry creates a new prometheus registry with default and percona exporters.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters) *prometheus.Registry {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters) (*prometheus.Registry, error) {
 	registry := prometheus.NewRegistry()
+	var postgresCollectorErr error
 
 	excludedDatabases := strings.Split(*excludeDatabases, ",")
 	logger.Log("msg", "Excluded databases", "databases", fmt.Sprintf("%v", excludedDatabases))
@@ -207,18 +265,19 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			logger,
 			excludedDatabases,
 			dsn,
-			[]string{},
+			filters.PostgresCollectors,
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema),
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())
+			postgresCollectorErr = err
 		} else {
 			registry.MustRegister(pe)
 		}
 	}
 
-	return registry
+	return registry, postgresCollectorErr
 }
 
 func (e *Exporter) loadCustomQueries(res MetricResolution, version semver.Version, server *Server) {
