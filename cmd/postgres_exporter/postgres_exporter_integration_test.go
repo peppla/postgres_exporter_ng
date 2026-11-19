@@ -175,7 +175,10 @@ func (s *IntegrationSuite) TestAutoDiscoverDatabases(c *C) {
 	)
 	c.Assert(exporter, NotNil)
 
-	dsns := exporter.discoverDatabaseDSNs()
+	dsns, discovered, ok := exporter.discoverDatabaseDSNs()
 
 	c.Assert(len(dsns), Equals, 2)
+	c.Assert(ok, Equals, true)
+	// Every selected database was discovered, so the count cannot be lower.
+	c.Assert(discovered >= len(dsns), Equals, true)
 }
