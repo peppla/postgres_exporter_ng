@@ -236,9 +236,16 @@ func TestDiscoveryFailsOnUnparseableSeed(t *testing.T) {
 	}
 }
 
-// TestCoverageCountsUnacquiredWorkAsFailed drives the real scrape path with an
-// exhausted semaphore and a cancelled context, so every database is skipped
-// before anything is attempted.
+// TestCoverageCountsUnacquiredWorkAsFailed drives the real scrape path with a
+// cancelled context, so every database is skipped before anything is
+// attempted.
+//
+// The semaphore is NOT exhausted: its single permit is free the whole time.
+// What fails the acquisition is the cancelled context, because Acquire checks
+// ctx.Done() before capacity and prefers to fail even when it could take the
+// permit without blocking (golang.org/x/sync/semaphore). The semaphore still
+// has to be present, since a nil connSema skips the acquisition entirely and
+// the path under test would never run.
 //
 // This is the case that made the first revision of these metrics lie: the
 // skipped work returned without touching the error counter, and scraped is
