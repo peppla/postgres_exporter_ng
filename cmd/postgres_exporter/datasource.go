@@ -230,19 +230,7 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 		server.master = true
 	}
 
-	// An application query can name the databases it runs on, so the server
-	// has to know which database it is. Discovery supplies the name when it
-	// runs. When it does not, there is one target and one round trip, asked
-	// only if some query actually needs the answer.
 	server.datname = target.datname
-	if server.datname == "" && e.needsDatabaseNames() {
-		var name string
-		if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
-			level.Warn(logger).Log("msg", "Could not determine the current database, so per-query database lists cannot be applied", "err", err)
-		} else {
-			server.datname = name
-		}
-	}
 
 	// Check if map versions need to be updated
 	if err := e.checkMapVersions(ch, server); err != nil {
@@ -261,6 +249,27 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 			return fmt.Errorf("could not prepare query maps for %s, so nothing was collected: %w", server, err)
 		}
 		level.Warn(logger).Log("msg", "Proceeding with outdated query maps, as the Postgres version could not be determined", "err", err)
+	}
+
+	// An application query can name the databases it runs on, so the server
+	// has to know which database it is. Discovery supplies the name when it
+	// runs; without discovery there is one target and no name, so it is asked
+	// for here.
+	//
+	// Asked only when some loaded query actually restricts itself by name, and
+	// only after the query maps exist, because that is what says whether any
+	// does. A file with no databases list anywhere pays nothing.
+	//
+	// A failure here is a collection failure, not an absent match. Leaving the
+	// name empty would make every restricted query quietly not run while the
+	// scrape reported the database as covered, which is the shape of claim
+	// these metrics exist to prevent.
+	if server.datname == "" && serverNeedsDatabaseName(server) {
+		var name string
+		if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
+			return fmt.Errorf("could not determine the current database on %s, so queries restricted by database name could not run: %w", server, err)
+		}
+		server.datname = name
 	}
 
 	return server.Scrape(ch, e.disableSettingsMetrics)
@@ -323,9 +332,19 @@ func getDataSources() ([]string, error) {
 	return []string{dsn}, nil
 }
 
-// needsDatabaseNames reports whether any loaded query restricts itself to
-// named databases. Nothing asks the server for its name unless something is
-// going to use the answer.
-func (e *Exporter) needsDatabaseNames() bool {
-	return e.userQueriesPath[e.resolutionEnabled] != ""
+// serverNeedsDatabaseName reports whether any namespace loaded for this server
+// decides where it runs from the database name.
+//
+// A master query does not: master wins over the list and is answered by
+// server.master alone. A query with no list does not either. So the lookup is
+// skipped for the configurations that make up most query files.
+func serverNeedsDatabaseName(server *Server) bool {
+	server.mappingMtx.RLock()
+	defer server.mappingMtx.RUnlock()
+	for _, mapping := range server.metricMap {
+		if mapping.databases.given && !mapping.master {
+			return true
+		}
+	}
+	return false
 }

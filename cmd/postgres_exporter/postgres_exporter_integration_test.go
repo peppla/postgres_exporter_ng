@@ -1612,3 +1612,134 @@ app_elsewhere:
 	c.Check(elsewhere, Equals, false,
 		Commentf("a query naming a database that does not exist ran anyway"))
 }
+
+// TestApplicationQueryNameLookupFailureIsNotSuccess is the regression for a
+// defect in the first version of per-query database selection.
+//
+// When the database name could not be resolved, the scrape logged a warning
+// and carried on with an empty name. Every query with a databases list then
+// matched nothing, so none of them ran, while the scrape returned no error and
+// coverage reported the database as covered. An unknown identity is not an
+// intentional non-match, and the two must not produce the same output.
+//
+// EXECUTE on pg_catalog.current_database() is revoked for the role, which is a
+// per-database privilege, so the connection, version detection and ordinary
+// queries all keep working and only the name lookup fails.
+func (s *IntegrationSuite) TestApplicationQueryNameLookupFailureIsNotSuccess(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "noname"
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	cleanup := func() {
+		_, _ = admin.db.Exec(`GRANT EXECUTE ON FUNCTION pg_catalog.current_database() TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM ` + role)
+	c.Assert(err, IsNil)
+
+	fixture := fmt.Sprintf(`
+app_lookup:
+  query: "SELECT 1::float8 AS value"
+  databases:
+    - %s
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+`, control)
+	dir := writeQueryFile(c, "app.yaml", fixture)
+
+	// Discovery off, so the name is not supplied by the catalog and has to be
+	// asked for.
+	exporter := NewExporter(
+		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + control + "?sslmode=disable"},
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+		DisableDefaultMetrics(true),
+		DisableSettingsMetrics(true),
+	)
+	c.Assert(exporter, NotNil)
+	families := gather(c, exporter)
+
+	count := func(name string) float64 {
+		f, ok := families[name]
+		c.Assert(ok, Equals, true, Commentf("%s was not published", name))
+		return f.GetMetric()[0].GetGauge().GetValue()
+	}
+	c.Check(count("pg_exporter_databases_scraped"), Equals, float64(0),
+		Commentf("the database was reported as covered although no restricted query could run"))
+	c.Check(count("pg_exporter_databases_failed"), Equals, float64(1))
+
+	_, ran := families["app_lookup_value"]
+	c.Check(ran, Equals, false,
+		Commentf("the fixture is wrong: the query ran, so the name lookup did not fail"))
+}
+
+// TestApplicationQueryWithoutListsNeedsNoName is the other half. A query file
+// that restricts nothing does not need the database name, so a scrape of it
+// must not fail when the name cannot be resolved, and must not pay a round
+// trip asking for it.
+func (s *IntegrationSuite) TestApplicationQueryWithoutListsNeedsNoName(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "noname_nolist"
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	cleanup := func() {
+		_, _ = admin.db.Exec(`GRANT EXECUTE ON FUNCTION pg_catalog.current_database() TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM ` + role)
+	c.Assert(err, IsNil)
+
+	dir := writeQueryFile(c, "app.yaml", `
+app_unrestricted:
+  query: "SELECT 1::float8 AS value"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+`)
+
+	exporter := NewExporter(
+		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + control + "?sslmode=disable"},
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+		DisableDefaultMetrics(true),
+		DisableSettingsMetrics(true),
+	)
+	families := gather(c, exporter)
+
+	_, ran := families["app_unrestricted_value"]
+	c.Check(ran, Equals, true,
+		Commentf("an unrestricted query did not run, so the name lookup was demanded when nothing needed it"))
+	c.Check(families["pg_exporter_databases_scraped"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+}
