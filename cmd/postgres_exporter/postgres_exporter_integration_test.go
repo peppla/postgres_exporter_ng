@@ -1276,3 +1276,88 @@ func (s *IntegrationSuite) TestIndexIOFansOutAcrossDatabases(c *C) {
 	c.Check(len(databases), Equals, 2,
 		Commentf("the same index name in two databases produced %d series, want 2: %v", len(databases), databases))
 }
+
+// TestIndexStatsCollectorAgainstServer covers the ported index statistics
+// collector running against a real server, in a database the DSN does not
+// point at.
+//
+// The collector reproduces the body of pg_stat_user_indexes rather than
+// selecting from it, so that the index's relpages and reltuples come off a
+// join the view already performs. That makes it worth running against each
+// supported version rather than trusting sqlmock, which cannot tell whether
+// the query is valid SQL on PostgreSQL 15 or 19.
+func (s *IntegrationSuite) TestIndexStatsCollectorAgainstServer(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "index_stats_other"
+	const table = "index_stats_marker"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	_, err = seed.db.Exec(`INSERT INTO ` + table + ` SELECT generate_series(1, 10)`)
+	c.Assert(err, IsNil)
+	_, err = seed.db.Exec(`SELECT count(*) FROM ` + table + ` WHERE id = 1`)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	c.Assert(pc.Collectors["stat_user_indexes"], NotNil,
+		Commentf("the index statistics collector is not enabled by default"))
+
+	families := gather(c, pc)
+	for _, name := range []string{
+		"pg_stat_user_indexes_idx_scan",
+		"pg_stat_user_indexes_idx_tup_read",
+		"pg_stat_user_indexes_idx_tup_fetch",
+		"pg_stat_user_indexes_relpages",
+		"pg_stat_user_indexes_reltuples",
+	} {
+		f, ok := families[name]
+		c.Assert(ok, Equals, true, Commentf("%s was not produced", name))
+		found := false
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			c.Check(labels["datname"], Not(Equals), "",
+				Commentf("%s does not say which database it describes", name))
+			if labels["datname"] == other && labels["relname"] == table {
+				found = true
+			}
+		}
+		c.Check(found, Equals, true,
+			Commentf("%s carries nothing for the index seeded in %q", name, other))
+	}
+
+	// The collector reports every collector status it owns, and none failed.
+	for _, m := range families["pg_scrape_collector_success"].GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["collector"] == "stat_user_indexes" {
+			c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+				Commentf("the index statistics collector failed against %q", labels["datname"]))
+		}
+	}
+}
