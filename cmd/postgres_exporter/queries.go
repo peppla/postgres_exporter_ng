@@ -344,8 +344,13 @@ func queryDatabases(ctx context.Context, server *Server) ([]catalogDatabase, err
 		}
 		result = append(result, db)
 	}
+	// Next stops on failure exactly as it stops at the end of the rows, so
+	// without this a partial catalog read returns a short database list and
+	// the scrape treats the databases it never saw as absent rather than
+	// unread. Wrapped, so a caller can tell a truncated read from a refused
+	// query.
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("Error retrieving databases: %v", err)
+		return nil, fmt.Errorf("error retrieving databases: %w", err)
 	}
 
 	return result, nil

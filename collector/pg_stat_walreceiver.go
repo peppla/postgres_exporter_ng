@@ -103,15 +103,28 @@ var (
 		column_name = 'flushed_lsn'
 	`
 
+	// The %s is flushed_lsn, which is selected only when the column exists.
+	// Its position has to match where rows.Scan binds it in Update, which is
+	// between receive_start_tli and received_tli. It used to sit one column
+	// earlier, so on every server that has the column, and all supported
+	// versions do, flushed_lsn was scanned into receive_start_tli and
+	// receive_start_tli into flushed_lsn. Each metric carried the other's
+	// value: a timeline number reported as a log position and a log position
+	// reported as a timeline.
+	//
+	// The unit tests could not see it. They build their fixture columns in the
+	// order Update scans, and sqlmock hands those back as given without
+	// parsing the SQL, so the fixture agreed with the code and both differed
+	// from the server. TestWalReceiverQueryMatchesScanOrder asks a real server
+	// for the column order instead.
 	pgStatWalReceiverQueryTemplate = `
 	SELECT
 		trim(both '''' from substring(conninfo from 'host=([^ ]*)')) as upstream_host,
 		slot_name,
 		status,
 		(receive_start_lsn- '0/0') %% (2^52)::bigint as receive_start_lsn,
-		%s
-receive_start_tli,
-		received_tli,
+		receive_start_tli,
+		%sreceived_tli,
 		extract(epoch from last_msg_send_time) as last_msg_send_time,
 		extract(epoch from last_msg_receipt_time) as last_msg_receipt_time,
 		(latest_end_lsn - '0/0') %% (2^52)::bigint as latest_end_lsn,
