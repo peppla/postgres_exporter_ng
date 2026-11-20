@@ -32,12 +32,13 @@ const (
 
 // UserQuery represents a user defined query, including support for Aurora, if needed
 type UserQuery struct {
-	Query        string    `yaml:"query"`         // Standard query
-	QueryAurora  string    `yaml:"query_aurora"`  // Aurora specific query
-	Metrics      []Mapping `yaml:"metrics"`       // Metrics to be collected
-	Master       bool      `yaml:"master"`        // Querying only for master database
-	CacheSeconds uint64    `yaml:"cache_seconds"` // Number of seconds to cache the namespace result metrics for.
-	RunOnServer  string    `yaml:"runonserver"`   // Querying to run on which server version
+	Query        string            `yaml:"query"`         // Standard query
+	QueryAurora  string            `yaml:"query_aurora"`  // Aurora specific query
+	Metrics      []Mapping         `yaml:"metrics"`       // Metrics to be collected
+	Master       bool              `yaml:"master"`        // Querying only for master database
+	Databases    queryDatabaseList `yaml:"databases"`     // Databases to run against; omitted means all
+	CacheSeconds uint64            `yaml:"cache_seconds"` // Number of seconds to cache the namespace result metrics for.
+	RunOnServer  string            `yaml:"runonserver"`   // Querying to run on which server version
 }
 
 // UserQueries represents a set of UserQuery objects
@@ -212,6 +213,9 @@ func parseUserQueries(content []byte, dist string) (map[string]intermediateMetri
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := rejectNullDatabases(content); err != nil {
+		return nil, nil, err
+	}
 
 	// Stores the loaded map representation
 	metricMaps := make(map[string]intermediateMetricMap)
@@ -245,6 +249,7 @@ func parseUserQueries(content []byte, dist string) (map[string]intermediateMetri
 			metricMap = intermediateMetricMap{
 				columnMappings: newMetricMap,
 				master:         specs.Master,
+				databases:      specs.Databases,
 				cacheSeconds:   specs.CacheSeconds,
 			}
 			metricMaps[metric] = metricMap

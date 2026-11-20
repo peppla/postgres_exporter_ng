@@ -217,7 +217,8 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 	return dbNames, nil
 }
 
-func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, dsn string) error {
+func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) error {
+	dsn := target.dsn
 	server, err := e.GetServer(dsn)
 	if err != nil {
 		return &ErrorConnectToServer{fmt.Sprintf("Error opening connection to database (%s): %s", loggableDSN(dsn), err.Error())}
@@ -227,6 +228,20 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, dsn string) error {
 	// Check if autoDiscoverDatabases is false, set dsn as master database (Default: false)
 	if !e.autoDiscoverDatabases || e.masterDSN == dsn {
 		server.master = true
+	}
+
+	// An application query can name the databases it runs on, so the server
+	// has to know which database it is. Discovery supplies the name when it
+	// runs. When it does not, there is one target and one round trip, asked
+	// only if some query actually needs the answer.
+	server.datname = target.datname
+	if server.datname == "" && e.needsDatabaseNames() {
+		var name string
+		if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
+			level.Warn(logger).Log("msg", "Could not determine the current database, so per-query database lists cannot be applied", "err", err)
+		} else {
+			server.datname = name
+		}
 	}
 
 	// Check if map versions need to be updated
@@ -306,4 +321,11 @@ func getDataSources() ([]string, error) {
 	dsn = "postgresql://" + ui + "@" + uri
 
 	return []string{dsn}, nil
+}
+
+// needsDatabaseNames reports whether any loaded query restricts itself to
+// named databases. Nothing asks the server for its name unless something is
+// going to use the answer.
+func (e *Exporter) needsDatabaseNames() bool {
+	return e.userQueriesPath[e.resolutionEnabled] != ""
 }

@@ -304,9 +304,9 @@ func (s *IntegrationSuite) TestUnknownMetricParsingDoesntCrash(c *C) {
 	emptyMaps := make(map[string]intermediateMetricMap, 0)
 	for k := range exporter.builtinMetricMaps {
 		emptyMaps[k] = intermediateMetricMap{
-			map[string]ColumnMapping{},
-			true,
-			0,
+			columnMappings: map[string]ColumnMapping{},
+			master:         true,
+			cacheSeconds:   0,
 		}
 	}
 	exporter.builtinMetricMaps = emptyMaps
@@ -1454,4 +1454,161 @@ func (s *IntegrationSuite) TestExtensionsFanOutAcrossDatabases(c *C) {
 		Commentf("%s reports no installed version in the database that has it", ext))
 	c.Check(installedVersions[control], Equals, "",
 		Commentf("%s reports an installed version in a database that does not have it", ext))
+}
+
+// TestApplicationQueryDatabaseSelection drives the per-query databases rule
+// against a real server, which is where the contract says it has to be
+// proved rather than at parse time.
+//
+// Four queries in one file, against a server with more than one database:
+// one with no list, one naming a single database, one with an explicit empty
+// list, and one with master: true and a list that does not contain the
+// configured database.
+func (s *IntegrationSuite) TestApplicationQueryDatabaseSelection(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	catalog, err := queryDatabases(context.Background(), server)
+	c.Assert(err, IsNil)
+	control, found := currentName(catalog)
+	c.Assert(found, Equals, true)
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others) > 0, Equals, true,
+		Commentf("the fixture server has one database, so per-query selection cannot be exercised"))
+	other := others[0]
+
+	const fixture = `
+app_everywhere:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_one_database:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases:
+    - %s
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_no_databases:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases: []
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_master_only:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  master: true
+  databases:
+    - %s
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`
+	// The master query's list names a database that is not the configured
+	// one, so a list that could suppress or redirect a master query would
+	// show up here.
+	dir := writeQueryFile(c, "app.yaml", fmt.Sprintf(fixture, other, other))
+
+	exporter := NewExporter(
+		strings.Split(dsn, ",")[:1],
+		AutoDiscoverDatabases(true),
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+	)
+	c.Assert(exporter, NotNil)
+	families := gather(c, exporter)
+
+	where := func(metric string) []string {
+		f, ok := families[metric]
+		if !ok {
+			return nil
+		}
+		var names []string
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "datname" {
+					names = append(names, l.GetValue())
+				}
+			}
+		}
+		sort.Strings(names)
+		return names
+	}
+
+	// An omitted list means every database the engine reaches.
+	everywhere := where("app_everywhere_value")
+	c.Check(len(everywhere), Equals, len(catalog),
+		Commentf("a query with no databases list ran in %v, the server has %d connectable databases", everywhere, len(catalog)))
+
+	// A list of one means that one.
+	c.Check(where("app_one_database_value"), DeepEquals, []string{other},
+		Commentf("a query naming %q ran somewhere else", other))
+
+	// An explicit empty list means nowhere, which is the opposite of omitted
+	// and the distinction a plain slice cannot carry.
+	c.Check(where("app_no_databases_value"), IsNil,
+		Commentf("a query with databases: [] ran anyway"))
+
+	// master: true means the configured connection database and only it, even
+	// though the list names a different one.
+	c.Check(where("app_master_only_value"), DeepEquals, []string{control},
+		Commentf("a master query did not run on the configured database alone"))
+}
+
+// TestApplicationQueryDatabasesWithoutDiscovery covers the case the name
+// resolution exists for.
+//
+// With discovery on, every target already carries a database name and the
+// per-query list can be applied straight away. With discovery off there is one
+// target and no name, so a list would match nothing and an application query
+// restricted to the database it is actually pointed at would silently never
+// run. The exporter asks the server instead, once, and only when some loaded
+// query has a list to apply.
+func (s *IntegrationSuite) TestApplicationQueryDatabasesWithoutDiscovery(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	var control string
+	c.Assert(server.db.QueryRow(`SELECT current_database()`).Scan(&control), IsNil)
+
+	const fixture = `
+app_here:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases:
+    - %s
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_elsewhere:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases:
+    - a_database_that_does_not_exist
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`
+	dir := writeQueryFile(c, "app.yaml", fmt.Sprintf(fixture, control))
+
+	// Discovery deliberately off: one target, and no name from the catalog.
+	exporter := NewExporter(
+		strings.Split(dsn, ",")[:1],
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+	)
+	c.Assert(exporter, NotNil)
+	families := gather(c, exporter)
+
+	_, here := families["app_here_value"]
+	c.Check(here, Equals, true,
+		Commentf("a query naming the database it is pointed at did not run, so the name was never resolved"))
+	_, elsewhere := families["app_elsewhere_value"]
+	c.Check(elsewhere, Equals, false,
+		Commentf("a query naming a database that does not exist ran anyway"))
 }

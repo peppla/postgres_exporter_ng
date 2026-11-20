@@ -199,8 +199,13 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 	for namespace, mapping := range server.metricMap {
 		level.Debug(logger).Log("msg", "Querying namespace", "namespace", namespace)
 
-		if mapping.master && !server.master {
-			level.Debug(logger).Log("msg", "Query skipped...")
+		// Where this query runs. master: true means the configured connection
+		// database and only it, whatever the databases list says. An absent
+		// list means every database the engine reaches, which is why built-in
+		// namespaces, whose list is always absent, behave exactly as before.
+		if !mapping.databases.runsOn(server.datname, mapping.master, server.master) {
+			level.Debug(logger).Log("msg", "Query skipped for this database",
+				"namespace", namespace, "datname", server.datname)
 			continue
 		}
 

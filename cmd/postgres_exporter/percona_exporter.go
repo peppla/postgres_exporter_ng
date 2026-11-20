@@ -122,9 +122,13 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		LR: *collectCustomQueryLrDirectory,
 	}
 
+	// Shared by both engines: how to reach the server, and how much of it to
+	// use at once. Database selection is deliberately not here. The two
+	// engines pick their own databases and the sets are never intersected,
+	// so neither one's include or exclude configuration may be applied to the
+	// other.
 	opts := []ExporterOpt{
 		AutoDiscoverDatabases(*autoDiscoverDatabases),
-		ExcludeDatabases(excludedDatabases),
 		WithConnectionsSemaphore(connSema),
 		WithContext(ctx),
 	}
@@ -136,6 +140,8 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			WithConstantLabels(*constantLabelsList), // This option depends on collectors name, so keep it after CollectorName option
 			DisableDefaultMetrics(*disableDefaultMetrics),
 			DisableSettingsMetrics(*disableSettingsMetrics),
+			// Built-in monitoring's own selection, and only its own.
+			ExcludeDatabases(excludedDatabases),
 			IncludeDatabases(*includeDatabases),
 		)...)
 		registry.MustRegister(defaultExporter)
@@ -146,6 +152,10 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			append(opts,
 				CollectorName("custom_query.hr"),
 				WithConstantLabels(*constantLabelsList), // This option depends on collectors name, so keep it after CollectorName option
+				// No database lists. An application query names its own
+				// databases, and an omitted list means every database the
+				// engine reaches rather than the set built-in monitoring
+				// chose.
 				WithUserQueriesEnabled(HR),
 				WithEnabled(*collectCustomQueryHr),
 				DisableDefaultMetrics(true),
@@ -161,6 +171,10 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			append(opts,
 				CollectorName("custom_query.mr"),
 				WithConstantLabels(*constantLabelsList), // This option depends on collectors name, so keep it after CollectorName option
+				// No database lists. An application query names its own
+				// databases, and an omitted list means every database the
+				// engine reaches rather than the set built-in monitoring
+				// chose.
 				WithUserQueriesEnabled(MR),
 				WithEnabled(*collectCustomQueryMr),
 				DisableDefaultMetrics(true),
@@ -175,6 +189,10 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			append(opts,
 				CollectorName("custom_query.lr"),
 				WithConstantLabels(*constantLabelsList), // This option depends on collectors name, so keep it after CollectorName option
+				// No database lists. An application query names its own
+				// databases, and an omitted list means every database the
+				// engine reaches rather than the set built-in monitoring
+				// chose.
 				WithUserQueriesEnabled(LR),
 				WithEnabled(*collectCustomQueryLr),
 				DisableDefaultMetrics(true),

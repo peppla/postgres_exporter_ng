@@ -115,7 +115,11 @@ func (cm *ColumnMapping) UnmarshalYAML(unmarshal func(interface{}) error) error 
 type intermediateMetricMap struct {
 	columnMappings map[string]ColumnMapping
 	master         bool
-	cacheSeconds   uint64
+	// databases is the per-query selection for an application query. It is
+	// absent for built-in namespaces, which means they run wherever the
+	// engine runs them.
+	databases    queryDatabaseList
+	cacheSeconds uint64
 }
 
 // MetricMapNamespace groups metric maps under a shared set of labels.
@@ -123,6 +127,7 @@ type MetricMapNamespace struct {
 	labels         []string             // Label names for this namespace
 	columnMappings map[string]MetricMap // Column mappings in this namespace
 	master         bool                 // Call query only for master database
+	databases      queryDatabaseList    // Application-query selection; absent means every database
 	cacheSeconds   uint64               // Number of seconds this metric namespace can be cached. 0 disables.
 }
 
@@ -168,7 +173,7 @@ func dumpMaps() {
 
 var builtinMetricMaps = map[string]intermediateMetricMap{
 	"pg_stat_database_conflicts": {
-		map[string]ColumnMapping{
+		columnMappings: map[string]ColumnMapping{
 			"datid":            {LABEL, "OID of a database", nil, nil},
 			"datname":          {LABEL, "Name of this database", nil, nil},
 			"confl_tablespace": {COUNTER, "Number of queries in this database that have been canceled due to dropped tablespaces", nil, nil},
@@ -177,19 +182,19 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"confl_bufferpin":  {COUNTER, "Number of queries in this database that have been canceled due to pinned buffers", nil, nil},
 			"confl_deadlock":   {COUNTER, "Number of queries in this database that have been canceled due to deadlocks", nil, nil},
 		},
-		true,
-		0,
+		master:       true,
+		cacheSeconds: 0,
 	},
 	"pg_lock_conflicts": {
-		map[string]ColumnMapping{
+		columnMappings: map[string]ColumnMapping{
 			"blocking_pid": {LABEL, "PID of blocking session", nil, nil},
 			"count":        {GAUGE, "Number of blocked sessions", nil, nil},
 		},
-		true,
-		0,
+		master:       true,
+		cacheSeconds: 0,
 	},
 	"pg_stat_replication": {
-		map[string]ColumnMapping{
+		columnMappings: map[string]ColumnMapping{
 			"procpid":                  {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange("<9.2.0")},
 			"pid":                      {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange(">=9.2.0")},
 			"usesysid":                 {DISCARD, "OID of the user logged into this WAL sender process", nil, nil},
@@ -231,21 +236,21 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"flush_lag":                {DISCARD, "Time elapsed between flushing recent WAL locally and receiving notification that this standby server has written and flushed it (but not yet applied it). This can be used to gauge the delay that synchronous_commit level remote_flush incurred while committing if this server was configured as a synchronous standby.", nil, semver.MustParseRange(">=10.0.0")},
 			"replay_lag":               {DISCARD, "Time elapsed between flushing recent WAL locally and receiving notification that this standby server has written, flushed and applied it. This can be used to gauge the delay that synchronous_commit level remote_apply incurred while committing if this server was configured as a synchronous standby.", nil, semver.MustParseRange(">=10.0.0")},
 		},
-		true,
-		0,
+		master:       true,
+		cacheSeconds: 0,
 	},
 	"pg_replication_slots": {
-		map[string]ColumnMapping{
+		columnMappings: map[string]ColumnMapping{
 			"slot_name":       {LABEL, "Name of the replication slot", nil, nil},
 			"database":        {LABEL, "Name of the database", nil, nil},
 			"active":          {GAUGE, "Flag indicating if the slot is active", nil, nil},
 			"pg_wal_lsn_diff": {GAUGE, "Replication lag in bytes", nil, nil},
 		},
-		true,
-		0,
+		master:       true,
+		cacheSeconds: 0,
 	},
 	"pg_stat_archiver": {
-		map[string]ColumnMapping{
+		columnMappings: map[string]ColumnMapping{
 			"archived_count":     {COUNTER, "Number of WAL files that have been successfully archived", nil, nil},
 			"last_archived_wal":  {DISCARD, "Name of the last WAL file successfully archived", nil, nil},
 			"last_archived_time": {DISCARD, "Time of the last successful archive operation", nil, nil},
@@ -255,11 +260,11 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"stats_reset":        {DISCARD, "Time at which these statistics were last reset", nil, nil},
 			"last_archive_age":   {GAUGE, "Time in seconds since last WAL segment was successfully archived", nil, nil},
 		},
-		true,
-		0,
+		master:       true,
+		cacheSeconds: 0,
 	},
 	"pg_stat_activity": {
-		map[string]ColumnMapping{
+		columnMappings: map[string]ColumnMapping{
 			"datname":            {LABEL, "Name of this database", nil, nil},
 			"state":              {LABEL, "connection state", nil, semver.MustParseRange(">=9.2.0")},
 			"usename":            {LABEL, "Name of the user logged into this backend", nil, nil},
@@ -268,8 +273,8 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"max_tx_duration":    {GAUGE, "max duration in seconds any active transaction has been running", nil, nil},
 			"max_state_duration": {GAUGE, "max state change duration in seconds any active transaction has been", nil, nil},
 		},
-		true,
-		0,
+		master:       true,
+		cacheSeconds: 0,
 	},
 }
 
@@ -403,7 +408,7 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 			}
 		}
 
-		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.cacheSeconds}
+		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.databases, intermediateMappings.cacheSeconds}
 	}
 
 	return metricMap
@@ -833,7 +838,7 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				}
 				defer e.connSema.Release(1)
 			}
-			if err := e.scrapeDSN(ch, target.dsn); err != nil {
+			if err := e.scrapeDSN(ch, target); err != nil {
 				errorsCount.Add(1)
 
 				level.Error(logger).Log("err", err)
