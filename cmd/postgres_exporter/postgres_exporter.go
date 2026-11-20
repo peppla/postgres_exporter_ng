@@ -27,6 +27,7 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -426,8 +427,8 @@ type Exporter struct {
 
 	disableDefaultMetrics, disableSettingsMetrics, autoDiscoverDatabases bool
 
-	excludeDatabases databaseList
-	includeDatabases databaseList
+	excludeDatabases dbselect.List
+	includeDatabases dbselect.List
 	dsn              []string
 	constantLabels   prometheus.Labels
 	duration         prometheus.Gauge
@@ -513,7 +514,7 @@ func AutoDiscoverDatabases(b bool) ExporterOpt {
 // name.
 func ExcludeDatabases(s []string) ExporterOpt {
 	return func(e *Exporter) {
-		e.excludeDatabases = listFromFlag(s)
+		e.excludeDatabases = dbselect.FromFlag(s)
 	}
 }
 
@@ -525,7 +526,7 @@ func ExcludeDatabases(s []string) ExporterOpt {
 func IncludeDatabases(s string) ExporterOpt {
 	return func(e *Exporter) {
 		if len(s) > 0 {
-			e.includeDatabases = listOf(strings.Split(s, ","))
+			e.includeDatabases = dbselect.Of(strings.Split(s, ","))
 		}
 	}
 }

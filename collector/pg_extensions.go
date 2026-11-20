@@ -9,7 +9,7 @@ import (
 )
 
 func init() {
-	registerCollector("extensions", defaultEnabled, NewExtensionsCollector)
+	registerCollector("extensions", defaultEnabled, scopeDatabase, NewExtensionsCollector)
 }
 
 var pgExtensions = map[string]*prometheus.Desc{

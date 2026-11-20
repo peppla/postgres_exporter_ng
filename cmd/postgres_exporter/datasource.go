@@ -22,111 +22,18 @@ import (
 	"strings"
 
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Reasons a database the server offered is not in the selected set. These are
-// label values, so the set is closed and short: the monitoring contract allows
-// bounded reason codes and forbids arbitrary strings.
+// The reason codes both engines report against live in internal/dbselect, so
+// "excluded" means the same thing wherever it is published.
 const (
-	reasonExcludeList = "exclude_list"
-	reasonNotIncluded = "not_in_include_list"
+	reasonExcludeList  = dbselect.ReasonExcludeList
+	reasonConnect      = dbselect.ReasonConnect
+	reasonScrape       = dbselect.ReasonScrape
+	reasonNotAttempted = dbselect.ReasonNotAttempted
 )
-
-// Reasons a selected database produced no data. Also label values, also a
-// closed set. Nothing derived from an error message belongs here.
-const (
-	reasonConnect      = "connect"
-	reasonScrape       = "scrape"
-	reasonNotAttempted = "not_attempted"
-)
-
-// databaseList is a configured list of database names that remembers whether
-// it was configured at all.
-//
-// Pep decided on 2026-11-20 that an explicitly empty list selects nothing,
-// while an omitted one means no restriction. Those are opposite instructions,
-// and a []string cannot tell them apart: both arrive with length zero. The
-// monitoring contract calls this out by name, because collapsing them is the
-// kind of thing that happens silently and then selects every database on a
-// server where the operator asked for none.
-//
-// The command-line surface cannot express an explicit empty list yet. An unset
-// flag and an empty one both arrive as absent, which is the safe direction.
-// Naming the configuration keys, and deciding how an empty list is written in
-// them, is still open.
-type databaseList struct {
-	names []string
-	given bool
-}
-
-// listOf records a list the operator supplied, empty or not.
-func listOf(names []string) databaseList {
-	return databaseList{names: names, given: true}
-}
-
-// listFromFlag converts the inherited comma-separated flag value. An unset
-// flag reaches this as a slice holding one empty string, because
-// strings.Split("", ",") does not return an empty slice, so a list of nothing
-// but empty names counts as absent rather than as an explicit empty list.
-func listFromFlag(names []string) databaseList {
-	for _, n := range names {
-		if n != "" {
-			return listOf(names)
-		}
-	}
-	return databaseList{}
-}
-
-// selection is what the configuration did to the catalog the server reported.
-//
-// Excluding a database is a decision, not a fault, and the contract is explicit
-// that the two must not be conflated. Keeping the names apart from the count is
-// about cardinality rather than principle: the names an operator wrote in an
-// exclude list are bounded by the configuration, while the complement of an
-// include list can be the whole server, so only the first is reported per
-// database.
-type selection struct {
-	selected []string
-	// excluded holds the names the operator listed and the server has, so a
-	// typo in the list shows up as a name that never appears here.
-	excluded []string
-	// notIncluded counts the databases left out by a non-empty include list.
-	notIncluded int
-}
-
-// selectDatabases applies the exclusion and inclusion rules to the names
-// discovery returned. Extracted from discoverDatabaseDSNs so the rule can be
-// tested without a database: it decides coverage, and nothing was testing it.
-//
-// The rule, as decided:
-//
-//	include omitted, exclude omitted     every eligible database
-//	include omitted, exclude given       every eligible database but those named
-//	include given and empty              no databases, whatever exclude says
-//	include given and non-empty          the named databases, minus exclusions
-//
-// Exclusion is checked first, so a database named in both lists is reported as
-// excluded rather than as not included. Exclusion takes precedence, and the
-// report should say which rule applied.
-func selectDatabases(names []string, exclude, include databaseList) selection {
-	s := selection{selected: make([]string, 0, len(names))}
-	for _, name := range names {
-		if contains(exclude.names, name) {
-			s.excluded = append(s.excluded, name)
-			continue
-		}
-		// An include list that was given restricts the set, including when it
-		// is empty: an operator who writes an empty list has asked for no
-		// database-local collection, not for all of it.
-		if include.given && !contains(include.names, name) {
-			s.notIncluded++
-			continue
-		}
-		s.selected = append(s.selected, name)
-	}
-	return s
-}
 
 // databaseRef identifies one database for reporting: which server, and which
 // database on it.
@@ -247,17 +154,17 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 			d.discovered++
 		}
 
-		sel := selectDatabases(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
-		for _, name := range sel.excluded {
+		sel := dbselect.Apply(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
+		for _, name := range sel.Excluded {
 			d.excluded = append(d.excluded, databaseRef{server: fingerprint, datname: name})
 		}
-		d.notIncluded += sel.notIncluded
+		d.notIncluded += sel.NotIncluded
 
 		// The configured database is subject to the same rules as any other,
 		// but it cannot be dropped from the DSN list: it is the connection
 		// the cluster-wide work runs on. Exclusion of database-local
 		// collection for it is a separate change.
-		for _, databaseName := range sel.selected {
+		for _, databaseName := range sel.Selected {
 			if dsnURI != nil {
 				if dsnURI.Host == "" && strings.HasPrefix(dsnURI.Path, "/") {
 					dsnURI.Path = "/" + databaseName

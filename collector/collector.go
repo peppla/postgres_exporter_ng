@@ -32,6 +32,7 @@ var (
 	initiatedCollectorsMtx = sync.Mutex{}
 	initiatedCollectors    = make(map[string]Collector)
 	collectorState         = make(map[string]*bool)
+	collectorScopes        = make(map[string]collectorScope)
 	forcedCollectors       = map[string]bool{} // collectors which have been explicitly enabled or disabled
 )
 
@@ -58,6 +59,37 @@ var (
 	)
 )
 
+// collectorScope says where a collector's queries have to run.
+//
+// PostgreSQL splits its catalogs. pg_database, pg_locks, pg_stat_activity,
+// pg_stat_database and the replication views are shared, so one connection
+// anywhere on the server sees the whole cluster. pg_stat_user_tables,
+// pg_statio_user_tables, pg_statio_user_indexes and pg_extension are not: they
+// show the objects of the database the connection is attached to and nothing
+// else.
+//
+// Before this distinction existed the exporter ran every collector on one
+// connection, so the four database-local ones reported the configured
+// database's tables and silently nothing about any other database on the
+// server. The scope is declared at registration because it is a property of
+// the collector's SQL, and a collector added without thinking about it should
+// not quietly inherit whichever behaviour is cheaper.
+type collectorScope int
+
+const (
+	// scopeCluster runs once per server, on the configured connection.
+	scopeCluster collectorScope = iota
+	// scopeDatabase runs once per selected database, on a connection to it.
+	scopeDatabase
+)
+
+func (s collectorScope) String() string {
+	if s == scopeDatabase {
+		return "database"
+	}
+	return "cluster"
+}
+
 type Collector interface {
 	Update(ctx context.Context, instance *instance, ch chan<- prometheus.Metric) error
 }
@@ -67,7 +99,7 @@ type collectorConfig struct {
 	excludeDatabases []string
 }
 
-func registerCollector(name string, isDefaultEnabled bool, createFunc func(collectorConfig) (Collector, error)) {
+func registerCollector(name string, isDefaultEnabled bool, scope collectorScope, createFunc func(collectorConfig) (Collector, error)) {
 	var helpDefaultState string
 	if isDefaultEnabled {
 		helpDefaultState = "enabled"
@@ -82,6 +114,7 @@ func registerCollector(name string, isDefaultEnabled bool, createFunc func(colle
 
 	flag := kingpin.Flag(flagName, flagHelp).Default(defaultValue).Action(collectorFlagAction(name)).Bool()
 	collectorState[name] = flag
+	collectorScopes[name] = scope
 
 	// Register the create function for this collector
 	factories[name] = createFunc

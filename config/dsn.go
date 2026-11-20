@@ -236,3 +236,54 @@ func parseKeyValue(in string) (map[string]string, error) {
 
 	return out, nil
 }
+
+// DSNWithDatabase returns the connection string in, pointed at another
+// database on the same server.
+//
+// Both DSN forms are handled, because an operator can configure either and the
+// difference must not decide which databases get monitored. A URL carries the
+// database in its path, and a key=value string carries it in dbname, so the
+// substitution is not the same edit in both and doing it by hand on a string
+// is how one of the two forms quietly stops working.
+//
+// The result is a URL connection string whichever form went in, since that is
+// what DSN serialises to. It carries the password, so it must not be logged.
+//
+// The dbname query parameter is dropped as well as the path being set. A
+// key=value connection string keeps its dbname in the query, and libpq reads
+// a dbname keyword there as well as the path, so setting the path alone leaves
+// two answers in one string and collection silently stays on the original
+// database.
+func DSNWithDatabase(in, database string) (string, error) {
+	d, err := dsnFromString(in)
+	if err != nil {
+		return "", err
+	}
+	d.path = "/" + database
+	if d.query != nil {
+		d.query.Del("dbname")
+	}
+	return d.GetConnectionString(), nil
+}
+
+// DatabaseFromDSN returns the database a connection string names, and whether
+// it names one at all.
+//
+// Both places are read, for the same reason DSNWithDatabase clears both. An
+// absent name is not an error: libpq then falls back to the user name, and
+// guessing that here would put a name on a database nobody configured.
+func DatabaseFromDSN(in string) (string, bool) {
+	d, err := dsnFromString(in)
+	if err != nil {
+		return "", false
+	}
+	if name := strings.TrimPrefix(d.path, "/"); name != "" {
+		return name, true
+	}
+	if d.query != nil {
+		if name := d.query.Get("dbname"); name != "" {
+			return name, true
+		}
+	}
+	return "", false
+}
