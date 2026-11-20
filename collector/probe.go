@@ -98,7 +98,7 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	wg.Add(len(pc.collectors))
 	for name, c := range pc.collectors {
 		go func(name string, c Collector) {
-			execute(pc.ctx, name, c, pc.instance, ch, pc.logger)
+			execute(pc.ctx, name, c, pc.instance, ch, pc.logger, "")
 			wg.Done()
 		}(name, c)
 	}

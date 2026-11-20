@@ -23,6 +23,7 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -45,16 +46,62 @@ const (
 )
 
 var (
+	// The datname label is empty for a cluster-wide collector, because there
+	// is no one database its result belongs to. Prometheus treats an
+	// empty-valued label as absent, so those series keep the identity they
+	// had before the label existed, and an alert on
+	// pg_scrape_collector_success == 0 keeps matching them.
 	scrapeDurationDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "scrape", "collector_duration_seconds"),
-		"postgres_exporter: Duration of a collector scrape.",
-		[]string{"collector"},
+		"postgres_exporter: Duration of a collector scrape. datname is the database a database-local collector ran against, and is empty for a cluster-wide collector.",
+		[]string{"collector", "datname"},
 		nil,
 	)
 	scrapeSuccessDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "scrape", "collector_success"),
-		"postgres_exporter: Whether a collector succeeded.",
-		[]string{"collector"},
+		"postgres_exporter: Whether a collector succeeded. datname is the database a database-local collector ran against, and is empty for a cluster-wide collector.",
+		[]string{"collector", "datname"},
+		nil,
+	)
+
+	// Coverage for this engine, reported against its own intentions. The
+	// legacy engine publishes its own counts under pg_exporter_, and one count
+	// spanning both would merge two different sets and could suggest either a
+	// coverage problem or full coverage where neither is true.
+	collectorDatabaseUpDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "database_up"),
+		"Whether the collectors could connect to this database (1 for yes, 0 for no). Published for every database the namespaced collectors selected.",
+		[]string{"server", "datname"},
+		nil,
+	)
+	collectorDiscoveredDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_discovered"),
+		"Connectable databases the server reported to the namespaced collectors, including the configured connection database.",
+		[]string{"server"},
+		nil,
+	)
+	collectorSelectedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_selected"),
+		"Databases the namespaced collectors intended to run database-local collectors against.",
+		[]string{"server"},
+		nil,
+	)
+	collectorExcludedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_excluded"),
+		"Databases the server offered that configuration left out of the namespaced collectors' set. These are decisions, not failures.",
+		[]string{"server"},
+		nil,
+	)
+	collectorDiscoverySuccessDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "database_discovery_success"),
+		"Whether the namespaced collectors could determine the set of databases (1 for yes, 0 for no). When this is 0 the set has collapsed to the configured connection database, which otherwise looks like a one-database server.",
+		[]string{"server"},
+		nil,
+	)
+	collectorExcludedDatabaseDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "database_excluded"),
+		"1 for each database an exclude list named and kept out of the namespaced collectors' set. Databases left out by a given include list are counted in databases_excluded and not named here, because that set can be the whole server.",
+		[]string{"server", "datname", "reason"},
 		nil,
 	)
 )
@@ -81,13 +128,31 @@ const (
 	scopeCluster collectorScope = iota
 	// scopeDatabase runs once per selected database, on a connection to it.
 	scopeDatabase
+	// scopeDatabaseUnlabelled is a database-local collector whose own metrics
+	// do not carry the database name.
+	//
+	// It reads per-database catalogs, so it describes only the database it
+	// runs in, but nothing in its output says which. Running it in two
+	// databases produces series that are identical in name and labels, which a
+	// registry rejects as duplicates and which an operator could not tell
+	// apart anyway. So it runs on the configured connection alone, which is
+	// what every collector did before the fan-out existed.
+	//
+	// This is a property of the metrics, not of the SQL. Giving these
+	// collectors a datname label would move them to scopeDatabase, and that is
+	// a change to published series rather than a change to scheduling.
+	scopeDatabaseUnlabelled
 )
 
 func (s collectorScope) String() string {
-	if s == scopeDatabase {
+	switch s {
+	case scopeDatabase:
 		return "database"
+	case scopeDatabaseUnlabelled:
+		return "database (unlabelled, control connection only)"
+	default:
+		return "cluster"
 	}
-	return "cluster"
 }
 
 type Collector interface {
@@ -126,6 +191,12 @@ type PostgresCollector struct {
 	logger     log.Logger
 
 	instance *instance
+
+	// Which databases the database-local collectors run against. This engine's
+	// own set: the legacy engine builds its own from its own configuration and
+	// the two are never intersected.
+	excludeDatabases dbselect.List
+	includeDatabases dbselect.List
 
 	connSema *semaphore.Weighted
 	ctx      context.Context
@@ -210,45 +281,220 @@ func WithConnectionsSemaphore(sem *semaphore.Weighted) Option {
 	}
 }
 
+// WithDatabaseSelection sets which databases the database-local collectors run
+// against. Both lists remember whether they were configured, because an
+// explicitly empty include list selects no databases and an omitted one means
+// no restriction.
+func WithDatabaseSelection(exclude, include dbselect.List) Option {
+	return func(c *PostgresCollector) error {
+		c.excludeDatabases = exclude
+		c.includeDatabases = include
+		return nil
+	}
+}
+
 // Describe implements the prometheus.Collector interface.
 func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- scrapeDurationDesc
 	ch <- scrapeSuccessDesc
+	ch <- collectorDatabaseUpDesc
+	ch <- collectorDiscoveredDesc
+	ch <- collectorSelectedDesc
+	ch <- collectorExcludedDesc
+	ch <- collectorDiscoverySuccessDesc
+	ch <- collectorExcludedDatabaseDesc
 }
 
 // Collect implements the prometheus.Collector interface.
+//
+// Cluster-wide collectors run once, on the configured connection.
+// Database-local collectors run once per selected database, each on its own
+// connection, because the views they read show only the database their
+// connection is attached to. Before the fan-out existed they all ran on the
+// one connection, so they described the configured database and said nothing
+// at all about the rest of the server.
 func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// copy the instance so that concurrent scrapes have independent instances
 	inst := p.instance.copy()
 
-	if p.connSema != nil {
-		if err := p.connSema.Acquire(p.ctx, 1); err != nil {
-			level.Warn(p.logger).Log("msg", "Failed to acquire semaphore", "err", err)
-			return
-		}
-		defer p.connSema.Release(1)
+	if !p.acquire() {
+		return
 	}
-
 	// Set up the database connection for the collector.
 	err := inst.setup()
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "err", err)
+		p.release()
 		return
 	}
-	defer inst.Close()
+
+	cluster, local, controlOnly := p.byScope()
+
+	sel, err := selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases)
+	if err != nil {
+		level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
+	}
+	p.reportSelection(ch, inst.name, sel)
+
+	// The control connection is held for the cluster-wide work and released
+	// before the fan-out, so the per-database connections are bounded by the
+	// same semaphore rather than competing with a permit this call is sitting
+	// on.
+	wg := sync.WaitGroup{}
+	wg.Add(len(cluster))
+	for name, c := range cluster {
+		go func(name string, c Collector) {
+			defer wg.Done()
+			execute(p.ctx, name, c, inst, ch, p.logger, "")
+		}(name, c)
+	}
+
+	// The control database's own database-local collectors run on the
+	// connection that is already open, so it is not opened twice.
+	control := sel.controlTarget()
+	if control != nil && !control.skipDatabaseLocal {
+		for _, set := range []map[string]Collector{local, controlOnly} {
+			wg.Add(len(set))
+			for name, c := range set {
+				go func(name string, c Collector) {
+					defer wg.Done()
+					execute(p.ctx, name, c, inst, ch, p.logger, control.datname)
+				}(name, c)
+			}
+		}
+	}
+	wg.Wait()
+	inst.Close()
+	p.release()
+
+	if control != nil {
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, control.datname)
+	}
+	if len(local) == 0 {
+		return
+	}
+
+	fanout := sync.WaitGroup{}
+	for _, t := range sel.targets {
+		if t.control || t.skipDatabaseLocal {
+			continue
+		}
+		fanout.Add(1)
+		go func(t dbTarget) {
+			defer fanout.Done()
+			p.collectDatabase(ch, t, local, inst.name)
+		}(t)
+	}
+	fanout.Wait()
+}
+
+// collectDatabase opens one database and runs the database-local collectors
+// against it.
+//
+// A database that cannot be opened reports database_up 0 and nothing else. The
+// alternative is emitting no series for it at all, which reads the same as a
+// database that was never selected.
+func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) {
+	if !p.acquire() {
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
+		return
+	}
+	defer p.release()
+
+	dbInst, err := newInstance(t.dsn)
+	if err == nil {
+		err = dbInst.setup()
+	}
+	if err != nil {
+		level.Error(p.logger).Log("msg", "Error opening connection to database", "datname", t.datname, "err", err)
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
+		return
+	}
+	defer dbInst.Close()
+	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, server, t.datname)
 
 	wg := sync.WaitGroup{}
-	wg.Add(len(p.Collectors))
-	for name, c := range p.Collectors {
+	wg.Add(len(local))
+	for name, c := range local {
 		go func(name string, c Collector) {
-			execute(p.ctx, name, c, inst, ch, p.logger)
-			wg.Done()
+			defer wg.Done()
+			execute(p.ctx, name, c, dbInst, ch, p.logger, t.datname)
 		}(name, c)
 	}
 	wg.Wait()
 }
 
-func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger) {
+// byScope splits the enabled collectors by where they can run.
+//
+// cluster runs once on the configured connection and reports no database.
+// local runs once per selected database. controlOnly runs once on the
+// configured connection and reports that database, because it describes one
+// database but its metrics do not say which.
+func (p PostgresCollector) byScope() (cluster, local, controlOnly map[string]Collector) {
+	cluster = make(map[string]Collector, len(p.Collectors))
+	local = make(map[string]Collector)
+	controlOnly = make(map[string]Collector)
+	for name, c := range p.Collectors {
+		switch collectorScopes[name] {
+		case scopeDatabase:
+			local[name] = c
+		case scopeDatabaseUnlabelled:
+			controlOnly[name] = c
+		default:
+			cluster[name] = c
+		}
+	}
+	return cluster, local, controlOnly
+}
+
+func (p PostgresCollector) acquire() bool {
+	if p.connSema == nil {
+		return true
+	}
+	if err := p.connSema.Acquire(p.ctx, 1); err != nil {
+		level.Warn(p.logger).Log("msg", "Failed to acquire semaphore", "err", err)
+		return false
+	}
+	return true
+}
+
+func (p PostgresCollector) release() {
+	if p.connSema != nil {
+		p.connSema.Release(1)
+	}
+}
+
+// reportSelection publishes what this engine meant to cover, before it tries.
+func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server string, sel dbSelection) {
+	selected := 0
+	for _, t := range sel.targets {
+		if !t.skipDatabaseLocal {
+			selected++
+		}
+	}
+	gauge := func(d *prometheus.Desc, v float64) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, server)
+	}
+	gauge(collectorDiscoveredDesc, float64(sel.discovered))
+	gauge(collectorSelectedDesc, float64(selected))
+	gauge(collectorExcludedDesc, float64(len(sel.excluded)+sel.notIncluded))
+	gauge(collectorDiscoverySuccessDesc, boolToFloat(sel.ok))
+	for _, name := range sel.excluded {
+		ch <- prometheus.MustNewConstMetric(collectorExcludedDatabaseDesc, prometheus.GaugeValue, 1,
+			server, name, dbselect.ReasonExcludeList)
+	}
+}
+
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// execute runs one collector and reports whether it worked. datname is the
+// database it ran against, empty for a cluster-wide collector.
+func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string) {
 	begin := time.Now()
 	err := c.Update(ctx, instance, ch)
 	duration := time.Since(begin)
@@ -256,17 +502,17 @@ func execute(ctx context.Context, name string, c Collector, instance *instance, 
 
 	if err != nil {
 		if IsNoDataError(err) {
-			level.Debug(logger).Log("msg", "collector returned no data", "name", name, "duration_seconds", duration.Seconds(), "err", err)
+			level.Debug(logger).Log("msg", "collector returned no data", "name", name, "datname", datname, "duration_seconds", duration.Seconds(), "err", err)
 		} else {
-			level.Error(logger).Log("msg", "collector failed", "name", name, "duration_seconds", duration.Seconds(), "err", err)
+			level.Error(logger).Log("msg", "collector failed", "name", name, "datname", datname, "duration_seconds", duration.Seconds(), "err", err)
 		}
 		success = 0
 	} else {
-		level.Debug(logger).Log("msg", "collector succeeded", "name", name, "duration_seconds", duration.Seconds())
+		level.Debug(logger).Log("msg", "collector succeeded", "name", name, "datname", datname, "duration_seconds", duration.Seconds())
 		success = 1
 	}
-	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, duration.Seconds(), name)
-	ch <- prometheus.MustNewConstMetric(scrapeSuccessDesc, prometheus.GaugeValue, success, name)
+	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, duration.Seconds(), name, datname)
+	ch <- prometheus.MustNewConstMetric(scrapeSuccessDesc, prometheus.GaugeValue, success, name, datname)
 }
 
 // collectorFlagAction generates a new action function for the given collector

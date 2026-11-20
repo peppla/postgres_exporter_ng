@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,7 @@ import (
 	"github.com/go-kit/log"
 	_ "github.com/lib/pq"
 	"github.com/percona/postgres_exporter/collector"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -233,21 +235,27 @@ func (s *IntegrationSuite) TestNamespacedCollectorsAgainstServer(c *C) {
 	success, ok := families["pg_scrape_collector_success"]
 	c.Assert(ok, Equals, true,
 		Commentf("no collector reported a scrape status"))
-	c.Check(len(success.GetMetric()), Equals, len(pc.Collectors))
 
+	// Every enabled collector reports at least once. Database-local ones
+	// report once per database they ran in, so the sample count is no longer
+	// the collector count, which is what the fan-out changed.
+	reported := map[string]int{}
 	var failed []string
 	for _, m := range success.GetMetric() {
-		if m.GetGauge().GetValue() == 1 {
-			continue
-		}
-		name := ""
+		labels := map[string]string{}
 		for _, l := range m.GetLabel() {
-			if l.GetName() == "collector" {
-				name = l.GetValue()
-			}
+			labels[l.GetName()] = l.GetValue()
 		}
-		failed = append(failed, name)
+		reported[labels["collector"]]++
+		if m.GetGauge().GetValue() != 1 {
+			failed = append(failed, labels["collector"]+"/"+labels["datname"])
+		}
 	}
+	for name := range pc.Collectors {
+		c.Check(reported[name] > 0, Equals, true,
+			Commentf("%s reported no status at all", name))
+	}
+	c.Check(len(reported), Equals, len(pc.Collectors))
 	c.Check(failed, IsNil, Commentf("collectors failed against this server: %v", failed))
 
 	// A collector can report success and emit nothing. pg_stat_database has a
@@ -629,4 +637,160 @@ func hostPort(c *C, dsn string) string {
 	u, err := url.Parse(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	return u.Host
+}
+
+// TestCollectorFanOutReachesOtherDatabases is the point of the fan-out.
+//
+// pg_stat_user_tables shows the tables of the database the connection is
+// attached to and nothing else, so before the fan-out the namespaced
+// collectors reported the configured database's tables and said nothing at all
+// about any other database on the server. A server with a hundred databases
+// looked like a server with one.
+//
+// The test seeds a table in a database the DSN does not point at, and requires
+// it to appear in the scrape.
+func (s *IntegrationSuite) TestCollectorFanOutReachesOtherDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "fanout_other"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE TABLE fanout_marker (id int)`)
+	c.Assert(err, IsNil)
+	// pg_stat_user_tables only shows a relation once statistics exist for it.
+	_, err = seed.db.Exec(`SELECT count(*) FROM fanout_marker`)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	// The seeded table, in a database the DSN does not name.
+	found := false
+	var seenDatabases []string
+	for name, f := range families {
+		if !strings.HasPrefix(name, "pg_stat_user_tables_") {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			seenDatabases = append(seenDatabases, labels["datname"])
+			if labels["datname"] == other && labels["relname"] == "fanout_marker" {
+				found = true
+			}
+		}
+	}
+	c.Check(found, Equals, true,
+		Commentf("a table in %q did not reach the scrape; databases seen: %v", other, uniq(seenDatabases)))
+
+	// The engine reports its own coverage, separately from the legacy engine.
+	for _, name := range []string{
+		"pg_collector_databases_discovered",
+		"pg_collector_databases_selected",
+		"pg_collector_databases_excluded",
+		"pg_collector_database_discovery_success",
+	} {
+		_, ok := families[name]
+		c.Check(ok, Equals, true, Commentf("%s was not published", name))
+	}
+	c.Check(families["pg_collector_database_discovery_success"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+	selected := families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue()
+	c.Check(selected > 1, Equals, true,
+		Commentf("the collectors selected %v databases, so the fan-out was not exercised", selected))
+
+	up, ok := families["pg_collector_database_up"]
+	c.Assert(ok, Equals, true, Commentf("no per-database connection status was published"))
+	c.Check(len(up.GetMetric()), Equals, int(selected),
+		Commentf("a selected database has no connection status"))
+	for _, m := range up.GetMetric() {
+		c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+			Commentf("database reported unreachable: %v", m.GetLabel()))
+	}
+}
+
+// TestCollectorSelectionExcludesDatabases checks that the collectors' own
+// selection is applied, and that an excluded database is reported as a
+// decision rather than as a fault.
+func (s *IntegrationSuite) TestCollectorSelectionExcludesDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	catalog, err := queryDatabases(context.Background(), server)
+	c.Assert(err, IsNil)
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others) > 0, Equals, true,
+		Commentf("the fixture server has one database, so exclusion cannot be exercised"))
+	excluded := others[0]
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Of([]string{excluded}), dbselect.Absent()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+
+	named, ok := families["pg_collector_database_excluded"]
+	c.Assert(ok, Equals, true, Commentf("the excluded database was counted but not named"))
+	c.Assert(len(named.GetMetric()), Equals, 1)
+	labels := map[string]string{}
+	for _, l := range named.GetMetric()[0].GetLabel() {
+		labels[l.GetName()] = l.GetValue()
+	}
+	c.Check(labels["datname"], Equals, excluded)
+	c.Check(labels["reason"], Equals, dbselect.ReasonExcludeList)
+
+	// An excluded database is not connected to and not reported as a failure.
+	for _, m := range families["pg_collector_database_up"].GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == "datname" {
+				c.Check(l.GetValue(), Not(Equals), excluded,
+					Commentf("an excluded database was connected to anyway"))
+			}
+		}
+	}
+}
+
+func uniq(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
