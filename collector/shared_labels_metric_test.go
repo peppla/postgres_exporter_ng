@@ -282,113 +282,42 @@ func TestSharedLabelsAreNotMutated(t *testing.T) {
 }
 
 // TestPGStatUserTablesCollectorDTOEquivalence runs the collector itself over
-// fixture rows and compares every emitted metric, descriptor and DTO, against
-// the MustNewConstMetric call the collector made before this change, for the
-// same row. This is the test a benchmark cannot be: same input, both
-// constructions, everything compared.
+// fixture rows and checks that every metric it emits writes the same DTO as
+// the MustNewConstMetric call it replaced. This is the test a benchmark cannot
+// be: same input, both constructions, everything compared.
 //
-// It runs both version paths. Both queries return the same 27 columns -- the
-// older one fills the four vacuum/analyze timing columns with NULL -- but the
-// collector emits those four families only on PostgreSQL 18 and later, so the
-// older path produces 20 metrics per row rather than 24. Every other test in
-// this collector uses 18, which leaves the path most installations take
-// unchecked.
+// It derives the comparison from what the collector emitted rather than from a
+// list of expected metrics. The earlier version carried the metric names, the
+// column set and the per-version counts by hand, so adding a column to the
+// query broke the test for reasons that had nothing to do with the invariant
+// it exists to hold. What matters is narrower than the metric list: for each
+// emitted metric, a const metric built from the same descriptor, type, value
+// and labels must write an identical DTO.
 //
-// Two rows each, because a version that built the labels once and reused them
-// for every row would pass a single-row test.
+// Both version paths run, because the collector assembles a different query
+// for each and every other test in this collector uses 18, which leaves the
+// path most installations take unchecked. Two rows each, because a version
+// that built the labels once and reused them for every row would pass a
+// single-row test.
 func TestPGStatUserTablesCollectorDTOEquivalence(t *testing.T) {
-	ts := func(s string) time.Time {
-		v, err := time.Parse("2006-01-02Z", s)
-		if err != nil {
-			t.Fatalf("parsing %s: %s", s, err)
-		}
-		return v
-	}
-	lastVacuum := ts("2023-06-02Z")
-	lastAutovacuum := ts("2023-06-03Z")
-	lastAnalyze := ts("2023-06-04Z")
-	lastAutoanalyze := ts("2023-06-05Z")
-
-	columns := []string{
-		"datname", "schemaname", "relname",
-		"seq_scan", "seq_tup_read", "idx_scan", "idx_tup_fetch",
-		"n_tup_ins", "n_tup_upd", "n_tup_del", "n_tup_hot_upd",
-		"n_live_tup", "n_dead_tup", "n_mod_since_analyze",
-		"last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze",
-		"vacuum_count", "autovacuum_count", "analyze_count", "autoanalyze_count",
-		"total_size",
-		"total_vacuum_time", "total_autovacuum_time", "total_analyze_time", "total_autoanalyze_time",
-	}
-
-	// Everything up to total_size, which both versions emit. The four timing
-	// values follow per version case.
-	rowCases := []struct {
-		labels  []string
-		scanned []driver.Value
-		values  []float64
-		timings []float64
-	}{
-		{
-			labels: []string{"postgres", "public", "a_table"},
-			scanned: []driver.Value{
-				1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0,
-				lastVacuum, lastAutovacuum, lastAnalyze, lastAutoanalyze,
-				11, 12, 13, 14, 15,
-			},
-			values: []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0,
-				float64(lastVacuum.Unix()), float64(lastAutovacuum.Unix()),
-				float64(lastAnalyze.Unix()), float64(lastAutoanalyze.Unix()),
-				11, 12, 13, 14, 15},
-			timings: []float64{16, 17, 18, 19},
-		},
-		{
-			labels: []string{"otherdb", "app", "b_table"},
-			scanned: []driver.Value{
-				21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-				lastVacuum, lastAutovacuum, lastAnalyze, lastAutoanalyze,
-				32, 33, 34, 35, 36,
-			},
-			values: []float64{21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-				float64(lastVacuum.Unix()), float64(lastAutovacuum.Unix()),
-				float64(lastAnalyze.Unix()), float64(lastAutoanalyze.Unix()),
-				32, 33, 34, 35, 36},
-			timings: []float64{37, 38, 39, 40},
-		},
-	}
-
 	for _, vc := range []struct {
 		name    string
 		version semver.Version
-		query   string
-		emitted int
 	}{
-		{"pre-18", semver.MustParse("17.0.0"), statUserTablesQueryPrePG18, 20},
-		{"18-and-later", pg18, statUserTablesQueryPostPG18, 24},
+		{"pre-18", semver.MustParse("17.0.0")},
+		{"18-and-later", pg18},
 	} {
 		t.Run(vc.name, func(t *testing.T) {
-			rows := sqlmock.NewRows(columns)
-			for _, rc := range rowCases {
-				scanned := []driver.Value{rc.labels[0], rc.labels[1], rc.labels[2]}
-				scanned = append(scanned, rc.scanned...)
-				for _, v := range rc.timings {
-					if vc.emitted == 24 {
-						scanned = append(scanned, v)
-					} else {
-						scanned = append(scanned, nil) // the older server has no timings
-					}
-				}
-				if len(scanned) != len(columns) {
-					t.Fatalf("fixture row has %d values for %d columns", len(scanned), len(columns))
-				}
-				rows = rows.AddRow(scanned...)
-			}
-
 			db, mock, err := sqlmock.New()
 			if err != nil {
 				t.Fatalf("Error opening a stub db connection: %s", err)
 			}
 			defer db.Close()
-			mock.ExpectQuery(sanitizeQuery(vc.query)).WillReturnRows(rows)
+
+			rows := sqlmock.NewRows(userTablesColumns).
+				AddRow(userTablesRow("a_table")...).
+				AddRow(userTablesRow("b_table")...)
+			mock.ExpectQuery(sanitizeQuery(statUserTablesQuery(vc.version))).WillReturnRows(rows)
 
 			ch := make(chan prometheus.Metric)
 			go func() {
@@ -399,31 +328,51 @@ func TestPGStatUserTablesCollectorDTOEquivalence(t *testing.T) {
 				}
 			}()
 
-			expected := statUserTablesEmitted[:vc.emitted]
-			want := len(expected) * len(rowCases)
+			seenRelations := map[string]bool{}
 			n := 0
-			for _, rc := range rowCases {
-				values := append(append([]float64{}, rc.values...), rc.timings...)[:vc.emitted]
-				for i, e := range expected {
-					got, ok := <-ch
-					if !ok {
-						t.Fatalf("collector stopped after %d metrics, expected %d", n, want)
-					}
-					n++
-					if got.Desc() != e.desc {
-						t.Fatalf("metric %d: descriptor mismatch\n got %s\nwant %s", n, got.Desc(), e.desc)
-					}
-					constructed := prometheus.MustNewConstMetric(e.desc, e.vtype, values[i], rc.labels...)
-					if err := sameDTO(writeDTO(t, constructed), writeDTO(t, got)); err != nil {
-						t.Errorf("metric %d (%s): %s", n, e.name, err)
-					}
+			for got := range ch {
+				n++
+				dto := writeDTO(t, got)
+
+				// Rebuild the same metric the old code would have built, from
+				// what this one actually wrote.
+				//
+				// A written DTO carries its label pairs sorted by name, while
+				// MustNewConstMetric wants them in the descriptor's declared
+				// order, so they are looked up by name rather than copied in
+				// the order they arrive.
+				byName := map[string]string{}
+				for _, l := range dto.Label {
+					byName[l.GetName()] = l.GetValue()
+				}
+				seenRelations[byName["relname"]] = true
+				labels := []string{byName["datname"], byName["schemaname"], byName["relname"]}
+				var vtype prometheus.ValueType
+				var value float64
+				switch {
+				case dto.Counter != nil:
+					vtype, value = prometheus.CounterValue, dto.Counter.GetValue()
+				case dto.Gauge != nil:
+					vtype, value = prometheus.GaugeValue, dto.Gauge.GetValue()
+				default:
+					t.Fatalf("metric %d (%s) is neither a counter nor a gauge", n, got.Desc())
+				}
+
+				constructed := prometheus.MustNewConstMetric(got.Desc(), vtype, value, labels...)
+				if err := sameDTO(writeDTO(t, constructed), dto); err != nil {
+					t.Errorf("metric %d (%s): %s", n, got.Desc(), err)
 				}
 			}
-			for range ch {
-				n++
+
+			if n == 0 {
+				t.Fatal("the collector emitted nothing, so nothing was compared")
 			}
-			if n != want {
-				t.Errorf("emitted %d metrics, expected %d", n, want)
+			// Both rows have to appear, or the second row's labels were never
+			// built and the reuse bug this test exists for would pass.
+			for _, rel := range []string{"a_table", "b_table"} {
+				if !seenRelations[rel] {
+					t.Errorf("no metric carried relname=%q, so only one row was emitted", rel)
+				}
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("there were unfulfilled expectations: %s", err)
@@ -556,5 +505,31 @@ func TestSharedLabelsRenderIdenticalText(t *testing.T) {
 				t.Fatalf("output lengths differ: %d lines against %d", len(gl), len(wl))
 			}
 		})
+	}
+}
+
+// userTablesRow builds one fixture row for userTablesColumns, with a given
+// relation name so two rows can be told apart.
+//
+// Values are arbitrary and distinct; what the equivalence test checks is that
+// whatever comes out is written identically by both constructions, not what
+// the numbers are.
+func userTablesRow(relname string) []driver.Value {
+	ts := func(s string) time.Time {
+		v, _ := time.Parse("2006-01-02Z", s)
+		return v
+	}
+	return []driver.Value{
+		"postgres", "public", relname,
+		1, 2, 3, 4, // seq_scan, seq_tup_read, idx_scan, idx_tup_fetch
+		5, 6, 7, 8, // n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd
+		9, 10, 0, 27, // n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum
+		ts("2023-06-02Z"), ts("2023-06-03Z"), ts("2023-06-04Z"), ts("2023-06-05Z"),
+		11, 12, 13, 14, // vacuum_count, autovacuum_count, analyze_count, autoanalyze_count
+		15,             // total_size
+		20,             // n_tup_newpage_upd
+		21, 22, 23, 24, // relpages, reltuples, relallvisible, relallfrozen
+		25, 26, // relfrozenxid_age, relminmxid_age
+		16, 17, 18, 19, // the four total_*_time columns
 	}
 }

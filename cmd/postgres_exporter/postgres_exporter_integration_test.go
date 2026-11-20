@@ -1828,3 +1828,93 @@ app_any_version:
 	c.Check(any, Equals, true,
 		Commentf("an unrestricted query did not run, so one query's restriction reached another"))
 }
+
+// TestTableCatalogMetricsAgainstServer checks the rewritten table collector
+// against a real server, including its version gates.
+//
+// The collector reads pg_class directly instead of querying
+// pg_stat_user_tables and joining back to it, and assembles its query per
+// version because PostgreSQL resolves missing columns and functions at parse
+// time. A query that is wrong for a version fails at parse, which sqlmock
+// cannot see: it never parses anything.
+func (s *IntegrationSuite) TestTableCatalogMetricsAgainstServer(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const table = "catalog_metrics_marker"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP TABLE IF EXISTS ` + table) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`INSERT INTO ` + table + ` SELECT generate_series(1, 100)`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`VACUUM ANALYZE ` + table)
+	c.Assert(err, IsNil)
+
+	var major int
+	c.Assert(admin.db.QueryRow(`SELECT current_setting('server_version_num')::int / 10000`).Scan(&major), IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	carries := func(name string) bool {
+		f, ok := families[name]
+		if !ok {
+			return false
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "relname" && l.GetValue() == table {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Present on every supported version.
+	for _, name := range []string{
+		"pg_stat_user_tables_n_ins_since_vacuum",
+		"pg_stat_user_tables_relpages",
+		"pg_stat_user_tables_reltuples",
+		"pg_stat_user_tables_relallvisible",
+		"pg_stat_user_tables_relfrozenxid_age",
+		"pg_stat_user_tables_relminmxid_age",
+	} {
+		c.Check(carries(name), Equals, true,
+			Commentf("%s carries nothing for the seeded table on PostgreSQL %d", name, major))
+	}
+
+	// Version gates. A gate that is wrong in the permissive direction fails
+	// the query at parse time and takes the whole collector with it, which the
+	// collector-success assertion below would catch; a gate wrong in the
+	// restrictive direction silently drops a metric, which is what this
+	// checks.
+	c.Check(carries("pg_stat_user_tables_n_tup_newpage_upd"), Equals, major >= 16,
+		Commentf("n_tup_newpage_upd on PostgreSQL %d", major))
+	c.Check(carries("pg_stat_user_tables_relallfrozen"), Equals, major >= 18,
+		Commentf("relallfrozen on PostgreSQL %d", major))
+
+	for _, m := range families["pg_scrape_collector_success"].GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["collector"] == "stat_user_tables" {
+			c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+				Commentf("the table collector failed against %q on PostgreSQL %d", labels["datname"], major))
+		}
+	}
+}
