@@ -77,6 +77,11 @@ type dbSelection struct {
 	// still a target in that case, so coverage collapses to one database, and
 	// saying so is the difference between that and a one-database server.
 	ok bool
+	// catalogRead says whether discovered is a number the server gave. When
+	// the catalog could not be read there is no total to publish, and the
+	// total it would otherwise report is 1, which looks exactly like a
+	// one-database server.
+	catalogRead bool
 }
 
 // selectDatabases reads the catalog over the control connection and applies
@@ -89,14 +94,43 @@ type dbSelection struct {
 // database-local collection for that database does not.
 func selectDatabases(ctx context.Context, inst *instance, exclude, include dbselect.List) (dbSelection, error) {
 	controlName, _ := config.DatabaseFromDSN(inst.dsn)
+
+	// controlTargetFor applies the rule to the configured database. It runs on
+	// every path, including the ones where discovery failed: a database the
+	// operator excluded stays excluded whether or not the catalog could be
+	// read, and an earlier version skipped the rule on the failure paths, so a
+	// catalog error turned an exclusion back into collection.
+	//
+	// The target itself is always present. Being left out means no
+	// database-local collection there, not that the connection stops being
+	// used for cluster-wide work.
+	controlTargetFor := func(sel *dbSelection, name string) dbTarget {
+		t := dbTarget{datname: name, dsn: inst.dsn, control: true}
+		if name == "" {
+			// No name to test the rule against. With any restriction
+			// configured, that is not a database this engine can show was
+			// wanted, so it gets cluster-wide work only.
+			if include.Given() || len(exclude.Names()) > 0 {
+				t.skipDatabaseLocal = true
+				sel.notIncluded++
+			}
+			return t
+		}
+		decided := dbselect.Apply([]string{name}, exclude, include)
+		if len(decided.Selected) == 0 {
+			t.skipDatabaseLocal = true
+			sel.excluded = append(sel.excluded, decided.Excluded...)
+			sel.notIncluded += decided.NotIncluded
+		}
+		return t
+	}
+
 	// Whatever happens below, the configured connection is a target: it is
 	// what the cluster-wide collectors run on.
 	alone := func(err error) (dbSelection, error) {
-		return dbSelection{
-			targets:    []dbTarget{{datname: controlName, dsn: inst.dsn, control: true}},
-			discovered: 1,
-			ok:         false,
-		}, err
+		sel := dbSelection{ok: false}
+		sel.targets = []dbTarget{controlTargetFor(&sel, controlName)}
+		return sel, err
 	}
 
 	names, catalogControl, err := readCatalog(ctx, inst)
@@ -107,24 +141,12 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 		controlName = catalogControl
 	}
 
-	sel := dbSelection{ok: true, discovered: len(names)}
+	sel := dbSelection{ok: true, catalogRead: true, discovered: len(names)}
 	if catalogControl != "" {
 		sel.discovered++
 	}
 
-	// The control database goes through the same rule as the rest. Being left
-	// out means no database-local collection there, not that its connection
-	// stops being used, so it stays a target either way.
-	control := dbTarget{datname: controlName, dsn: inst.dsn, control: true}
-	if catalogControl != "" {
-		decided := dbselect.Apply([]string{catalogControl}, exclude, include)
-		if len(decided.Selected) == 0 {
-			control.skipDatabaseLocal = true
-			sel.excluded = append(sel.excluded, decided.Excluded...)
-			sel.notIncluded += decided.NotIncluded
-		}
-	}
-	sel.targets = append(sel.targets, control)
+	sel.targets = append(sel.targets, controlTargetFor(&sel, controlName))
 
 	applied := dbselect.Apply(names, exclude, include)
 	sel.excluded = append(sel.excluded, applied.Excluded...)

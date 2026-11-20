@@ -23,6 +23,7 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -96,6 +97,12 @@ var (
 		prometheus.BuildFQName(namespace, "collector", "database_discovery_success"),
 		"Whether the namespaced collectors could determine the set of databases (1 for yes, 0 for no). When this is 0 the set has collapsed to the configured connection database, which otherwise looks like a one-database server.",
 		[]string{"server"},
+		nil,
+	)
+	collectorDatabaseErrorDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "database_error"),
+		"1 for each selected database the collectors did not reach, labelled with why: connect for a connection that failed, not_attempted for work that never started. Reasons are a closed set, never an error message.",
+		[]string{"server", "datname", "reason"},
 		nil,
 	)
 	collectorExcludedDatabaseDesc = prometheus.NewDesc(
@@ -303,6 +310,7 @@ func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collectorExcludedDesc
 	ch <- collectorDiscoverySuccessDesc
 	ch <- collectorExcludedDatabaseDesc
+	ch <- collectorDatabaseErrorDesc
 }
 
 // Collect implements the prometheus.Collector interface.
@@ -317,14 +325,24 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// copy the instance so that concurrent scrapes have independent instances
 	inst := p.instance.copy()
 
+	// The control database's name as configured. The catalog may correct it
+	// later, but a failure before that still has to name something.
+	controlName, _ := config.DatabaseFromDSN(inst.dsn)
+
 	if !p.acquire() {
+		// Nothing was attempted, which is neither a success nor a connection
+		// failure. Returning silently here published no series at all, so a
+		// scrape that collected nothing was indistinguishable from one that
+		// was never configured to collect.
+		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonNotAttempted)
 		return
 	}
 	// Set up the database connection for the collector.
-	err := inst.setup()
+	err := inst.setup(p.ctx)
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "err", err)
 		p.release()
+		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonConnect)
 		return
 	}
 
@@ -395,19 +413,23 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 // alternative is emitting no series for it at all, which reads the same as a
 // database that was never selected.
 func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) {
-	if !p.acquire() {
+	fail := func(reason string) {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, t.datname, reason)
+	}
+	if !p.acquire() {
+		fail(dbselect.ReasonNotAttempted)
 		return
 	}
 	defer p.release()
 
 	dbInst, err := newInstance(t.dsn)
 	if err == nil {
-		err = dbInst.setup()
+		err = dbInst.setup(p.ctx)
 	}
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "datname", t.datname, "err", err)
-		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
+		fail(dbselect.ReasonConnect)
 		return
 	}
 	defer dbInst.Close()
@@ -475,7 +497,13 @@ func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server s
 	gauge := func(d *prometheus.Desc, v float64) {
 		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, server)
 	}
-	gauge(collectorDiscoveredDesc, float64(sel.discovered))
+	// discovered is published only when the catalog was actually read. A
+	// number here when it was not would be an invented total, and the number
+	// it would invent is 1, which is exactly what a one-database server looks
+	// like. discovery_success says the set is unknown instead.
+	if sel.catalogRead {
+		gauge(collectorDiscoveredDesc, float64(sel.discovered))
+	}
 	gauge(collectorSelectedDesc, float64(selected))
 	gauge(collectorExcludedDesc, float64(len(sel.excluded)+sel.notIncluded))
 	gauge(collectorDiscoverySuccessDesc, boolToFloat(sel.ok))
@@ -483,6 +511,36 @@ func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server s
 		ch <- prometheus.MustNewConstMetric(collectorExcludedDatabaseDesc, prometheus.GaugeValue, 1,
 			server, name, dbselect.ReasonExcludeList)
 	}
+}
+
+// reportControlFailure publishes the one thing that is known when the control
+// connection never worked: this engine collected nothing, and why.
+//
+// No discovered total is published, because discovery did not run and a count
+// here would be invented. Selected is 1 only when the rule would have kept the
+// control database, so a scrape configured to collect from nothing does not
+// report a shortfall it never intended.
+func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, server, datname, reason string) {
+	selected := 0
+	if p.controlSelected(datname) {
+		selected = 1
+	}
+	ch <- prometheus.MustNewConstMetric(collectorSelectedDesc, prometheus.GaugeValue, float64(selected), server)
+	ch <- prometheus.MustNewConstMetric(collectorDiscoverySuccessDesc, prometheus.GaugeValue, 0, server)
+	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, datname)
+	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, datname, reason)
+}
+
+// controlSelected reports whether the configured database would get
+// database-local collection under the configured rule.
+//
+// With no name to test and a restriction configured, the answer is no: an
+// include list that cannot be checked is not an include list that passed.
+func (p PostgresCollector) controlSelected(datname string) bool {
+	if datname == "" {
+		return !p.includeDatabases.Given() && len(p.excludeDatabases.Names()) == 0
+	}
+	return len(dbselect.Apply([]string{datname}, p.excludeDatabases, p.includeDatabases).Selected) == 1
 }
 
 func boolToFloat(b bool) float64 {
