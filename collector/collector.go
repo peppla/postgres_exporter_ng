@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -198,6 +199,43 @@ type PostgresCollector struct {
 }
 
 type Option func(*PostgresCollector) error
+
+// scopedCollectors returns the enabled collectors that registered with the
+// given scope.
+//
+// The classification is read from the registration, not from a second list of
+// names kept beside it. A list like that is only correct while someone
+// maintains it: a collector renamed, or added without a thought for it, falls
+// to whichever side the lookup happens to miss and nothing says so. The scope
+// is already a required argument to registerCollector, so there is one answer
+// and it is the one the fan-out uses.
+//
+// Disabled collectors are left out rather than reported as an error. A group
+// asks for whatever of its kind the exporter has, which is a different request
+// from naming a collector, where being turned off is worth saying.
+func scopedCollectors(scope collectorScope) []string {
+	var names []string
+	for name, enabled := range collectorState {
+		if enabled == nil || !*enabled {
+			continue
+		}
+		if collectorScopes[name] == scope {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ClusterScopedCollectors returns the enabled collectors whose answer is the
+// same from any database on the server, so one scrape of them describes the
+// whole cluster.
+func ClusterScopedCollectors() []string { return scopedCollectors(scopeCluster) }
+
+// DatabaseScopedCollectors returns the enabled collectors that read catalogs
+// belonging to one database, and which therefore run once per selected
+// database and carry a datname label.
+func DatabaseScopedCollectors() []string { return scopedCollectors(scopeDatabase) }
 
 // NewPostgresCollector creates a new PostgresCollector.
 func NewPostgresCollector(logger log.Logger, excludeDatabases []string, dsn string, filters []string, options ...Option) (*PostgresCollector, error) {

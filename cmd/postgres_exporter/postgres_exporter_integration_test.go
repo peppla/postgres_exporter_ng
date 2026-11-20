@@ -3003,3 +3003,110 @@ edited_probe:
 	c.Check(edited, Equals, float64(22),
 		Commentf("the edited query returned %v, so a result from before the edit was served", edited))
 }
+
+// scrapeWith serves one /metrics request with the given collect[] values and
+// returns the status and the body.
+//
+// This goes through the HTTP handler rather than gathering a collector
+// directly, because what is being tested is the selection a scrape asks for,
+// and that lives in the request.
+func scrapeWith(dsn string, collect ...string) (int, string) {
+	code, body, _ := scrapeHTTP(dsn, budget.Defaults(), "", collect...)
+	return code, body
+}
+
+// hasFamily reports whether a scrape's body carries any sample of a family.
+//
+// The body is read rather than parsed. expfmt's text parser needs a name
+// validation scheme that this version of prometheus/common leaves unset, and
+// setting a global to read one response is a worse trade than matching the
+// sample lines, which is all this needs.
+func hasFamily(body, name string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, name+"{") || strings.HasPrefix(line, name+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCollectSelectsCollectorsByScope covers the per-collector and per-scope
+// collect[] selection against a running server.
+//
+// The two groups are what let one exporter serve two Prometheus jobs at
+// different intervals, with the per-database collectors on the slower one. For
+// that to work each group has to collect its own side and not the other's, so
+// the test names a family from each side and requires it present on one and
+// absent on the other.
+func (s *IntegrationSuite) TestCollectSelectsCollectorsByScope(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	const clusterFamily = "pg_stat_database_blks_read"
+	// pg_extensions rather than a table family: the connected database may
+	// hold no user tables, and a collector with nothing to report looks the
+	// same as a collector that was not selected. Every database has plpgsql.
+	const databaseFamily = "pg_extensions"
+
+	// The premise first. Without it, a test that finds neither family would
+	// report that selection works when in fact nothing was collected at all.
+	code, all := scrapeWith(dsn, "postgres")
+	c.Assert(code, Equals, 200)
+	c.Assert(hasFamily(all, clusterFamily), Equals, true,
+		Commentf("%s is missing from an unfiltered scrape, so the fixture is wrong", clusterFamily))
+	c.Assert(hasFamily(all, databaseFamily), Equals, true,
+		Commentf("%s is missing from an unfiltered scrape, so the fixture is wrong", databaseFamily))
+
+	for _, tc := range []struct {
+		name        string
+		collect     []string
+		wantCluster bool
+		wantLocal   bool
+	}{
+		{"the cluster group collects its own side only",
+			[]string{"postgres.cluster"}, true, false},
+		{"the database group collects its own side only",
+			[]string{"postgres.database"}, false, true},
+		{"both groups together collect everything",
+			[]string{"postgres.cluster", "postgres.database"}, true, true},
+		{"one collector by name collects only itself",
+			[]string{"postgres.collector.extensions"}, false, true},
+		{"a bare postgres overrides a narrower selection",
+			[]string{"postgres.collector.extensions", "postgres"}, true, true},
+	} {
+		code, body := scrapeWith(dsn, tc.collect...)
+		c.Check(code, Equals, 200, Commentf("%s: %v", tc.name, tc.collect))
+
+		gotCluster := hasFamily(body, clusterFamily)
+		gotLocal := hasFamily(body, databaseFamily)
+		c.Check(gotCluster, Equals, tc.wantCluster,
+			Commentf("%s: %s present=%v, want %v", tc.name, clusterFamily, gotCluster, tc.wantCluster))
+		c.Check(gotLocal, Equals, tc.wantLocal,
+			Commentf("%s: %s present=%v, want %v", tc.name, databaseFamily, gotLocal, tc.wantLocal))
+	}
+}
+
+// TestCollectRejectsAnUnusableSelection covers the failure that used to look
+// like a success.
+//
+// A collect[] naming a collector that does not exist, or one that is turned
+// off, used to produce a scrape that returned 200 with no metrics in it.
+// Prometheus records that as a healthy target reporting nothing, which is the
+// same shape as a database with nothing to report.
+func (s *IntegrationSuite) TestCollectRejectsAnUnusableSelection(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	for _, tc := range []struct {
+		name    string
+		collect string
+	}{
+		{"an unknown collector name", "postgres.collector.no_such_collector"},
+		{"a collector that ships disabled", "postgres.collector.stat_wal_receiver"},
+		{"an unknown value in the postgres namespace", "postgres.nonsense"},
+		{"the old second-level collector form", "postgres.stat_user_tables"},
+	} {
+		code, _ := scrapeWith(dsn, tc.collect)
+		c.Check(code, Equals, 400, Commentf("%s: %s returned %d", tc.name, tc.collect, code))
+	}
+}
