@@ -505,12 +505,7 @@ func (c *PGStatUserTablesCollector) Update(ctx context.Context, instance *instan
 		if nInsSinceVacuum.Valid {
 			nInsSinceVacuumMetric = float64(nInsSinceVacuum.Int64)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			statUserTablesNInsSinceVacuum,
-			prometheus.GaugeValue,
-			nInsSinceVacuumMetric,
-			datnameLabel, schemanameLabel, relnameLabel,
-		)
+		emit(statUserTablesNInsSinceVacuum, prometheus.GaugeValue, nInsSinceVacuumMetric)
 
 		lastVacuumMetric := 0.0
 		if lastVacuum.Valid {
@@ -574,12 +569,7 @@ func (c *PGStatUserTablesCollector) Update(ctx context.Context, instance *instan
 			if nTupNewpageUpd.Valid {
 				nTupNewpageUpdMetric = float64(nTupNewpageUpd.Int64)
 			}
-			ch <- prometheus.MustNewConstMetric(
-				statUserTablesNTupNewpageUpd,
-				prometheus.CounterValue,
-				nTupNewpageUpdMetric,
-				datnameLabel, schemanameLabel, relnameLabel,
-			)
+			emit(statUserTablesNTupNewpageUpd, prometheus.CounterValue, nTupNewpageUpdMetric)
 		}
 
 		// pg_class statistics. relpages, reltuples and relallvisible are
@@ -588,12 +578,7 @@ func (c *PGStatUserTablesCollector) Update(ctx context.Context, instance *instan
 		if relpages.Valid {
 			relpagesMetric = float64(relpages.Int64)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			statUserTablesRelpages,
-			prometheus.GaugeValue,
-			relpagesMetric,
-			datnameLabel, schemanameLabel, relnameLabel,
-		)
+		emit(statUserTablesRelpages, prometheus.GaugeValue, relpagesMetric)
 
 		// reltuples may legitimately be -1 (PostgreSQL 14+: "never analyzed").
 		// We emit the raw value so that state is observable rather than masked.
@@ -601,23 +586,13 @@ func (c *PGStatUserTablesCollector) Update(ctx context.Context, instance *instan
 		if reltuples.Valid {
 			reltuplesMetric = reltuples.Float64
 		}
-		ch <- prometheus.MustNewConstMetric(
-			statUserTablesReltuples,
-			prometheus.GaugeValue,
-			reltuplesMetric,
-			datnameLabel, schemanameLabel, relnameLabel,
-		)
+		emit(statUserTablesReltuples, prometheus.GaugeValue, reltuplesMetric)
 
 		relallvisibleMetric := 0.0
 		if relallvisible.Valid {
 			relallvisibleMetric = float64(relallvisible.Int64)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			statUserTablesRelallvisible,
-			prometheus.GaugeValue,
-			relallvisibleMetric,
-			datnameLabel, schemanameLabel, relnameLabel,
-		)
+		emit(statUserTablesRelallvisible, prometheus.GaugeValue, relallvisibleMetric)
 
 		// relallfrozen is PostgreSQL 18+ only; skip on older versions.
 		if v18plus {
@@ -625,12 +600,7 @@ func (c *PGStatUserTablesCollector) Update(ctx context.Context, instance *instan
 			if relallfrozen.Valid {
 				relallfrozenMetric = float64(relallfrozen.Int64)
 			}
-			ch <- prometheus.MustNewConstMetric(
-				statUserTablesRelallfrozen,
-				prometheus.GaugeValue,
-				relallfrozenMetric,
-				datnameLabel, schemanameLabel, relnameLabel,
-			)
+			emit(statUserTablesRelallfrozen, prometheus.GaugeValue, relallfrozenMetric)
 		}
 
 		// Freeze-deadline ages (available on all supported versions).
@@ -638,23 +608,13 @@ func (c *PGStatUserTablesCollector) Update(ctx context.Context, instance *instan
 		if relfrozenxidAge.Valid {
 			relfrozenxidAgeMetric = float64(relfrozenxidAge.Int64)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			statUserTablesRelfrozenxidAge,
-			prometheus.GaugeValue,
-			relfrozenxidAgeMetric,
-			datnameLabel, schemanameLabel, relnameLabel,
-		)
+		emit(statUserTablesRelfrozenxidAge, prometheus.GaugeValue, relfrozenxidAgeMetric)
 
 		relminmxidAgeMetric := 0.0
 		if relminmxidAge.Valid {
 			relminmxidAgeMetric = float64(relminmxidAge.Int64)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			statUserTablesRelminmxidAge,
-			prometheus.GaugeValue,
-			relminmxidAgeMetric,
-			datnameLabel, schemanameLabel, relnameLabel,
-		)
+		emit(statUserTablesRelminmxidAge, prometheus.GaugeValue, relminmxidAgeMetric)
 
 		if v18plus {
 			// PostgreSQL 18+ vacuum/analyze timing metrics
