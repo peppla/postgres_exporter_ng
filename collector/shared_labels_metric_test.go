@@ -56,35 +56,48 @@ import (
 // them drift, and a descriptor missing from either list is a descriptor nothing
 // checks. A metric added to the collector has to be added here, and both tests
 // then cover it.
+// minMajor is the first PostgreSQL major version that produces the family. A
+// zero means every supported version does. A gated family is omitted below its
+// version rather than published as a zero, which is the distinction the
+// equivalence test's expected sets rest on.
 var statUserTablesEmitted = []struct {
-	name  string
-	desc  *prometheus.Desc
-	vtype prometheus.ValueType
+	name     string
+	desc     *prometheus.Desc
+	vtype    prometheus.ValueType
+	minMajor uint64
 }{
-	{"seq_scan", statUserTablesSeqScan, prometheus.CounterValue},
-	{"seq_tup_read", statUserTablesSeqTupRead, prometheus.CounterValue},
-	{"idx_scan", statUserTablesIdxScan, prometheus.CounterValue},
-	{"idx_tup_fetch", statUserTablesIdxTupFetch, prometheus.CounterValue},
-	{"n_tup_ins", statUserTablesNTupIns, prometheus.CounterValue},
-	{"n_tup_upd", statUserTablesNTupUpd, prometheus.CounterValue},
-	{"n_tup_del", statUserTablesNTupDel, prometheus.CounterValue},
-	{"n_tup_hot_upd", statUserTablesNTupHotUpd, prometheus.CounterValue},
-	{"n_live_tup", statUserTablesNLiveTup, prometheus.GaugeValue},
-	{"n_dead_tup", statUserTablesNDeadTup, prometheus.GaugeValue},
-	{"n_mod_since_analyze", statUserTablesNModSinceAnalyze, prometheus.GaugeValue},
-	{"last_vacuum", statUserTablesLastVacuum, prometheus.GaugeValue},
-	{"last_autovacuum", statUserTablesLastAutovacuum, prometheus.GaugeValue},
-	{"last_analyze", statUserTablesLastAnalyze, prometheus.GaugeValue},
-	{"last_autoanalyze", statUserTablesLastAutoanalyze, prometheus.GaugeValue},
-	{"vacuum_count", statUserTablesVacuumCount, prometheus.CounterValue},
-	{"autovacuum_count", statUserTablesAutovacuumCount, prometheus.CounterValue},
-	{"analyze_count", statUserTablesAnalyzeCount, prometheus.CounterValue},
-	{"autoanalyze_count", statUserTablesAutoanalyzeCount, prometheus.CounterValue},
-	{"total_size", statUserTablesTotalSize, prometheus.GaugeValue},
-	{"total_vacuum_time", statUserTablesTotalVacuumTime, prometheus.CounterValue},
-	{"total_autovacuum_time", statUserTablesTotalAutovacuumTime, prometheus.CounterValue},
-	{"total_analyze_time", statUserTablesTotalAnalyzeTime, prometheus.CounterValue},
-	{"total_autoanalyze_time", statUserTablesTotalAutoanalyzeTime, prometheus.CounterValue},
+	{"seq_scan", statUserTablesSeqScan, prometheus.CounterValue, 0},
+	{"seq_tup_read", statUserTablesSeqTupRead, prometheus.CounterValue, 0},
+	{"idx_scan", statUserTablesIdxScan, prometheus.CounterValue, 0},
+	{"idx_tup_fetch", statUserTablesIdxTupFetch, prometheus.CounterValue, 0},
+	{"n_tup_ins", statUserTablesNTupIns, prometheus.CounterValue, 0},
+	{"n_tup_upd", statUserTablesNTupUpd, prometheus.CounterValue, 0},
+	{"n_tup_del", statUserTablesNTupDel, prometheus.CounterValue, 0},
+	{"n_tup_hot_upd", statUserTablesNTupHotUpd, prometheus.CounterValue, 0},
+	{"n_live_tup", statUserTablesNLiveTup, prometheus.GaugeValue, 0},
+	{"n_dead_tup", statUserTablesNDeadTup, prometheus.GaugeValue, 0},
+	{"n_mod_since_analyze", statUserTablesNModSinceAnalyze, prometheus.GaugeValue, 0},
+	{"n_ins_since_vacuum", statUserTablesNInsSinceVacuum, prometheus.GaugeValue, 0},
+	{"last_vacuum", statUserTablesLastVacuum, prometheus.GaugeValue, 0},
+	{"last_autovacuum", statUserTablesLastAutovacuum, prometheus.GaugeValue, 0},
+	{"last_analyze", statUserTablesLastAnalyze, prometheus.GaugeValue, 0},
+	{"last_autoanalyze", statUserTablesLastAutoanalyze, prometheus.GaugeValue, 0},
+	{"vacuum_count", statUserTablesVacuumCount, prometheus.CounterValue, 0},
+	{"autovacuum_count", statUserTablesAutovacuumCount, prometheus.CounterValue, 0},
+	{"analyze_count", statUserTablesAnalyzeCount, prometheus.CounterValue, 0},
+	{"autoanalyze_count", statUserTablesAutoanalyzeCount, prometheus.CounterValue, 0},
+	{"total_size", statUserTablesTotalSize, prometheus.GaugeValue, 0},
+	{"n_tup_newpage_upd", statUserTablesNTupNewpageUpd, prometheus.CounterValue, 16},
+	{"relpages", statUserTablesRelpages, prometheus.GaugeValue, 0},
+	{"reltuples", statUserTablesReltuples, prometheus.GaugeValue, 0},
+	{"relallvisible", statUserTablesRelallvisible, prometheus.GaugeValue, 0},
+	{"relallfrozen", statUserTablesRelallfrozen, prometheus.GaugeValue, 18},
+	{"relfrozenxid_age", statUserTablesRelfrozenxidAge, prometheus.GaugeValue, 0},
+	{"relminmxid_age", statUserTablesRelminmxidAge, prometheus.GaugeValue, 0},
+	{"total_vacuum_time", statUserTablesTotalVacuumTime, prometheus.CounterValue, 18},
+	{"total_autovacuum_time", statUserTablesTotalAutovacuumTime, prometheus.CounterValue, 18},
+	{"total_analyze_time", statUserTablesTotalAnalyzeTime, prometheus.CounterValue, 18},
+	{"total_autoanalyze_time", statUserTablesTotalAutoanalyzeTime, prometheus.CounterValue, 18},
 }
 
 func writeDTO(t *testing.T, m prometheus.Metric) *dto.Metric {
@@ -162,8 +175,8 @@ func TestSharedLabelsMetricMatchesConstMetric(t *testing.T) {
 		math.NaN(), math.Inf(1), math.Inf(-1)}
 	types := []prometheus.ValueType{prometheus.CounterValue, prometheus.GaugeValue, prometheus.UntypedValue}
 
-	if len(statUserTablesEmitted) != 24 {
-		t.Fatalf("expected 24 descriptors, listed %d", len(statUserTablesEmitted))
+	if len(statUserTablesEmitted) != 32 {
+		t.Fatalf("expected 32 descriptors, listed %d", len(statUserTablesEmitted))
 	}
 
 	for _, lv := range labelSets {
@@ -282,24 +295,33 @@ func TestSharedLabelsAreNotMutated(t *testing.T) {
 }
 
 // TestPGStatUserTablesCollectorDTOEquivalence runs the collector itself over
-// fixture rows and checks that every metric it emits writes the same DTO as
-// the MustNewConstMetric call it replaced. This is the test a benchmark cannot
-// be: same input, both constructions, everything compared.
+// fixture rows and checks what it emits against an expected result written
+// here, not read back out of the collector.
 //
-// It derives the comparison from what the collector emitted rather than from a
-// list of expected metrics. The earlier version carried the metric names, the
-// column set and the per-version counts by hand, so adding a column to the
-// query broke the test for reasons that had nothing to do with the invariant
-// it exists to hold. What matters is narrower than the metric list: for each
-// emitted metric, a const metric built from the same descriptor, type, value
-// and labels must write an identical DTO.
+// Three things are checked at once, because one DTO comparison covers all
+// three: every family carries the column this test says it carries, with the
+// value type this test says it has and the label values the fixture row went
+// in with, and the metric the collector built writes the same DTO as the
+// MustNewConstMetric call it replaced.
+//
+// The expected set is also checked both ways. A family that disappears from
+// the collector is a missing entry, and a family that appears below its
+// version gate is an unexpected one. Neither can be absorbed by a comparison
+// that only looks at what arrived.
 //
 // Both version paths run, because the collector assembles a different query
 // for each and every other test in this collector uses 18, which leaves the
-// path most installations take unchecked. Two rows each, because a version
-// that built the labels once and reused them for every row would pass a
-// single-row test.
+// path most installations take unchecked. Two rows each, with no value in
+// common, because a version that built one row's numbers or labels and reused
+// them for the next would pass a single-row test.
 func TestPGStatUserTablesCollectorDTOEquivalence(t *testing.T) {
+	byDesc := map[*prometheus.Desc]int{}
+	byFamily := map[string]int{}
+	for i, e := range statUserTablesEmitted {
+		byDesc[e.desc] = i
+		byFamily[e.name] = i
+	}
+
 	for _, vc := range []struct {
 		name    string
 		version semver.Version
@@ -314,9 +336,10 @@ func TestPGStatUserTablesCollectorDTOEquivalence(t *testing.T) {
 			}
 			defer db.Close()
 
-			rows := sqlmock.NewRows(userTablesColumns).
-				AddRow(userTablesRow("a_table")...).
-				AddRow(userTablesRow("b_table")...)
+			rows := sqlmock.NewRows(userTablesColumns)
+			for _, f := range userTablesFixtures {
+				rows = rows.AddRow(f.row()...)
+			}
 			mock.ExpectQuery(sanitizeQuery(statUserTablesQuery(vc.version))).WillReturnRows(rows)
 
 			ch := make(chan prometheus.Metric)
@@ -328,51 +351,77 @@ func TestPGStatUserTablesCollectorDTOEquivalence(t *testing.T) {
 				}
 			}()
 
-			seenRelations := map[string]bool{}
-			n := 0
-			for got := range ch {
-				n++
-				dto := writeDTO(t, got)
-
-				// Rebuild the same metric the old code would have built, from
-				// what this one actually wrote.
-				//
-				// A written DTO carries its label pairs sorted by name, while
-				// MustNewConstMetric wants them in the descriptor's declared
-				// order, so they are looked up by name rather than copied in
-				// the order they arrive.
-				byName := map[string]string{}
-				for _, l := range dto.Label {
-					byName[l.GetName()] = l.GetValue()
+			// relname -> family name -> what the collector wrote.
+			emitted := map[string]map[string]*dto.Metric{}
+			total := 0
+			for m := range ch {
+				total++
+				i, known := byDesc[m.Desc()]
+				if !known {
+					t.Fatalf("metric %d carries a descriptor no family in statUserTablesEmitted claims: %s", total, m.Desc())
 				}
-				seenRelations[byName["relname"]] = true
-				labels := []string{byName["datname"], byName["schemaname"], byName["relname"]}
-				var vtype prometheus.ValueType
-				var value float64
-				switch {
-				case dto.Counter != nil:
-					vtype, value = prometheus.CounterValue, dto.Counter.GetValue()
-				case dto.Gauge != nil:
-					vtype, value = prometheus.GaugeValue, dto.Gauge.GetValue()
-				default:
-					t.Fatalf("metric %d (%s) is neither a counter nor a gauge", n, got.Desc())
+				written := writeDTO(t, m)
+
+				// A written DTO carries its label pairs sorted by name, so the
+				// row a metric belongs to is looked up by label name rather
+				// than by position.
+				relname := ""
+				for _, l := range written.Label {
+					if l.GetName() == "relname" {
+						relname = l.GetValue()
+					}
+				}
+				if emitted[relname] == nil {
+					emitted[relname] = map[string]*dto.Metric{}
+				}
+				family := statUserTablesEmitted[i].name
+				if _, repeated := emitted[relname][family]; repeated {
+					t.Errorf("%s was emitted twice for relname=%q", family, relname)
+				}
+				emitted[relname][family] = written
+			}
+
+			wantTotal := 0
+			for _, f := range userTablesFixtures {
+				want := f.expected(vc.version.Major)
+				wantTotal += len(want)
+
+				rowEmitted, ok := emitted[f.relname]
+				if !ok {
+					t.Errorf("nothing was emitted for relname=%q", f.relname)
+					continue
 				}
 
-				constructed := prometheus.MustNewConstMetric(got.Desc(), vtype, value, labels...)
-				if err := sameDTO(writeDTO(t, constructed), dto); err != nil {
-					t.Errorf("metric %d (%s): %s", n, got.Desc(), err)
+				for family, wantValue := range want {
+					written, ok := rowEmitted[family]
+					if !ok {
+						t.Errorf("relname=%q: %s was not emitted", f.relname, family)
+						continue
+					}
+					e := statUserTablesEmitted[byFamily[family]]
+
+					// The expected metric is built from this test's own
+					// descriptor, type, value and label values, which is what
+					// makes this a reference rather than a restatement.
+					expected := prometheus.MustNewConstMetric(
+						e.desc, e.vtype, wantValue,
+						f.datname, f.schemaname, f.relname,
+					)
+					if err := sameDTO(writeDTO(t, expected), written); err != nil {
+						t.Errorf("relname=%q %s: %s", f.relname, family, err)
+					}
+				}
+
+				for family := range rowEmitted {
+					if _, expected := want[family]; !expected {
+						t.Errorf("relname=%q: %s was emitted on PostgreSQL %s, where it is not available",
+							f.relname, family, vc.version)
+					}
 				}
 			}
 
-			if n == 0 {
-				t.Fatal("the collector emitted nothing, so nothing was compared")
-			}
-			// Both rows have to appear, or the second row's labels were never
-			// built and the reuse bug this test exists for would pass.
-			for _, rel := range []string{"a_table", "b_table"} {
-				if !seenRelations[rel] {
-					t.Errorf("no metric carried relname=%q, so only one row was emitted", rel)
-				}
+			if total != wantTotal {
+				t.Errorf("the collector emitted %d metrics, expected %d", total, wantTotal)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("there were unfulfilled expectations: %s", err)
@@ -508,28 +557,140 @@ func TestSharedLabelsRenderIdenticalText(t *testing.T) {
 	}
 }
 
-// userTablesRow builds one fixture row for userTablesColumns, with a given
-// relation name so two rows can be told apart.
+// userTablesFixture is one input row for PGStatUserTablesCollector, written
+// out field by field.
 //
-// Values are arbitrary and distinct; what the equivalence test checks is that
-// whatever comes out is written identically by both constructions, not what
-// the numbers are.
-func userTablesRow(relname string) []driver.Value {
-	ts := func(s string) time.Time {
-		v, _ := time.Parse("2006-01-02Z", s)
-		return v
-	}
+// Having the input as named fields is what lets the expected output be a
+// separate statement about the same row. A fixture read back out of the
+// collector's own output can only say that the output equals itself.
+type userTablesFixture struct {
+	datname, schemaname, relname string
+
+	seqScan, seqTupRead, idxScan, idxTupFetch                    int64
+	nTupIns, nTupUpd, nTupDel, nTupHotUpd                        int64
+	nLiveTup, nDeadTup, nModSinceAnalyze, nInsSinceVacuum        int64
+	lastVacuum, lastAutovacuum, lastAnalyze, lastAutoanalyze     time.Time
+	vacuumCount, autovacuumCount, analyzeCount, autoanalyzeCount int64
+	totalSize                                                    int64
+
+	nTupNewpageUpd  int64
+	relpages        int64
+	reltuples       float64
+	relallvisible   int64
+	relallfrozen    int64
+	relfrozenxidAge int64
+	relminmxidAge   int64
+
+	totalVacuumTime, totalAutovacuumTime, totalAnalyzeTime, totalAutoanalyzeTime float64
+}
+
+// row writes the fixture out in the 35-column order statUserTablesQuery
+// selects and the collector scans.
+func (f userTablesFixture) row() []driver.Value {
 	return []driver.Value{
-		"postgres", "public", relname,
-		1, 2, 3, 4, // seq_scan, seq_tup_read, idx_scan, idx_tup_fetch
-		5, 6, 7, 8, // n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd
-		9, 10, 0, 27, // n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum
-		ts("2023-06-02Z"), ts("2023-06-03Z"), ts("2023-06-04Z"), ts("2023-06-05Z"),
-		11, 12, 13, 14, // vacuum_count, autovacuum_count, analyze_count, autoanalyze_count
-		15,             // total_size
-		20,             // n_tup_newpage_upd
-		21, 22, 23, 24, // relpages, reltuples, relallvisible, relallfrozen
-		25, 26, // relfrozenxid_age, relminmxid_age
-		16, 17, 18, 19, // the four total_*_time columns
+		f.datname, f.schemaname, f.relname,
+		f.seqScan, f.seqTupRead, f.idxScan, f.idxTupFetch,
+		f.nTupIns, f.nTupUpd, f.nTupDel, f.nTupHotUpd,
+		f.nLiveTup, f.nDeadTup, f.nModSinceAnalyze, f.nInsSinceVacuum,
+		f.lastVacuum, f.lastAutovacuum, f.lastAnalyze, f.lastAutoanalyze,
+		f.vacuumCount, f.autovacuumCount, f.analyzeCount, f.autoanalyzeCount,
+		f.totalSize,
+		f.nTupNewpageUpd,
+		f.relpages, f.reltuples, f.relallvisible, f.relallfrozen,
+		f.relfrozenxidAge, f.relminmxidAge,
+		f.totalVacuumTime, f.totalAutovacuumTime, f.totalAnalyzeTime, f.totalAutoanalyzeTime,
 	}
+}
+
+// expected states which family carries which column, as a number, on a server
+// of the given major version.
+//
+// This mapping is written by hand and belongs to the test. The timestamps
+// become Unix-epoch seconds, which is the one conversion the metric contract
+// makes between a column and its family.
+//
+// A family missing from this map on a version that produces it, or present on
+// a version that does not, fails the test in one direction or the other.
+func (f userTablesFixture) expected(major uint64) map[string]float64 {
+	want := map[string]float64{
+		"seq_scan":            float64(f.seqScan),
+		"seq_tup_read":        float64(f.seqTupRead),
+		"idx_scan":            float64(f.idxScan),
+		"idx_tup_fetch":       float64(f.idxTupFetch),
+		"n_tup_ins":           float64(f.nTupIns),
+		"n_tup_upd":           float64(f.nTupUpd),
+		"n_tup_del":           float64(f.nTupDel),
+		"n_tup_hot_upd":       float64(f.nTupHotUpd),
+		"n_live_tup":          float64(f.nLiveTup),
+		"n_dead_tup":          float64(f.nDeadTup),
+		"n_mod_since_analyze": float64(f.nModSinceAnalyze),
+		"n_ins_since_vacuum":  float64(f.nInsSinceVacuum),
+		"last_vacuum":         float64(f.lastVacuum.Unix()),
+		"last_autovacuum":     float64(f.lastAutovacuum.Unix()),
+		"last_analyze":        float64(f.lastAnalyze.Unix()),
+		"last_autoanalyze":    float64(f.lastAutoanalyze.Unix()),
+		"vacuum_count":        float64(f.vacuumCount),
+		"autovacuum_count":    float64(f.autovacuumCount),
+		"analyze_count":       float64(f.analyzeCount),
+		"autoanalyze_count":   float64(f.autoanalyzeCount),
+		"total_size":          float64(f.totalSize),
+		"relpages":            float64(f.relpages),
+		"reltuples":           f.reltuples,
+		"relallvisible":       float64(f.relallvisible),
+		"relfrozenxid_age":    float64(f.relfrozenxidAge),
+		"relminmxid_age":      float64(f.relminmxidAge),
+	}
+	if major >= 16 {
+		want["n_tup_newpage_upd"] = float64(f.nTupNewpageUpd)
+	}
+	if major >= 18 {
+		want["relallfrozen"] = float64(f.relallfrozen)
+		want["total_vacuum_time"] = f.totalVacuumTime
+		want["total_autovacuum_time"] = f.totalAutovacuumTime
+		want["total_analyze_time"] = f.totalAnalyzeTime
+		want["total_autoanalyze_time"] = f.totalAutoanalyzeTime
+	}
+	return want
+}
+
+// userTablesFixtures are the two rows the equivalence test runs.
+//
+// No number, timestamp or label value appears in both rows, so a collector
+// that built a value or a label set for the first row and reused it for the
+// second fails rather than passes. The second row's reltuples is the -1 that
+// PostgreSQL stores for a relation that has never been analyzed, which the
+// collector passes through rather than flattening to zero.
+var userTablesFixtures = []userTablesFixture{
+	{
+		datname: "postgres", schemaname: "public", relname: "a_table",
+		seqScan: 1, seqTupRead: 2, idxScan: 3, idxTupFetch: 4,
+		nTupIns: 5, nTupUpd: 6, nTupDel: 7, nTupHotUpd: 8,
+		nLiveTup: 9, nDeadTup: 10, nModSinceAnalyze: 11, nInsSinceVacuum: 27,
+		lastVacuum:      time.Unix(1685664000, 0).UTC(),
+		lastAutovacuum:  time.Unix(1685750400, 0).UTC(),
+		lastAnalyze:     time.Unix(1685836800, 0).UTC(),
+		lastAutoanalyze: time.Unix(1685923200, 0).UTC(),
+		vacuumCount:     12, autovacuumCount: 13, analyzeCount: 14, autoanalyzeCount: 15,
+		totalSize:      16,
+		nTupNewpageUpd: 20,
+		relpages:       21, reltuples: 22.5, relallvisible: 23, relallfrozen: 24,
+		relfrozenxidAge: 25, relminmxidAge: 26,
+		totalVacuumTime: 17.5, totalAutovacuumTime: 18.25, totalAnalyzeTime: 19.75, totalAutoanalyzeTime: 28.125,
+	},
+	{
+		datname: "otherdb", schemaname: "app", relname: "b_table",
+		seqScan: 101, seqTupRead: 102, idxScan: 103, idxTupFetch: 104,
+		nTupIns: 105, nTupUpd: 106, nTupDel: 107, nTupHotUpd: 108,
+		nLiveTup: 109, nDeadTup: 110, nModSinceAnalyze: 111, nInsSinceVacuum: 127,
+		lastVacuum:      time.Unix(1700000000, 0).UTC(),
+		lastAutovacuum:  time.Unix(1700086400, 0).UTC(),
+		lastAnalyze:     time.Unix(1700172800, 0).UTC(),
+		lastAutoanalyze: time.Unix(1700259200, 0).UTC(),
+		vacuumCount:     112, autovacuumCount: 113, analyzeCount: 114, autoanalyzeCount: 115,
+		totalSize:      116,
+		nTupNewpageUpd: 120,
+		relpages:       121, reltuples: -1, relallvisible: 123, relallfrozen: 124,
+		relfrozenxidAge: 125, relminmxidAge: 126,
+		totalVacuumTime: 117.5, totalAutovacuumTime: 118.25, totalAnalyzeTime: 119.75, totalAutoanalyzeTime: 128.125,
+	},
 }
