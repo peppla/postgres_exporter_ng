@@ -182,16 +182,22 @@ func (s *IntegrationSuite) TestAllNamespacesReturnResults(c *C) {
 		names := metricNames(rec.done())
 
 		// An empty error map is only good news if something ran. These three
-		// namespaces return at least one row on any reachable server, unlike
-		// pg_stat_replication, pg_replication_slots and pg_lock_conflicts,
-		// which are empty on an idle standalone primary.
+		// namespaces return at least one row in this fixture, a stock primary
+		// reached with a superuser connection: pg_stat_database_conflicts has
+		// a row per database even with no conflicts, pg_stat_archiver has its
+		// row even with archiving off, and the activity override builds rows
+		// from database names and known session states with zero counts where
+		// nothing matches. That is a claim about this fixture, not about every
+		// server: a restricted role or a managed service can hide any of them.
+		// pg_stat_replication, pg_replication_slots and pg_lock_conflicts are
+		// legitimately empty here, so they are not asserted.
 		for _, want := range []string{
 			"pg_stat_database_conflicts_confl_lock",
 			"pg_stat_archiver_archived_count",
 			"pg_stat_activity_count",
 		} {
 			c.Check(names[want] > 0, Equals, true,
-				Commentf("%s was not produced, so the namespace queries did not reach the server", want))
+				Commentf("%s was not produced, so the namespace queries did not run against this fixture", want))
 		}
 
 		// querySettings reads pg_settings and names each metric after the
