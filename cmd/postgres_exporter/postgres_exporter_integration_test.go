@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,6 +39,7 @@ import (
 	"github.com/go-kit/log"
 	_ "github.com/lib/pq"
 	"github.com/percona/postgres_exporter/collector"
+	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	. "gopkg.in/check.v1"
@@ -521,4 +523,110 @@ func (s *IntegrationSuite) TestPerDatabaseCoverageAgainstServer(c *C) {
 	c.Check(counts["pg_exporter_databases_selected"], Equals, float64(len(selected.GetMetric())),
 		Commentf("the count and the named series disagree about how many databases were selected"))
 	c.Check(counts["pg_exporter_databases_excluded"], Equals, float64(0))
+}
+
+// TestMetadataFailureIsNotReportedAsCoverage drives the real collection path
+// against a database where version detection cannot work, and checks that the
+// database is reported as not covered.
+//
+// This is the defect the per-database gauges would otherwise have made worse.
+// GetServer builds a fresh Server for every scrape, so when checkMapVersions
+// fails there is no previous query map to fall back on: the map is nil,
+// queryNamespaceMappings iterates nothing and returns no errors, Scrape
+// returns nil, and the exporter reports a database it never queried as covered.
+// Custom query files load in that same step, so they do not run either.
+//
+// The failure is arranged by revoking EXECUTE on pg_catalog.version(), which
+// is a per-database privilege, so only the fixture database is affected.
+func (s *IntegrationSuite) TestMetadataFailureIsNotReportedAsCoverage(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const db = "vis_metadata_fail"
+	const role = "vis_metadata"
+	exec := func(server *Server, stmt string) error {
+		_, err := server.db.Exec(stmt)
+		return err
+	}
+	// Leave nothing behind for the cases that run after this one.
+	cleanup := func() {
+		_ = exec(admin, `DROP DATABASE IF EXISTS `+db+` WITH (FORCE)`)
+		_ = exec(admin, `DROP ROLE IF EXISTS `+role)
+	}
+	cleanup()
+	defer cleanup()
+
+	c.Assert(exec(admin, `CREATE ROLE `+role+` LOGIN PASSWORD 'secret'`), IsNil)
+	c.Assert(exec(admin, `GRANT pg_monitor TO `+role), IsNil)
+	c.Assert(exec(admin, `CREATE DATABASE `+db), IsNil)
+
+	target, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], db))
+	c.Assert(err, IsNil)
+	defer target.Close()
+	c.Assert(exec(target, `REVOKE EXECUTE ON FUNCTION pg_catalog.version() FROM PUBLIC`), IsNil)
+	c.Assert(exec(target, `REVOKE EXECUTE ON FUNCTION pg_catalog.version() FROM `+role), IsNil)
+
+	// The version cache is keyed by host:port, not by database, so a version
+	// another case already looked up on this server would be served from it
+	// and this database would never attempt the call that is revoked.
+	versioncache.Clear()
+	defer versioncache.Clear()
+
+	exporter := NewExporter(
+		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + db + "?sslmode=disable"},
+		AutoDiscoverDatabases(true),
+		// Keep the fan-out to the one database whose metadata is broken, so
+		// the counts below are unambiguous.
+		IncludeDatabases(db),
+	)
+	families := gather(c, exporter)
+
+	count := func(name string) float64 {
+		f, ok := families[name]
+		c.Assert(ok, Equals, true, Commentf("%s was not published", name))
+		return f.GetMetric()[0].GetGauge().GetValue()
+	}
+	c.Check(count("pg_exporter_databases_selected"), Equals, float64(1))
+	c.Check(count("pg_exporter_databases_scraped"), Equals, float64(0),
+		Commentf("a database whose query maps could not be prepared was reported as covered"))
+	c.Check(count("pg_exporter_databases_failed"), Equals, float64(1))
+
+	success, ok := families["pg_exporter_database_scrape_success"]
+	c.Assert(ok, Equals, true)
+	c.Assert(len(success.GetMetric()), Equals, 1)
+	c.Check(success.GetMetric()[0].GetGauge().GetValue(), Equals, float64(0),
+		Commentf("per-database status claims coverage of a database that was never queried"))
+
+	errs, ok := families["pg_exporter_database_scrape_error"]
+	c.Assert(ok, Equals, true, Commentf("the failure was counted but not named"))
+	c.Assert(len(errs.GetMetric()), Equals, 1)
+	labels := map[string]string{}
+	for _, l := range errs.GetMetric()[0].GetLabel() {
+		labels[l.GetName()] = l.GetValue()
+	}
+	c.Check(labels["datname"], Equals, db)
+	// The connection worked, so this is a collection failure. Calling it a
+	// connection failure would change what pg_up means.
+	c.Check(labels["reason"], Equals, reasonScrape)
+	c.Check(count("pg_up"), Equals, float64(1),
+		Commentf("the connection succeeded, so pg_up must not report otherwise"))
+}
+
+// rewriteDatabase points a DSN at another database on the same server.
+func rewriteDatabase(c *C, dsn, database string) string {
+	u, err := url.Parse(dsn)
+	c.Assert(err, IsNil)
+	u.Path = "/" + database
+	return u.String()
+}
+
+// hostPort returns the host and port of a DSN, for building another one.
+func hostPort(c *C, dsn string) string {
+	u, err := url.Parse(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	return u.Host
 }

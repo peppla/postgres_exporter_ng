@@ -63,10 +63,15 @@
 // invisible. So every target the scrape knows a name for also reports its own
 // outcome:
 //
-//	database_selected{datname}        1 for each database this scrape meant to cover
-//	database_scrape_success{datname}  1 if it was covered, 0 if it was not
-//	database_scrape_error{datname,reason}  1, with a reason from a closed set
-//	database_excluded{datname,reason}      1, for configuration, not failure
+//	database_selected{server,datname}        1 for each database this scrape meant to cover
+//	database_scrape_success{server,datname}  1 if it was covered, 0 if it was not
+//	database_scrape_error{server,datname,reason}  1, with a reason from a closed set
+//	database_excluded{server,datname,reason}      1, for configuration, not failure
+//
+// The server label is the host:port fingerprint the exporter already uses for
+// its other per-server metrics. Without it, two servers that each hold a
+// database called postgres share one series, and a failure on one is erased by
+// a success on the other.
 //
 // The name was the obstacle. The DSN list is a list of connection strings, and
 // the catalog query used to exclude current_database(), so the one name that
@@ -159,13 +164,13 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 			"Databases the server offered that configuration left out of the selected set, by an exclude list or by a non-empty include list. These are decisions, not failures, and are never counted in databases_failed."),
 
 		databaseSelected: vec("database_selected",
-			"1 for each database the last scrape intended to cover. Absent for a database that was not selected.", "datname"),
+			"1 for each database the last scrape intended to cover, by server and database name. Absent for a database that was not selected.", "server", "datname"),
 		databaseSuccess: vec("database_scrape_success",
-			"Whether the last scrape of this database returned no error (1 for yes, 0 for no). Present for every selected database whose name is known, so a database going dark is visible rather than averaged into a count. Not a claim of complete coverage for that database.", "datname"),
+			"Whether the last scrape of this database returned no error (1 for yes, 0 for no). Present for every selected database whose name is known, so a database going dark is visible rather than averaged into a count. Not a claim of complete coverage for that database.", "server", "datname"),
 		databaseError: vec("database_scrape_error",
-			"1 for each selected database the last scrape did not cover, labelled with why: connect for a connection that failed, scrape for a query or collector that failed, not_attempted for work that never started. Reasons are a closed set, never an error message.", "datname", "reason"),
+			"1 for each selected database the last scrape did not cover, labelled with why: connect for a connection that failed, scrape for a query or collector that failed, not_attempted for work that never started. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
 		databaseExcluded: vec("database_excluded",
-			"1 for each database an exclude list kept out of the selected set. Databases left out by a non-empty include list are counted in databases_excluded and not named here, because that set can be the whole server.", "datname", "reason"),
+			"1 for each database an exclude list named and kept out of the selected set. Databases left out by a non-empty include list are counted in databases_excluded and not named here, because that set can be the whole server.", "server", "datname", "reason"),
 	}
 }
 
@@ -176,7 +181,7 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 // and emits these gauges only after it returns, so a client whose HTTP request
 // times out receives nothing at all -- intent included. Setting the values
 // first keeps them correct with respect to the work, and nothing more.
-func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, discovered int, targets []scrapeTarget, excluded []string, notIncluded int) {
+func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, discovered int, targets []scrapeTarget, excluded []databaseRef, notIncluded int) {
 	c.discoveryEnabled.Set(boolToFloat(discoveryEnabled))
 	c.discoverySuccess.Set(boolToFloat(discoverySuccess))
 	c.discovered.Set(float64(discovered))
@@ -194,28 +199,28 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 		if t.datname == "" {
 			continue
 		}
-		c.databaseSelected.WithLabelValues(t.datname).Set(1)
+		c.databaseSelected.WithLabelValues(t.server, t.datname).Set(1)
 		// Assume nothing until the outcome is known. A scrape cut short
 		// leaves this at 0, which is the honest reading: it was not covered.
-		c.databaseSuccess.WithLabelValues(t.datname).Set(0)
+		c.databaseSuccess.WithLabelValues(t.server, t.datname).Set(0)
 	}
-	for _, name := range excluded {
-		c.databaseExcluded.WithLabelValues(name, reasonExcludeList).Set(1)
+	for _, ref := range excluded {
+		c.databaseExcluded.WithLabelValues(ref.server, ref.datname, reasonExcludeList).Set(1)
 	}
 }
 
 // setDatabaseOutcome records one database's result. Called once per target,
 // from the goroutine that handled it.
-func (c *coverageMetrics) setDatabaseOutcome(datname, reason string) {
-	if datname == "" {
+func (c *coverageMetrics) setDatabaseOutcome(ref databaseRef, reason string) {
+	if ref.datname == "" {
 		return
 	}
 	if reason == "" {
-		c.databaseSuccess.WithLabelValues(datname).Set(1)
+		c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(1)
 		return
 	}
-	c.databaseSuccess.WithLabelValues(datname).Set(0)
-	c.databaseError.WithLabelValues(datname, reason).Set(1)
+	c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(0)
+	c.databaseError.WithLabelValues(ref.server, ref.datname, reason).Set(1)
 }
 
 // setOutcome records what actually happened. scraped is derived from selected

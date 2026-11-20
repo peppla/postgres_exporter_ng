@@ -128,8 +128,22 @@ func selectDatabases(names []string, exclude, include databaseList) selection {
 	return s
 }
 
-// scrapeTarget is one database the scrape will try to cover, and the name to
-// report it under.
+// databaseRef identifies one database for reporting: which server, and which
+// database on it.
+//
+// The server half is not decoration. The exporter accepts several DSNs, and
+// two servers can each hold a database called postgres. Keyed on the name
+// alone, their outcomes land on the same series and one overwrites the other,
+// so a failure on one server can be erased by a success on another. It is the
+// same host:port fingerprint the exporter already labels its other
+// per-server metrics with, so it carries no credentials.
+type databaseRef struct {
+	server  string
+	datname string
+}
+
+// scrapeTarget is one database the scrape will try to cover, and how to report
+// it.
 //
 // The name is what lets a shortfall say which database went dark. It is known
 // whenever discovery ran, because the catalog query now returns the connection
@@ -137,8 +151,8 @@ func selectDatabases(names []string, exclude, include databaseList) selection {
 // the only target is the configured DSN and the name would have to come from
 // parsing a connection string.
 type scrapeTarget struct {
-	dsn     string
-	datname string
+	dsn string
+	databaseRef
 }
 
 // discovery is what one pass over the seed DSNs worked out.
@@ -157,7 +171,7 @@ type discovery struct {
 	targets    []scrapeTarget
 	discovered int
 	// excluded holds the databases the operator's exclude list matched.
-	excluded []string
+	excluded []databaseRef
 	// notIncluded counts databases a non-empty include list left out.
 	notIncluded int
 	ok          bool
@@ -170,8 +184,9 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 	// with a valid-ish keyword pair
 	connstringRe := regexp.MustCompile(`^ *[a-zA-Z0-9]+ *= *[^= ]+`)
 
-	// DSN to database name. The name is empty when it is not known.
-	dsns := make(map[string]string)
+	// DSN to how that database is reported. The name is empty when it is
+	// not known.
+	dsns := make(map[string]databaseRef)
 	for _, dsn := range e.dsn {
 		var dsnURI *url.URL
 		var dsnConnstring string
@@ -195,7 +210,14 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 			continue
 		}
 		seed := dsn
-		dsns[seed] = ""
+		// The host:port identity this seed's databases are reported under.
+		// Discovery has already accepted the DSN above, so a failure here
+		// leaves the identity empty rather than dropping the seed.
+		fingerprint, err := parseFingerprint(dsn)
+		if err != nil {
+			level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
+		}
+		dsns[seed] = databaseRef{server: fingerprint}
 
 		// If autoDiscoverDatabases is true, set first dsn as master database (Default: false)
 		e.masterDSN = dsn
@@ -213,17 +235,22 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 		}
 		d.discovered += len(catalog)
 		if name, found := currentName(catalog); found {
-			dsns[seed] = name
+			dsns[seed] = databaseRef{server: fingerprint, datname: name}
 		} else {
-			// The connection database is not in its own catalog, which means
-			// it stopped being connectable while this connection was open.
-			// It is still a target, and still counted, but there is no name
-			// to report it under and inventing one would be worse.
+			// The connection database is not in its own catalog. The query
+			// also filters out templates and databases this role has no
+			// CONNECT privilege on, so this says the database is outside the
+			// eligible set, not specifically that it became unconnectable
+			// mid-scrape. Connecting to a template database is one way to
+			// get here. It is still a target and still counted, but there is
+			// no name to report it under and inventing one would be worse.
 			d.discovered++
 		}
 
 		sel := selectDatabases(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
-		d.excluded = append(d.excluded, sel.excluded...)
+		for _, name := range sel.excluded {
+			d.excluded = append(d.excluded, databaseRef{server: fingerprint, datname: name})
+		}
 		d.notIncluded += sel.notIncluded
 
 		// The configured database is subject to the same rules as any other,
@@ -243,13 +270,13 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 				// just append new dbname to override.
 				dsn = fmt.Sprintf("%s dbname=%s", dsnConnstring, databaseName)
 			}
-			dsns[dsn] = databaseName
+			dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName}
 		}
 	}
 
 	d.targets = make([]scrapeTarget, 0, len(dsns))
-	for dsn, name := range dsns {
-		d.targets = append(d.targets, scrapeTarget{dsn: dsn, datname: name})
+	for dsn, ref := range dsns {
+		d.targets = append(d.targets, scrapeTarget{dsn: dsn, databaseRef: ref})
 	}
 	// Map iteration order is random, and a random order makes a failure
 	// report read differently every scrape for no reason.
@@ -297,6 +324,20 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, dsn string) error {
 
 	// Check if map versions need to be updated
 	if err := e.checkMapVersions(ch, server); err != nil {
+		// Proceeding is only defensible when there is something to proceed
+		// with. GetServer builds a fresh Server for every scrape, so when this
+		// step fails there is no previous map: metricMap is nil,
+		// queryNamespaceMappings iterates nothing, Scrape returns no error,
+		// and the database is reported as covered while none of its queries
+		// ran. Custom query files are loaded by this same step, so they do not
+		// run either.
+		//
+		// The connection worked, so this is a collection failure and not a
+		// connection one. Returning ErrorConnectToServer here would change
+		// what pg_up means.
+		if !server.hasQueryMaps() {
+			return fmt.Errorf("could not prepare query maps for %s, so nothing was collected: %w", server, err)
+		}
 		level.Warn(logger).Log("msg", "Proceeding with outdated query maps, as the Postgres version could not be determined", "err", err)
 	}
 

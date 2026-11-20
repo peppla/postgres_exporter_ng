@@ -28,15 +28,27 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// targetsFor builds the scrape targets for a list of database names, the way
-// discovery would when it knows every name.
+// targetsFor builds the scrape targets for a list of database names on one
+// server, the way discovery would when it knows every name.
 func targetsFor(names ...string) []scrapeTarget {
+	return targetsOn("h:5432", names...)
+}
+
+// targetsOn builds targets on a named server, so a test can have the same
+// database name on two of them.
+func targetsOn(server string, names ...string) []scrapeTarget {
 	out := make([]scrapeTarget, 0, len(names))
 	for _, n := range names {
-		out = append(out, scrapeTarget{dsn: "postgresql://u:p@h:5432/" + n, datname: n})
+		out = append(out, scrapeTarget{
+			dsn:         "postgresql://u:p@" + server + "/" + n,
+			databaseRef: databaseRef{server: server, datname: n},
+		})
 	}
 	return out
 }
+
+// ref names one database on the default test server.
+func ref(datname string) databaseRef { return databaseRef{server: "h:5432", datname: datname} }
 
 // TestSelectDatabases pins the selection rule, which decides coverage and had
 // no test before. The rule is: exclusion wins, an inclusion list that was
@@ -186,10 +198,10 @@ func gathered(t *testing.T, c *coverageMetrics) map[string]float64 {
 // that fails this test rather than a quiet edit.
 func TestCoverageMetricNames(t *testing.T) {
 	c := newCoverageMetrics(nil)
-	c.setSelection(true, true, 10, targetsFor("one", "two"), []string{"skipped"}, 7)
+	c.setSelection(true, true, 10, targetsFor("one", "two"), []databaseRef{ref("skipped")}, 7)
 	c.setOutcome(2, 1)
-	c.setDatabaseOutcome("one", "")
-	c.setDatabaseOutcome("two", reasonConnect)
+	c.setDatabaseOutcome(ref("one"), "")
+	c.setDatabaseOutcome(ref("two"), reasonConnect)
 
 	want := []string{
 		"pg_exporter_database_discovery_enabled",
@@ -199,12 +211,12 @@ func TestCoverageMetricNames(t *testing.T) {
 		"pg_exporter_databases_scraped",
 		"pg_exporter_databases_failed",
 		"pg_exporter_databases_excluded",
-		"pg_exporter_database_selected{datname=one}",
-		"pg_exporter_database_selected{datname=two}",
-		"pg_exporter_database_scrape_success{datname=one}",
-		"pg_exporter_database_scrape_success{datname=two}",
-		"pg_exporter_database_scrape_error{datname=two,reason=connect}",
-		"pg_exporter_database_excluded{datname=skipped,reason=exclude_list}",
+		"pg_exporter_database_selected{datname=one,server=h:5432}",
+		"pg_exporter_database_selected{datname=two,server=h:5432}",
+		"pg_exporter_database_scrape_success{datname=one,server=h:5432}",
+		"pg_exporter_database_scrape_success{datname=two,server=h:5432}",
+		"pg_exporter_database_scrape_error{datname=two,reason=connect,server=h:5432}",
+		"pg_exporter_database_excluded{datname=skipped,reason=exclude_list,server=h:5432}",
 	}
 	got := series(t, c)
 	if len(got) != len(want) {
@@ -397,26 +409,26 @@ func TestDatabaseOutcomeNamesTheFailure(t *testing.T) {
 	c := newCoverageMetrics(nil)
 	targets := targetsFor("app", "tenant_1", "tenant_2")
 	c.setSelection(true, true, 3, targets, nil, 0)
-	c.setDatabaseOutcome("app", "")
-	c.setDatabaseOutcome("tenant_1", "")
-	c.setDatabaseOutcome("tenant_2", reasonConnect)
+	c.setDatabaseOutcome(ref("app"), "")
+	c.setDatabaseOutcome(ref("tenant_1"), "")
+	c.setDatabaseOutcome(ref("tenant_2"), reasonConnect)
 	c.setOutcome(3, 1)
 
 	g := series(t, c)
 	if g["pg_exporter_databases_scraped"] != 2 || g["pg_exporter_databases_failed"] != 1 {
 		t.Fatalf("counts wrong: %v", g)
 	}
-	if g["pg_exporter_database_scrape_success{datname=tenant_2}"] != 0 {
+	if g["pg_exporter_database_scrape_success{datname=tenant_2,server=h:5432}"] != 0 {
 		t.Error("the database that failed is reported as a success")
 	}
-	if g["pg_exporter_database_scrape_error{datname=tenant_2,reason=connect}"] != 1 {
+	if g["pg_exporter_database_scrape_error{datname=tenant_2,reason=connect,server=h:5432}"] != 1 {
 		t.Error("no error series names the database that failed")
 	}
 	for _, ok := range []string{"app", "tenant_1"} {
-		if g["pg_exporter_database_scrape_success{datname="+ok+"}"] != 1 {
+		if g["pg_exporter_database_scrape_success{datname="+ok+",server=h:5432}"] != 1 {
 			t.Errorf("%s was covered but is not reported as a success", ok)
 		}
-		if _, found := g["pg_exporter_database_scrape_error{datname="+ok+",reason=connect}"]; found {
+		if _, found := g["pg_exporter_database_scrape_error{datname="+ok+",reason=connect,server=h:5432}"]; found {
 			t.Errorf("%s was covered but has an error series", ok)
 		}
 	}
@@ -430,23 +442,23 @@ func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
 	c := newCoverageMetrics(nil)
 
 	c.setSelection(true, true, 2, targetsFor("app", "going_away"), nil, 0)
-	c.setDatabaseOutcome("app", "")
-	c.setDatabaseOutcome("going_away", "")
+	c.setDatabaseOutcome(ref("app"), "")
+	c.setDatabaseOutcome(ref("going_away"), "")
 	c.setOutcome(2, 0)
-	if g := series(t, c); g["pg_exporter_database_scrape_success{datname=going_away}"] != 1 {
+	if g := series(t, c); g["pg_exporter_database_scrape_success{datname=going_away,server=h:5432}"] != 1 {
 		t.Fatalf("setup: going_away was not reported as covered: %v", g)
 	}
 
 	// Next scrape: the database is gone.
 	c.setSelection(true, true, 1, targetsFor("app"), nil, 0)
-	c.setDatabaseOutcome("app", "")
+	c.setDatabaseOutcome(ref("app"), "")
 	c.setOutcome(1, 0)
 
 	g := series(t, c)
-	if _, found := g["pg_exporter_database_selected{datname=going_away}"]; found {
+	if _, found := g["pg_exporter_database_selected{datname=going_away,server=h:5432}"]; found {
 		t.Error("a database that is no longer selected is still reported as selected")
 	}
-	if _, found := g["pg_exporter_database_scrape_success{datname=going_away}"]; found {
+	if _, found := g["pg_exporter_database_scrape_success{datname=going_away,server=h:5432}"]; found {
 		t.Error("a database that is gone is still reported as successfully scraped")
 	}
 }
@@ -457,8 +469,8 @@ func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
 // configured.
 func TestExcludedIsNeverFailed(t *testing.T) {
 	c := newCoverageMetrics(nil)
-	c.setSelection(true, true, 5, targetsFor("app"), []string{"scratch", "archive"}, 2)
-	c.setDatabaseOutcome("app", "")
+	c.setSelection(true, true, 5, targetsFor("app"), []databaseRef{ref("scratch"), ref("archive")}, 2)
+	c.setDatabaseOutcome(ref("app"), "")
 	c.setOutcome(1, 0)
 
 	g := series(t, c)
@@ -470,13 +482,13 @@ func TestExcludedIsNeverFailed(t *testing.T) {
 		t.Errorf("excluded count is %v, want 4", g["pg_exporter_databases_excluded"])
 	}
 	for _, name := range []string{"scratch", "archive"} {
-		if g["pg_exporter_database_excluded{datname="+name+",reason=exclude_list}"] != 1 {
+		if g["pg_exporter_database_excluded{datname="+name+",reason=exclude_list,server=h:5432}"] != 1 {
 			t.Errorf("%s is not reported as excluded", name)
 		}
-		if _, found := g["pg_exporter_database_scrape_error{datname="+name+",reason=connect}"]; found {
+		if _, found := g["pg_exporter_database_scrape_error{datname="+name+",reason=connect,server=h:5432}"]; found {
 			t.Errorf("%s is excluded but has a failure series", name)
 		}
-		if _, found := g["pg_exporter_database_selected{datname="+name+"}"]; found {
+		if _, found := g["pg_exporter_database_selected{datname="+name+",server=h:5432}"]; found {
 			t.Errorf("%s is excluded but is reported as selected", name)
 		}
 	}
@@ -508,12 +520,12 @@ func TestUnreachableDatabasesAreNamed(t *testing.T) {
 	}
 	g := series(t, e.coverage)
 	for _, name := range []string{"app", "tenant_1"} {
-		if g["pg_exporter_database_scrape_success{datname="+name+"}"] != 0 {
+		if g["pg_exporter_database_scrape_success{datname="+name+",server=127.0.0.1:1}"] != 0 {
 			t.Errorf("%s is unreachable but reported as a success", name)
 		}
 		found := ""
 		for _, reason := range []string{reasonConnect, reasonScrape, reasonNotAttempted} {
-			if _, ok := g["pg_exporter_database_scrape_error{datname="+name+",reason="+reason+"}"]; ok {
+			if _, ok := g["pg_exporter_database_scrape_error{datname="+name+",reason="+reason+",server=127.0.0.1:1}"]; ok {
 				found = reason
 			}
 		}
@@ -550,10 +562,10 @@ func TestUnattemptedWorkIsNamedNotAttempted(t *testing.T) {
 	}
 	g := series(t, e.coverage)
 	for _, name := range []string{"one", "two"} {
-		if g["pg_exporter_database_scrape_error{datname="+name+",reason="+reasonNotAttempted+"}"] != 1 {
+		if g["pg_exporter_database_scrape_error{datname="+name+",reason="+reasonNotAttempted+",server=127.0.0.1:1}"] != 1 {
 			t.Errorf("%s was never attempted but is not reported as such: %v", name, g)
 		}
-		if g["pg_exporter_database_scrape_success{datname="+name+"}"] != 0 {
+		if g["pg_exporter_database_scrape_success{datname="+name+",server=127.0.0.1:1}"] != 0 {
 			t.Errorf("%s was never attempted but is reported as a success", name)
 		}
 	}
@@ -565,9 +577,68 @@ func targetsForDSN(hostport string, names ...string) []scrapeTarget {
 	out := make([]scrapeTarget, 0, len(names))
 	for _, n := range names {
 		out = append(out, scrapeTarget{
-			dsn:     "postgresql://u:p@" + hostport + "/" + n + "?sslmode=disable",
-			datname: n,
+			dsn:         "postgresql://u:p@" + hostport + "/" + n + "?sslmode=disable",
+			databaseRef: databaseRef{server: hostport, datname: n},
 		})
 	}
 	return out
+}
+
+// TestSameDatabaseNameOnTwoServersStaysApart covers the collision a datname
+// label alone invites. The exporter accepts several DSNs, and two servers can
+// each hold a database called postgres. Keyed on the name only, the second
+// target overwrites the first: a failure on one server is erased by a success
+// on another, and the aggregate count says two databases while one series
+// claims to describe them both.
+func TestSameDatabaseNameOnTwoServersStaysApart(t *testing.T) {
+	c := newCoverageMetrics(nil)
+	targets := append(targetsOn("10.0.0.1:5432", "postgres"), targetsOn("10.0.0.2:5432", "postgres")...)
+	c.setSelection(true, true, 2, targets, nil, 0)
+	c.setDatabaseOutcome(targets[0].databaseRef, "")
+	c.setDatabaseOutcome(targets[1].databaseRef, reasonConnect)
+	c.setOutcome(2, 1)
+
+	g := series(t, c)
+	if g["pg_exporter_database_scrape_success{datname=postgres,server=10.0.0.1:5432}"] != 1 {
+		t.Error("the healthy server's database is not reported as covered")
+	}
+	if g["pg_exporter_database_scrape_success{datname=postgres,server=10.0.0.2:5432}"] != 0 {
+		t.Error("the failing server's database was overwritten by the healthy one")
+	}
+	if g["pg_exporter_database_scrape_error{datname=postgres,reason=connect,server=10.0.0.2:5432}"] != 1 {
+		t.Error("the failure on the second server has no error series")
+	}
+
+	// The named series and the aggregate count have to agree about how many
+	// databases there were. One named series for two counted targets is the
+	// shape this collision takes in a response.
+	named := 0
+	for key := range g {
+		if strings.HasPrefix(key, "pg_exporter_database_selected{") {
+			named++
+		}
+	}
+	if float64(named) != g["pg_exporter_databases_selected"] {
+		t.Errorf("%d named series for %v selected databases", named, g["pg_exporter_databases_selected"])
+	}
+}
+
+// TestExcludedSameNameOnTwoServersStaysApart is the same collision on the
+// exclusion family, which is keyed the same way.
+func TestExcludedSameNameOnTwoServersStaysApart(t *testing.T) {
+	c := newCoverageMetrics(nil)
+	c.setSelection(true, true, 4, targetsOn("10.0.0.1:5432", "app"), []databaseRef{
+		{server: "10.0.0.1:5432", datname: "scratch"},
+		{server: "10.0.0.2:5432", datname: "scratch"},
+	}, 0)
+
+	g := series(t, c)
+	for _, server := range []string{"10.0.0.1:5432", "10.0.0.2:5432"} {
+		if g["pg_exporter_database_excluded{datname=scratch,reason=exclude_list,server="+server+"}"] != 1 {
+			t.Errorf("scratch on %s is not reported as excluded", server)
+		}
+	}
+	if g["pg_exporter_databases_excluded"] != 2 {
+		t.Errorf("excluded count is %v, want 2", g["pg_exporter_databases_excluded"])
+	}
 }

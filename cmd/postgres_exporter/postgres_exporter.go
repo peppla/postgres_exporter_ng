@@ -760,9 +760,16 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		d = e.discoverDatabaseDSNs()
 	} else {
 		// No discovery, so no catalog and no names. The targets are the
-		// configured DSNs as given.
+		// configured DSNs as given, identified by server only.
 		for _, dsn := range e.dsn {
-			d.targets = append(d.targets, scrapeTarget{dsn: dsn})
+			fingerprint, err := parseFingerprint(dsn)
+			if err != nil {
+				level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
+			}
+			d.targets = append(d.targets, scrapeTarget{
+				dsn:         dsn,
+				databaseRef: databaseRef{server: fingerprint},
+			})
 		}
 	}
 	// Published before the fan-out, not after. If this scrape is cut short, the
@@ -820,7 +827,7 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 					// Deliberately not a connection error: nothing was
 					// connected to, so pg_up keeps the meaning it had.
 					errorsCount.Add(1)
-					e.coverage.setDatabaseOutcome(target.datname, reasonNotAttempted)
+					e.coverage.setDatabaseOutcome(target.databaseRef, reasonNotAttempted)
 					return
 				}
 				defer e.connSema.Release(1)
@@ -835,10 +842,10 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 					connectionErrorsCount.Add(1)
 					reason = reasonConnect
 				}
-				e.coverage.setDatabaseOutcome(target.datname, reason)
+				e.coverage.setDatabaseOutcome(target.databaseRef, reason)
 				return
 			}
-			e.coverage.setDatabaseOutcome(target.datname, "")
+			e.coverage.setDatabaseOutcome(target.databaseRef, "")
 		}()
 	}
 
