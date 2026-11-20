@@ -32,3 +32,12 @@ jobs:
         uses: golangci/golangci-lint-action@v9.3.0 # v9.3.0
         with:
           version: v2.15.0
+
+      # The default run skips every file behind //go:build integration, which
+      # left the database integration tests as the only Go in the repository
+      # that nothing linted.
+      - name: Lint integration-tagged code
+        uses: golangci/golangci-lint-action@v9.3.0 # v9.3.0
+        with:
+          version: v2.15.0
+          args: --build-tags integration
