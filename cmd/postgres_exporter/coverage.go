@@ -56,18 +56,47 @@
 // its own metric -- per-collector status -- rather than a different meaning for
 // this one.
 //
-// # What is deliberately not here yet
+// # Per-database status
 //
-// Per-database status, labelled by database name. It is wanted, and the
-// contract asks for it, but the DSN list is a list of connection strings: the
-// name is known for every discovered database and NOT for the configured one,
-// because the discovery query excludes it. Getting it costs either an extra
-// round trip on every scrape -- a cost paid by the monitored server, which the
-// contract says to account for rather than assume -- or a DSN parser handling
-// both URI and keyword forms. Either is its own change with its own tests.
+// The counts answer "did we lose a database?". They cannot answer "which one?",
+// and averaging a shortfall across a set is how one database going dark stays
+// invisible. So every target the scrape knows a name for also reports its own
+// outcome:
 //
-// Counts first. They answer "did we lose a database?", which is the question
-// that currently has no answer at all.
+//	database_selected{datname}        1 for each database this scrape meant to cover
+//	database_scrape_success{datname}  1 if it was covered, 0 if it was not
+//	database_scrape_error{datname,reason}  1, with a reason from a closed set
+//	database_excluded{datname,reason}      1, for configuration, not failure
+//
+// The name was the obstacle. The DSN list is a list of connection strings, and
+// the catalog query used to exclude current_database(), so the one name that
+// could not be recovered was the configured database's own. The query returns
+// it now, which removes the off-by-one at its source and names every target
+// without a second round trip and without a connection-string parser.
+//
+// Names are therefore known whenever discovery ran. With discovery disabled
+// there is a single target, the configured DSN, and no name for it; the counts
+// are still published and pg_up still answers the question. That is a gap in
+// the gauges rather than a silent claim, and closing it means parsing DSNs in
+// both URI and keyword forms, which is its own change.
+//
+// # Cardinality
+//
+// One series per database per family, so a 50-database server costs a few
+// hundred. That is the cost of being able to name the database that went dark.
+//
+// Exclusion is the asymmetric one. A database the operator named in an exclude
+// list gets its own series, because that list is bounded by the configuration
+// they wrote. Databases left out by a non-empty include list are counted and
+// not named, because that complement can be the entire server: an include list
+// of three on a server of five hundred would otherwise mint 497 series to say
+// nothing the operator does not already know.
+//
+// # The vectors are reset every scrape
+//
+// A database that is dropped from the server, or removed from the selection,
+// must stop being reported rather than freeze at its last value. The
+// alternative is a gauge that still says a deleted database is healthy.
 //
 // # Scope
 //
@@ -86,6 +115,12 @@ type coverageMetrics struct {
 	selected         prometheus.Gauge
 	scraped          prometheus.Gauge
 	failed           prometheus.Gauge
+	excluded         prometheus.Gauge
+
+	databaseSelected *prometheus.GaugeVec
+	databaseSuccess  *prometheus.GaugeVec
+	databaseError    *prometheus.GaugeVec
+	databaseExcluded *prometheus.GaugeVec
 }
 
 func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
@@ -97,6 +132,15 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 			Help:        help,
 			ConstLabels: constLabels,
 		})
+	}
+	vec := func(name, help string, labels ...string) *prometheus.GaugeVec {
+		return prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Subsystem:   exporter,
+			Name:        name,
+			Help:        help,
+			ConstLabels: constLabels,
+		}, labels)
 	}
 	return &coverageMetrics{
 		discoveryEnabled: gauge("database_discovery_enabled",
@@ -111,6 +155,17 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 			"Databases whose scrape returned no error at the last scrape. Not a claim of complete coverage for that database."),
 		failed: gauge("databases_failed",
 			"Databases the last scrape did not cover: the scrape returned an error, or it could not be started. Work that was skipped is counted here rather than left out, so it cannot be mistaken for success."),
+		excluded: gauge("databases_excluded",
+			"Databases the server offered that configuration left out of the selected set, by an exclude list or by a non-empty include list. These are decisions, not failures, and are never counted in databases_failed."),
+
+		databaseSelected: vec("database_selected",
+			"1 for each database the last scrape intended to cover. Absent for a database that was not selected.", "datname"),
+		databaseSuccess: vec("database_scrape_success",
+			"Whether the last scrape of this database returned no error (1 for yes, 0 for no). Present for every selected database whose name is known, so a database going dark is visible rather than averaged into a count. Not a claim of complete coverage for that database.", "datname"),
+		databaseError: vec("database_scrape_error",
+			"1 for each selected database the last scrape did not cover, labelled with why: connect for a connection that failed, scrape for a query or collector that failed, not_attempted for work that never started. Reasons are a closed set, never an error message.", "datname", "reason"),
+		databaseExcluded: vec("database_excluded",
+			"1 for each database an exclude list kept out of the selected set. Databases left out by a non-empty include list are counted in databases_excluded and not named here, because that set can be the whole server.", "datname", "reason"),
 	}
 }
 
@@ -121,11 +176,46 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 // and emits these gauges only after it returns, so a client whose HTTP request
 // times out receives nothing at all -- intent included. Setting the values
 // first keeps them correct with respect to the work, and nothing more.
-func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, discovered, selected int) {
+func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, discovered int, targets []scrapeTarget, excluded []string, notIncluded int) {
 	c.discoveryEnabled.Set(boolToFloat(discoveryEnabled))
 	c.discoverySuccess.Set(boolToFloat(discoverySuccess))
 	c.discovered.Set(float64(discovered))
-	c.selected.Set(float64(selected))
+	c.selected.Set(float64(len(targets)))
+	c.excluded.Set(float64(len(excluded) + notIncluded))
+
+	// Reset before setting, so a database that is gone stops being reported
+	// instead of keeping the value it had when it was last seen.
+	c.databaseSelected.Reset()
+	c.databaseSuccess.Reset()
+	c.databaseError.Reset()
+	c.databaseExcluded.Reset()
+
+	for _, t := range targets {
+		if t.datname == "" {
+			continue
+		}
+		c.databaseSelected.WithLabelValues(t.datname).Set(1)
+		// Assume nothing until the outcome is known. A scrape cut short
+		// leaves this at 0, which is the honest reading: it was not covered.
+		c.databaseSuccess.WithLabelValues(t.datname).Set(0)
+	}
+	for _, name := range excluded {
+		c.databaseExcluded.WithLabelValues(name, reasonExcludeList).Set(1)
+	}
+}
+
+// setDatabaseOutcome records one database's result. Called once per target,
+// from the goroutine that handled it.
+func (c *coverageMetrics) setDatabaseOutcome(datname, reason string) {
+	if datname == "" {
+		return
+	}
+	if reason == "" {
+		c.databaseSuccess.WithLabelValues(datname).Set(1)
+		return
+	}
+	c.databaseSuccess.WithLabelValues(datname).Set(0)
+	c.databaseError.WithLabelValues(datname, reason).Set(1)
 }
 
 // setOutcome records what actually happened. scraped is derived from selected
@@ -142,6 +232,11 @@ func (c *coverageMetrics) collect(ch chan<- prometheus.Metric) {
 	ch <- c.selected
 	ch <- c.scraped
 	ch <- c.failed
+	ch <- c.excluded
+	c.databaseSelected.Collect(ch)
+	c.databaseSuccess.Collect(ch)
+	c.databaseError.Collect(ch)
+	c.databaseExcluded.Collect(ch)
 }
 
 func boolToFloat(b bool) float64 {

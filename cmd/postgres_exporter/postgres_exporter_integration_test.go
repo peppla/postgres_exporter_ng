@@ -429,23 +429,96 @@ func (s *IntegrationSuite) TestAutoDiscoverDatabases(c *C) {
 	c.Assert(err, IsNil)
 	defer server.Close()
 
-	// The same set discovery is built from, asked for directly.
-	names, err := queryDatabases(context.Background(), server)
+	// The same catalog discovery is built from, asked for directly.
+	catalog, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	c.Assert(len(catalog) > 1, Equals, true,
+		Commentf("the fixture server has one database, so discovery was never exercised"))
 
-	dsns, discovered, ok := exporter.discoverDatabaseDSNs()
-	c.Assert(ok, Equals, true, Commentf("discovery reported failure"))
+	// The catalog query returns the connection's own database, flagged. That
+	// is what gives every target a name, and it is why the counts below no
+	// longer add one and hope.
+	seedName, found := currentName(catalog)
+	c.Assert(found, Equals, true,
+		Commentf("the catalog did not report which database the connection is on: %v", catalog))
+	var reported string
+	c.Assert(server.db.QueryRow("SELECT current_database()").Scan(&reported), IsNil)
+	c.Assert(seedName, Equals, reported)
 
-	// Discovery keeps the DSN it was given and adds one per database it found.
-	c.Assert(len(dsns), Equals, len(names)+1,
-		Commentf("discovered %d DSNs from %d connectable databases: %v", len(dsns), len(names), names))
-	c.Assert(len(names) > 0, Equals, true,
-		Commentf("the fixture server has no second database, so discovery was never exercised"))
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others), Equals, len(catalog)-1)
 
-	// The reported count adds the seed's own database back, which
-	// queryDatabases leaves out. Asserting it against the server rather than
-	// against len(dsns) is what catches that off-by-one, since the two would
-	// agree while both were one short.
-	c.Assert(discovered, Equals, len(names)+1,
-		Commentf("discovery reported %d databases, the server has %d plus the seed", discovered, len(names)))
+	d := exporter.discoverDatabaseDSNs()
+	c.Assert(d.ok, Equals, true, Commentf("discovery reported failure"))
+
+	// Discovery keeps the DSN it was given and adds one per other database.
+	c.Assert(len(d.targets), Equals, len(others)+1,
+		Commentf("built %d targets from %d other databases: %v", len(d.targets), len(others), others))
+	c.Assert(d.discovered, Equals, len(catalog),
+		Commentf("discovery reported %d databases, the catalog has %d", d.discovered, len(catalog)))
+
+	// Every target carries a name, including the seed. Without that, a
+	// shortfall can be counted but not attributed.
+	byName := map[string]bool{}
+	for _, t := range d.targets {
+		c.Check(t.datname, Not(Equals), "",
+			Commentf("target %q has no database name", loggableDSN(t.dsn)))
+		byName[t.datname] = true
+	}
+	c.Check(byName[seedName], Equals, true,
+		Commentf("the configured database %q is not among the named targets", seedName))
+	for _, name := range others {
+		c.Check(byName[name], Equals, true, Commentf("%q was discovered but is not a target", name))
+	}
+}
+
+// TestPerDatabaseCoverageAgainstServer checks that a real scrape publishes a
+// named series per database it covered.
+//
+// The counts alone cannot say which database went dark, and this is the only
+// test that shows the names reaching the output through the real discovery
+// path rather than through targets a test built by hand.
+func (s *IntegrationSuite) TestPerDatabaseCoverageAgainstServer(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	exporter := NewExporter(strings.Split(dsn, ",")[:1], AutoDiscoverDatabases(true))
+	c.Assert(exporter, NotNil)
+
+	families := gather(c, exporter)
+
+	selected, ok := families["pg_exporter_database_selected"]
+	c.Assert(ok, Equals, true, Commentf("no per-database selection was published"))
+	c.Assert(len(selected.GetMetric()) > 1, Equals, true,
+		Commentf("only %d database was selected, so the fan-out was not exercised", len(selected.GetMetric())))
+
+	success, ok := families["pg_exporter_database_scrape_success"]
+	c.Assert(ok, Equals, true, Commentf("no per-database outcome was published"))
+	c.Assert(len(success.GetMetric()), Equals, len(selected.GetMetric()),
+		Commentf("a selected database has no outcome, so coverage would be averaged away"))
+
+	for _, m := range success.GetMetric() {
+		c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+			Commentf("database reported as not covered: %v", m.GetLabel()))
+	}
+
+	// Every database on this server is reachable, so nothing should be
+	// reported as failed or excluded.
+	if errs, present := families["pg_exporter_database_scrape_error"]; present {
+		c.Check(len(errs.GetMetric()), Equals, 0,
+			Commentf("failures reported against a healthy server: %v", errs.GetMetric()))
+	}
+	counts := map[string]float64{}
+	for _, name := range []string{"pg_exporter_databases_selected", "pg_exporter_databases_scraped",
+		"pg_exporter_databases_failed", "pg_exporter_databases_excluded"} {
+		f, present := families[name]
+		c.Assert(present, Equals, true, Commentf("%s was not published", name))
+		counts[name] = f.GetMetric()[0].GetGauge().GetValue()
+	}
+	c.Check(counts["pg_exporter_databases_scraped"]+counts["pg_exporter_databases_failed"],
+		Equals, counts["pg_exporter_databases_selected"],
+		Commentf("the coverage invariant does not hold against a real server: %v", counts))
+	c.Check(counts["pg_exporter_databases_selected"], Equals, float64(len(selected.GetMetric())),
+		Commentf("the count and the named series disagree about how many databases were selected"))
+	c.Check(counts["pg_exporter_databases_excluded"], Equals, float64(0))
 }
