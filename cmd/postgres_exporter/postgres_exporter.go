@@ -118,8 +118,13 @@ type intermediateMetricMap struct {
 	// databases is the per-query selection for an application query. It is
 	// absent for built-in namespaces, which means they run wherever the
 	// engine runs them.
-	databases    queryDatabaseList
-	cacheSeconds uint64
+	databases queryDatabaseList
+	// runOnServer restricts a query to a range of PostgreSQL versions. Nil
+	// means no restriction. It is parsed once, at load, so an unparseable
+	// range is an error rather than a query that silently never runs.
+	runOnServer    semver.Range
+	runOnServerRaw string
+	cacheSeconds   uint64
 }
 
 // MetricMapNamespace groups metric maps under a shared set of labels.
@@ -128,6 +133,8 @@ type MetricMapNamespace struct {
 	columnMappings map[string]MetricMap // Column mappings in this namespace
 	master         bool                 // Call query only for master database
 	databases      queryDatabaseList    // Application-query selection; absent means every database
+	runOnServer    semver.Range         // Version restriction; nil means no restriction
+	runOnServerRaw string               // The restriction as written, for logging
 	cacheSeconds   uint64               // Number of seconds this metric namespace can be cached. 0 disables.
 }
 
@@ -408,7 +415,7 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 			}
 		}
 
-		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.databases, intermediateMappings.cacheSeconds}
+		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.databases, intermediateMappings.runOnServer, intermediateMappings.runOnServerRaw, intermediateMappings.cacheSeconds}
 	}
 
 	return metricMap
@@ -732,7 +739,10 @@ func (e *Exporter) checkMapVersions(ch chan<- prometheus.Metric, server *Server)
 		server.queryOverrides = make(map[string]string)
 	}
 
-	// server.lastMapVersion[e.resolutionEnabled] = semanticVersion
+	// The version every per-query version restriction is tested against.
+	// It was never assigned, so runonserver compared against the zero version
+	// and a restricted query either always ran or never did.
+	server.lastMapVersion = semanticVersion
 
 	if e.userQueriesPath[HR] != "" || e.userQueriesPath[MR] != "" || e.userQueriesPath[LR] != "" {
 		// Clear the metric while reload

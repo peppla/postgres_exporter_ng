@@ -23,6 +23,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blang/semver/v4"
+
 	"gopkg.in/yaml.v2"
 )
 
@@ -132,6 +134,59 @@ func TestQueryRunsOn(t *testing.T) {
 			if got := tc.list.runsOn(tc.datname, tc.master, tc.isMaster); got != tc.want {
 				t.Errorf("runsOn(%q, master=%v, isMaster=%v) = %v, want %v",
 					tc.datname, tc.master, tc.isMaster, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunOnServerParsing checks that an unparseable version range stops the
+// file rather than producing a query that silently never matches.
+//
+// The range used to be parsed at execution with the error discarded, so a typo
+// produced a range that matched nothing and a query that never ran, with
+// nothing said about it anywhere.
+func TestRunOnServerParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		wantErr bool
+		matches map[string]bool
+	}{
+		{name: "absent means no restriction", raw: "", matches: nil},
+		{
+			name:    "a range restricts",
+			raw:     ">=16.0.0",
+			matches: map[string]bool{"15.4.0": false, "16.0.0": true, "19.0.0": true},
+		},
+		{
+			name:    "a compound range",
+			raw:     ">=15.0.0 <17.0.0",
+			matches: map[string]bool{"14.9.0": false, "15.1.0": true, "16.3.0": true, "17.0.0": false},
+		},
+		{name: "a typo is an error", raw: ">= sixteen", wantErr: true},
+		{name: "an empty comparison is an error", raw: ">=", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseRunOnServer(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for %q, got none", tc.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseRunOnServer(%q): %s", tc.raw, err)
+			}
+			if tc.matches == nil {
+				if got != nil {
+					t.Error("an absent restriction produced a range")
+				}
+				return
+			}
+			for version, want := range tc.matches {
+				if got(semver.MustParse(version)) != want {
+					t.Errorf("%q against %s = %v, want %v", tc.raw, version, !want, want)
+				}
 			}
 		})
 	}

@@ -1743,3 +1743,66 @@ app_unrestricted:
 	c.Check(families["pg_exporter_databases_scraped"].GetMetric()[0].GetGauge().GetValue(),
 		Equals, float64(1))
 }
+
+// TestApplicationQueryVersionRestriction covers per-query version gating,
+// which was parsed and then ignored.
+//
+// runonserver was read from a Server field that nothing ever assigned, and
+// compared against a version that was also never assigned, so every query in a
+// file shared one restriction and that restriction was always empty. A query
+// written for PostgreSQL 16 and later ran on 15, and one written for 13 only
+// ran on 19.
+//
+// Three queries against the running server: one restricted to a range that
+// includes it, one to a range that excludes it, and one unrestricted. The
+// excluded one must not run while the other two do, which is also what shows
+// the restriction belongs to the query rather than to the file.
+func (s *IntegrationSuite) TestApplicationQueryVersionRestriction(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	var major int
+	c.Assert(server.db.QueryRow(`SELECT current_setting('server_version_num')::int / 10000`).Scan(&major), IsNil)
+
+	fixture := fmt.Sprintf(`
+app_supported:
+  query: "SELECT 1::float8 AS value"
+  runonserver: ">=%d.0.0"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_unsupported:
+  query: "SELECT 1::float8 AS value"
+  runonserver: ">=%d.0.0"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_any_version:
+  query: "SELECT 1::float8 AS value"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+`, major, major+10)
+	dir := writeQueryFile(c, "app.yaml", fixture)
+
+	exporter := NewExporter(
+		strings.Split(dsn, ",")[:1],
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+		DisableDefaultMetrics(true),
+		DisableSettingsMetrics(true),
+	)
+	families := gather(c, exporter)
+
+	_, supported := families["app_supported_value"]
+	c.Check(supported, Equals, true,
+		Commentf("a query restricted to >=%d did not run on PostgreSQL %d", major, major))
+
+	_, unsupported := families["app_unsupported_value"]
+	c.Check(unsupported, Equals, false,
+		Commentf("a query restricted to >=%d ran on PostgreSQL %d", major+10, major))
+
+	_, any := families["app_any_version_value"]
+	c.Check(any, Equals, true,
+		Commentf("an unrestricted query did not run, so one query's restriction reached another"))
+}
