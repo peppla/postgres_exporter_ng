@@ -1361,3 +1361,97 @@ func (s *IntegrationSuite) TestIndexStatsCollectorAgainstServer(c *C) {
 		}
 	}
 }
+
+// TestExtensionsFanOutAcrossDatabases is the last of the two collectors that
+// could not fan out.
+//
+// pg_extension is a per-database catalog, and pg_available_extensions reports
+// its installed_version from the connection's own database, so both describe
+// one database while neither said which. Two databases produced identical
+// label sets, so the collector ran on the configured connection alone.
+//
+// An extension installed in one database and not another is what makes the
+// difference visible.
+func (s *IntegrationSuite) TestExtensionsFanOutAcrossDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "extensions_other"
+	// pg_trgm ships with the server and is not installed anywhere by default.
+	const ext = "pg_trgm"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE EXTENSION ` + ext)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+
+	families := gather(c, pc)
+	installed, ok := families["pg_extensions"]
+	c.Assert(ok, Equals, true, Commentf("the extensions collector produced nothing"))
+
+	seen := map[string]map[string]bool{}
+	for _, m := range installed.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		c.Check(labels["datname"], Not(Equals), "",
+			Commentf("an installed-extension sample does not say which database it describes"))
+		if seen[labels["datname"]] == nil {
+			seen[labels["datname"]] = map[string]bool{}
+		}
+		seen[labels["datname"]][labels["name"]] = true
+	}
+
+	c.Check(len(seen) > 1, Equals, true,
+		Commentf("extensions were reported for %d database, so the collector did not fan out", len(seen)))
+	c.Check(seen[other][ext], Equals, true,
+		Commentf("%s is installed in %q but was not reported there: %v", ext, other, seen))
+
+	// The point of the label: the same extension list is not reported for
+	// every database. plpgsql is in both, pg_trgm is in one.
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+	c.Check(seen[control][ext], Equals, false,
+		Commentf("%s is not installed in %q but was reported there", ext, control))
+	c.Check(seen[control]["plpgsql"], Equals, true)
+	c.Check(seen[other]["plpgsql"], Equals, true)
+
+	// pg_available_extensions is reported per database too, because its
+	// installed_version differs between them.
+	available, ok := families["pg_available_extensions"]
+	c.Assert(ok, Equals, true)
+	installedVersions := map[string]string{}
+	for _, m := range available.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["name"] == ext {
+			installedVersions[labels["datname"]] = labels["installed_version"]
+		}
+	}
+	c.Check(installedVersions[other], Not(Equals), "",
+		Commentf("%s reports no installed version in the database that has it", ext))
+	c.Check(installedVersions[control], Equals, "",
+		Commentf("%s reports an installed version in a database that does not have it", ext))
+}
