@@ -1,8 +1,8 @@
 > ## This is a fork, diverging on purpose
 >
 > `postgres_exporter_ng` starts from
-> [percona/postgres_exporter](https://github.com/percona/postgres_exporter) —
-> the exporter PMM ships — which is itself a fork of
+> [percona/postgres_exporter](https://github.com/percona/postgres_exporter),
+> the exporter PMM ships, which is itself a fork of
 > [prometheus-community/postgres_exporter](https://github.com/prometheus-community/postgres_exporter).
 > It is being developed into a different exporter, and is **not** kept in sync
 > with either.
@@ -25,7 +25,18 @@
 
 Prometheus exporter for PostgreSQL server metrics.
 
-CI Tested PostgreSQL versions: `13`, `14`, `15`, `16`, `18`
+CI tested PostgreSQL versions: `15`, `16`, `17`, `18`, `19`
+
+A version is supported while it is not end-of-life, following the
+[PostgreSQL versioning policy](https://www.postgresql.org/support/versioning/).
+PostgreSQL 13 reached end of life on 2025-11-13 and 14 on 2026-11-12.
+
+Each of those versions gets its own CI job, which starts a server of that
+version and runs the integration tests against it. Those tests cover the
+built-in namespace queries, the settings query, database discovery, custom
+query files, and a scrape of the default-enabled namespaced collectors. They
+run on a single primary with a superuser DSN, so they say nothing yet about
+standby servers, least-privilege roles or extensions.
 
 ## Quick Start
 This package is available for Docker:
