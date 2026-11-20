@@ -19,7 +19,6 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/internal/budget"
-	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -377,6 +376,19 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			dsn = dsns[0]
 		}
 
+		// Built-in monitoring's own selection, from monitoring.databases in
+		// the configuration file where it is written there and from the
+		// deprecated flags otherwise. This engine's set is never intersected
+		// with the legacy engine's.
+		excludeSelection, includeSelection, selErr := builtinDatabaseSelection(
+			c.GetConfig(), excludedDatabases, strings.Split(*includeDatabases, ","))
+		if selErr != nil {
+			// Two sources disagreeing about the same set is a configuration
+			// error, not something to resolve quietly at scrape time.
+			level.Error(logger).Log("msg", "Database selection is configured twice", "err", selErr.Error())
+			return registry, nil
+		}
+
 		pe, err := collector.NewPostgresCollector(
 			logger,
 			excludedDatabases,
@@ -384,15 +396,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			filters.postgresCollectors(),
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema),
-			// This engine selects its own databases and its set is never
-			// intersected with the legacy engine's. The two are fed the same
-			// values here because these flags are the only database selection
-			// configuration that exists today. Separate keys wait on the
-			// naming decision in contract §4.0b; the mechanism does not.
-			collector.WithDatabaseSelection(
-				dbselect.FromFlag(excludedDatabases),
-				dbselect.FromFlag(strings.Split(*includeDatabases, ",")),
-			),
+			collector.WithDatabaseSelection(excludeSelection, includeSelection),
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())

@@ -168,6 +168,45 @@ what limits the set, in `monitoring.databases`.
 deprecated, and setting both is refused at startup rather than resolved by a
 precedence rule.
 
+### monitoring
+
+This section configures built-in monitoring. `databases` says which databases
+the database-local collectors run against, by exact name.
+
+```yaml
+monitoring:
+  databases:
+    include:
+      - app
+      - reports
+    exclude:
+      - staging
+```
+
+| what you write | which databases are collected |
+| --- | --- |
+| neither key | every connectable, non-template database |
+| `include` only | the listed databases |
+| `exclude` only | every eligible database but the listed ones |
+| both | the included databases minus the excluded ones |
+| `include: []` | none, whatever `exclude` says |
+
+Exclusion wins over inclusion. A key left out and a key written as an empty
+list mean opposite things, so writing a key with nothing after it is refused
+rather than read as one of them.
+
+The connected database is subject to these rules like any other and is not
+added back automatically. Leaving it out stops database-local collection there.
+Its connection is still what the cluster-wide collectors use, and those run
+once per server whatever this section says.
+
+These keys replace `--exclude-databases` and `--include-databases`, which are
+deprecated. Configuring the same set in both places is refused at startup
+rather than resolved by a precedence rule.
+
+Application queries are not affected. They select their own databases per
+query, with `databases:` and `master: true` in the query file.
+
 ## Building and running
 
     git clone https://github.com/percona/postgres_exporter.git

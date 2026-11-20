@@ -3182,3 +3182,93 @@ func (s *IntegrationSuite) TestCollectRejectsAnUnusableSelection(c *C) {
 		c.Check(code, Equals, 400, Commentf("%s: %s returned %d", tc.name, tc.collect, code))
 	}
 }
+
+// withConfigFile installs a parsed configuration file as the one the exporter
+// reads, and restores what was there afterwards.
+//
+// The package-level handler is named c, which a gocheck method shadows with
+// its own parameter, so this lives outside the method.
+func withConfigFile(path string) (func(), error) {
+	h := &config.Handler{}
+	if err := h.ReloadConfig(path, log.NewNopLogger()); err != nil {
+		return func() {}, err
+	}
+	previous := c.GetConfig()
+	c.Config = h.GetConfig()
+	return func() { c.Config = previous }, nil
+}
+
+// TestMonitoringDatabaseKeysSelectDatabases is the end-to-end half of the
+// configuration keys.
+//
+// Parsing them is checked in the config package. What this adds is that the
+// parsed value reaches the collector and changes which databases are
+// collected, which is the step a unit test cannot see: a key can be read
+// perfectly and never passed on.
+//
+// The registry is built the way a scrape builds it, because that is where the
+// configuration is read.
+func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	catalog, err := queryDatabases(context.Background(), server)
+	c.Assert(err, IsNil)
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others) > 0, Equals, true,
+		Commentf("the fixture server has one database, so selection cannot be exercised"))
+	chosen := others[0]
+
+	path := filepath.Join(c.MkDir(), "postgres_exporter.yml")
+	c.Assert(os.WriteFile(path,
+		[]byte("monitoring:\n  databases:\n    include: ["+chosen+"]\n"), 0o600), IsNil)
+	restore, err := withConfigFile(path)
+	c.Assert(err, IsNil)
+	defer restore()
+
+	limits := budget.Defaults()
+	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		Filters{EnablePostgresCollector: true}, limits, querycache.New())
+	c.Assert(err, IsNil)
+	families, err := registry.Gather()
+	c.Assert(err, IsNil)
+
+	byName := map[string]*dto.MetricFamily{}
+	for _, f := range families {
+		byName[f.GetName()] = f
+	}
+
+	count, ok := byName["pg_collector_databases_selected"]
+	c.Assert(ok, Equals, true, Commentf("nothing was collected, so the fixture proves nothing"))
+	c.Check(count.GetMetric()[0].GetGauge().GetValue(), Equals, float64(1),
+		Commentf("an include list naming one database did not select exactly one"))
+
+	// What the include list is for: which databases the database-local
+	// collectors actually read. pg_extensions rather than a table family,
+	// because a database with no user tables reports nothing either way.
+	//
+	// The control connection is a separate matter. It stays up and keeps
+	// serving the cluster-wide collectors whether or not its database was
+	// selected, which is why this looks at what was collected rather than at
+	// which connections are up.
+	extensions, ok := byName["pg_extensions"]
+	c.Assert(ok, Equals, true, Commentf("no extensions were collected from any database"))
+
+	var collected []string
+	for _, m := range extensions.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == "datname" && l.GetValue() != "" {
+				collected = append(collected, l.GetValue())
+			}
+		}
+	}
+	sort.Strings(collected)
+	collected = uniq(collected)
+
+	c.Check(collected, DeepEquals, []string{chosen},
+		Commentf("an include list naming %q collected from %v", chosen, collected))
+}

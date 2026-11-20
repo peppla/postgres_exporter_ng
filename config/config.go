@@ -43,6 +43,8 @@ type Config struct {
 	AuthModules map[string]AuthModule `yaml:"auth_modules"`
 	// Limits is what one scrape is allowed to cost. See limits.go.
 	Limits Limits `yaml:"limits"`
+	// Monitoring configures built-in monitoring. See selection.go.
+	Monitoring Monitoring `yaml:"monitoring"`
 }
 
 type AuthModule struct {
@@ -82,14 +84,21 @@ func (ch *Handler) ReloadConfig(f string, logger log.Logger) error {
 
 	// Read the file once and parse it twice. The typed parse cannot see a key
 	// written with no value, because yaml decodes a null into the same nil
-	// that an absent key produces, so the keys where that matters are checked
-	// against the document separately.
+	// that an absent key produces and does not call a custom unmarshaler for
+	// one, so the keys where that matters are checked against the document
+	// separately.
 	content, err := os.ReadFile(f)
 	if err != nil {
 		return fmt.Errorf("error opening config file %q: %s", f, err)
 	}
 
 	if err = rejectNullKeys(content, limitKeyPaths()...); err != nil {
+		return fmt.Errorf("error parsing config file %q: %s", f, err)
+	}
+	// A separate pass for the selection lists, which need their own message:
+	// an empty list and an absent key mean opposite things there, and "give
+	// it a value" does not say which one to write.
+	if err = rejectNullSelectionLists(content); err != nil {
 		return fmt.Errorf("error parsing config file %q: %s", f, err)
 	}
 

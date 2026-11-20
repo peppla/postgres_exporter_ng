@@ -133,9 +133,11 @@ func main() {
 	// Load the config file if specified, otherwise use default/DSN settings.
 	//
 	// A file that was named and could not be read is fatal. It used to be a
-	// warning, after which the exporter ran on defaults: with limits in the
-	// file, that means an operator who tightened a budget and mistyped a key
-	// gets the default budget, with one warning line to say so.
+	// warning, after which the exporter ran on defaults. With limits in the
+	// file, an operator who tightened a budget and mistyped a key would get
+	// the default budget, and with monitoring.databases in it, one who asked
+	// for two databases would get every database on the server, each with one
+	// warning line to say so.
 	if *configFile != "" {
 		if err := c.ReloadConfig(*configFile, logger); err != nil {
 			level.Error(logger).Log("msg", "Error loading config", "err", err)
