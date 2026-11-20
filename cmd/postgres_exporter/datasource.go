@@ -24,7 +24,37 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-func (e *Exporter) discoverDatabaseDSNs() []string {
+// selectDatabases applies the exclusion and inclusion rules to the names
+// discovery returned. Exclusion wins; a non-empty inclusion list is a
+// whitelist. Extracted from discoverDatabaseDSNs so the rule can be tested
+// without a database: it decides coverage, and nothing was testing it.
+func selectDatabases(names, exclude, include []string) []string {
+	selected := make([]string, 0, len(names))
+	for _, name := range names {
+		if contains(exclude, name) {
+			continue
+		}
+		if len(include) != 0 && !contains(include, name) {
+			continue
+		}
+		selected = append(selected, name)
+	}
+	return selected
+}
+
+// discoverDatabaseDSNs returns the DSNs to scrape, how many databases the
+// server reported as connectable, and whether discovery itself succeeded.
+//
+// The count includes the database named in each seed DSN, because
+// queryDatabases excludes current_database() and a coverage metric that
+// inherited that exclusion would understate the server by one.
+//
+// With more than one seed DSN pointing at the same server the count is a sum
+// and will overstate it. One seed is the normal case and the only one PMM
+// produces; the alternative is deduplicating databases across seeds, which
+// needs a notion of server identity this code does not have.
+func (e *Exporter) discoverDatabaseDSNs() (dsnList []string, discovered int, ok bool) {
+	ok = true
 	// connstring syntax is complex (and not sure if even regular).
 	// we don't need to parse it, so just superficially validate that it starts
 	// with a valid-ish keyword pair
@@ -40,33 +70,37 @@ func (e *Exporter) discoverDatabaseDSNs() []string {
 			dsnURI, err = url.Parse(dsn)
 			if err != nil {
 				level.Error(logger).Log("msg", "Unable to parse DSN as URI", "dsn", loggableDSN(dsn), "err", err)
+				// The set could not be determined for this seed, and the
+				// seed itself is dropped. Reporting success here would
+				// publish "nothing to cover, and that is correct".
+				ok = false
 				continue
 			}
 		} else if connstringRe.MatchString(dsn) {
 			dsnConnstring = dsn
 		} else {
 			level.Error(logger).Log("msg", "Unable to parse DSN as either URI or connstring", "dsn", loggableDSN(dsn))
+			ok = false
 			continue
 		}
 		dsns[dsn] = struct{}{}
+		// The seed's own database. queryDatabases does not return it.
+		discovered++
 
 		// If autoDiscoverDatabases is true, set first dsn as master database (Default: false)
 		e.masterDSN = dsn
 
 		databaseNames, err := e.getDatabaseNames(dsn)
 		if err != nil {
+			// Discovery failed for this seed. The DSN list keeps the seed
+			// alone, so coverage silently collapsed to one database -- which
+			// is exactly what ok=false exists to stop being silent.
+			ok = false
 			continue
 		}
+		discovered += len(databaseNames)
 
-		for _, databaseName := range databaseNames {
-			if contains(e.excludeDatabases, databaseName) {
-				continue
-			}
-
-			if len(e.includeDatabases) != 0 && !contains(e.includeDatabases, databaseName) {
-				continue
-			}
-
+		for _, databaseName := range selectDatabases(databaseNames, e.excludeDatabases, e.includeDatabases) {
 			if dsnURI != nil {
 				if dsnURI.Host == "" && strings.HasPrefix(dsnURI.Path, "/") {
 					dsnURI.Path = "/" + databaseName
@@ -90,7 +124,7 @@ func (e *Exporter) discoverDatabaseDSNs() []string {
 		index++
 	}
 
-	return result
+	return result, discovered, ok
 }
 
 func (e *Exporter) getDatabaseNames(dsn string) ([]string, error) {

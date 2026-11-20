@@ -433,11 +433,19 @@ func (s *IntegrationSuite) TestAutoDiscoverDatabases(c *C) {
 	names, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
 
-	dsns := exporter.discoverDatabaseDSNs()
+	dsns, discovered, ok := exporter.discoverDatabaseDSNs()
+	c.Assert(ok, Equals, true, Commentf("discovery reported failure"))
 
 	// Discovery keeps the DSN it was given and adds one per database it found.
 	c.Assert(len(dsns), Equals, len(names)+1,
 		Commentf("discovered %d DSNs from %d connectable databases: %v", len(dsns), len(names), names))
 	c.Assert(len(names) > 0, Equals, true,
 		Commentf("the fixture server has no second database, so discovery was never exercised"))
+
+	// The reported count adds the seed's own database back, which
+	// queryDatabases leaves out. Asserting it against the server rather than
+	// against len(dsns) is what catches that off-by-one, since the two would
+	// agree while both were one short.
+	c.Assert(discovered, Equals, len(names)+1,
+		Commentf("discovery reported %d databases, the server has %d plus the seed", discovered, len(names)))
 }

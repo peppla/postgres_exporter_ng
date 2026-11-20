@@ -435,6 +435,7 @@ type Exporter struct {
 	psqlUp           prometheus.Gauge
 	userQueriesError *prometheus.GaugeVec
 	totalScrapes     prometheus.Counter
+	coverage         *coverageMetrics
 
 	// servers are used to allow re-using the DB connection between scrapes.
 	// servers contains metrics map and query overrides.
@@ -646,6 +647,7 @@ func (e *Exporter) setupInternalMetrics() {
 		Help:        "Whether the user queries file was loaded and parsed successfully (1 for error, 0 for success).",
 		ConstLabels: e.constantLabels,
 	}, []string{"filename", "hashsum"})
+	e.coverage = newCoverageMetrics(e.constantLabels)
 }
 
 // Describe implements prometheus.Collector.
@@ -664,6 +666,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.error
 	ch <- e.psqlUp
 	e.userQueriesError.Collect(ch)
+	e.coverage.collect(ch)
 }
 
 func newDesc(subsystem, name, help string, labels prometheus.Labels) *prometheus.Desc {
@@ -744,9 +747,14 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	e.totalScrapes.Inc()
 
 	dsns := e.dsn
+	discovered, discoverySucceeded := len(e.dsn), true
 	if e.autoDiscoverDatabases {
-		dsns = e.discoverDatabaseDSNs()
+		dsns, discovered, discoverySucceeded = e.discoverDatabaseDSNs()
 	}
+	// Published before the fan-out, not after. If this scrape is cut short, the
+	// intent still reaches the response; a shortfall with no record of what was
+	// intended is indistinguishable from no shortfall.
+	e.coverage.setSelection(e.autoDiscoverDatabases, discoverySucceeded, discovered, len(dsns))
 
 	var errorsCount atomic.Int32
 	var connectionErrorsCount atomic.Int32
@@ -761,6 +769,16 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			if e.connSema != nil {
 				if err := e.connSema.Acquire(e.ctx, 1); err != nil {
 					level.Warn(logger).Log("msg", "Failed to acquire semaphore", "err", err)
+					// This database is not scraped, so it must not be
+					// counted as one that was. scraped is selected minus
+					// errors, so returning silently here would publish a
+					// database that was never attempted as successfully
+					// covered -- the exact false claim these metrics exist
+					// to prevent.
+					//
+					// Deliberately not a connection error: nothing was
+					// connected to, so pg_up keeps the meaning it had.
+					errorsCount.Add(1)
 					return
 				}
 				defer e.connSema.Release(1)
@@ -778,6 +796,8 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	}
 
 	wg.Wait()
+
+	e.coverage.setOutcome(len(dsns), int(errorsCount.Load()))
 
 	switch {
 	case int(connectionErrorsCount.Load()) >= len(dsns):
