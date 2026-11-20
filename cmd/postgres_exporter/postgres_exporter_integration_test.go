@@ -1184,3 +1184,95 @@ func (s *IntegrationSuite) TestCollectorIncludeWithAmbiguousDSN(c *C) {
 	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
 		Equals, float64(0))
 }
+
+// withCollector enables a collector that ships disabled, for the duration of
+// one test, and restores the defaults afterwards.
+//
+// Collector enablement lives in package-level flag state, so this mutates
+// something shared. gocheck runs the cases in a suite one at a time, and the
+// restore is deferred, so the blast radius is this test.
+func withCollector(c *C, name string) func() {
+	_, err := kingpin.CommandLine.Parse([]string{"--collector." + name})
+	c.Assert(err, IsNil)
+	return func() {
+		_, err := kingpin.CommandLine.Parse([]string{})
+		c.Assert(err, IsNil)
+	}
+}
+
+// TestIndexIOFansOutAcrossDatabases covers the port that made the index I/O
+// collector fannable.
+//
+// pg_statio_user_indexes carried no datname label, so two databases each
+// holding a public.accounts.accounts_pkey produced label sets identical in
+// every respect. The registry rejects those as duplicates, which is why the
+// collector ran on the configured connection alone and reported nothing about
+// any other database.
+func (s *IntegrationSuite) TestIndexIOFansOutAcrossDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	defer withCollector(c, "statio_user_indexes")()
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "index_io_other"
+	const table = "index_io_marker"
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`)
+		_, _ = admin.db.Exec(`DROP TABLE IF EXISTS ` + table)
+	}
+	cleanup()
+	defer cleanup()
+
+	// The same table and index name in two databases, which is the collision
+	// the label exists to resolve.
+	_, err = admin.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	for _, server := range []*Server{admin, seed} {
+		// Touch the index so statistics exist for it.
+		_, err = server.db.Exec(`SELECT count(*) FROM ` + table + ` WHERE id = 1`)
+		c.Assert(err, IsNil)
+	}
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	c.Assert(pc.Collectors["statio_user_indexes"], NotNil,
+		Commentf("the collector under test is not enabled"))
+
+	families := gather(c, pc)
+	f, ok := families["pg_statio_user_indexes_idx_blks_read_total"]
+	c.Assert(ok, Equals, true, Commentf("the index I/O collector produced nothing"))
+
+	databases := map[string]bool{}
+	for _, m := range f.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		c.Check(labels["datname"], Not(Equals), "",
+			Commentf("an index I/O sample does not say which database it describes"))
+		if labels["relname"] == table {
+			databases[labels["datname"]] = true
+		}
+	}
+	c.Check(databases[other], Equals, true,
+		Commentf("the index in %q did not reach the scrape; saw %v", other, databases))
+	c.Check(len(databases), Equals, 2,
+		Commentf("the same index name in two databases produced %d series, want 2: %v", len(databases), databases))
+}
