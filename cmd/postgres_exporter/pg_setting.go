@@ -60,6 +60,12 @@ func querySettings(ch chan<- prometheus.Metric, server *Server) error {
 		ch <- s.metric(server.labels)
 	}
 
+	// Next stops on error exactly as it stops at the end of the rows, so
+	// without this a settings query that failed partway reports success.
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error retrieving rows on %q: %s %v", server, namespace, err)
+	}
+
 	return nil
 }
 

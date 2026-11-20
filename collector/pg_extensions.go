@@ -103,7 +103,10 @@ func (e *ExtensionsCollector) scrapeInstalledExtensions(ctx context.Context, db 
 		)
 	}
 
-	return nil
+	// Next returning false does not mean the rows ended; it also means the
+	// query failed partway, or was cancelled. Returning nil here reports a
+	// truncated collection as a complete one.
+	return rowsExtensions.Err()
 }
 
 func (e *ExtensionsCollector) scrapeAvailableExtensions(ctx context.Context, db *sql.DB, ch chan<- prometheus.Metric) error {
@@ -133,7 +136,7 @@ func (e *ExtensionsCollector) scrapeAvailableExtensions(ctx context.Context, db 
 		)
 	}
 
-	return nil
+	return rows.Err()
 }
 
 var _ = (Collector)(&ExtensionsCollector{})

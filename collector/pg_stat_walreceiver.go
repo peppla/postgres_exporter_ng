@@ -134,6 +134,12 @@ func (c *PGStatWalReceiverCollector) Update(ctx context.Context, instance *insta
 	}
 
 	hasFlushedLSN := hasFlushedLSNRows.Next()
+	// This Next decides which query runs next, so an error here picks the
+	// wrong one silently.
+	if err := hasFlushedLSNRows.Err(); err != nil {
+		hasFlushedLSNRows.Close()
+		return err
+	}
 	var query string
 	if hasFlushedLSN {
 		query = fmt.Sprintf(pgStatWalReceiverQueryTemplate, "(flushed_lsn - '0/0') % (2^52)::bigint as flushed_lsn,\n")
