@@ -25,7 +25,11 @@
 
 Prometheus exporter for PostgreSQL server metrics.
 
-CI Tested PostgreSQL versions: `13`, `14`, `15`, `16`, `18`
+CI Tested PostgreSQL versions: `15`, `16`, `17`, `18`, `19`
+
+A version is supported while it is not end-of-life, following the
+[PostgreSQL versioning policy](https://www.postgresql.org/support/versioning/).
+PostgreSQL 13 reached end of life on 2025-11-13 and 14 on 2026-11-12.
 
 ## Quick Start
 This package is available for Docker:
