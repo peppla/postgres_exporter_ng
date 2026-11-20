@@ -93,6 +93,19 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 	return s, nil
 }
 
+// hasQueryMaps reports whether checkMapVersions has run to completion on this
+// server.
+//
+// The distinction is nil against empty, and it matters. A fresh Server has a
+// nil metricMap; checkMapVersions always assigns one, even when it assigns an
+// empty one for a non-master server. So nil means the preparation step did not
+// finish, and an empty map means it finished and there was nothing to prepare.
+func (s *Server) hasQueryMaps() bool {
+	s.mappingMtx.RLock()
+	defer s.mappingMtx.RUnlock()
+	return s.metricMap != nil
+}
+
 // Close disconnects from Postgres.
 func (s *Server) Close() error {
 	return s.db.Close()

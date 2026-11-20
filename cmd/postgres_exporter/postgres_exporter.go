@@ -426,8 +426,8 @@ type Exporter struct {
 
 	disableDefaultMetrics, disableSettingsMetrics, autoDiscoverDatabases bool
 
-	excludeDatabases []string
-	includeDatabases []string
+	excludeDatabases databaseList
+	includeDatabases databaseList
 	dsn              []string
 	constantLabels   prometheus.Labels
 	duration         prometheus.Gauge
@@ -505,18 +505,27 @@ func AutoDiscoverDatabases(b bool) ExporterOpt {
 	}
 }
 
-// ExcludeDatabases allows to filter out result from AutoDiscoverDatabases
+// ExcludeDatabases allows to filter out result from AutoDiscoverDatabases.
+//
+// The caller passes the inherited comma-separated flag split on commas, which
+// is a slice holding one empty string when the flag is unset. listFromFlag
+// reads that as absent rather than as a list containing a database with no
+// name.
 func ExcludeDatabases(s []string) ExporterOpt {
 	return func(e *Exporter) {
-		e.excludeDatabases = s
+		e.excludeDatabases = listFromFlag(s)
 	}
 }
 
-// IncludeDatabases allows to filter result from AutoDiscoverDatabases
+// IncludeDatabases allows to filter result from AutoDiscoverDatabases.
+//
+// An empty string is an absent list here, not an explicit empty one. The flag
+// surface cannot express the difference, and until it can, absent is the safe
+// reading: an explicit empty list selects no databases at all.
 func IncludeDatabases(s string) ExporterOpt {
 	return func(e *Exporter) {
 		if len(s) > 0 {
-			e.includeDatabases = strings.Split(s, ",")
+			e.includeDatabases = listOf(strings.Split(s, ","))
 		}
 	}
 }
@@ -746,22 +755,61 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	e.totalScrapes.Inc()
 
-	dsns := e.dsn
-	discovered, discoverySucceeded := len(e.dsn), true
+	d := discovery{ok: true, discovered: len(e.dsn)}
 	if e.autoDiscoverDatabases {
-		dsns, discovered, discoverySucceeded = e.discoverDatabaseDSNs()
+		d = e.discoverDatabaseDSNs()
+	} else {
+		// No discovery, so no catalog and no names. The targets are the
+		// configured DSNs as given, identified by server only.
+		for _, dsn := range e.dsn {
+			fingerprint, err := parseFingerprint(dsn)
+			if err != nil {
+				level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
+			}
+			d.targets = append(d.targets, scrapeTarget{
+				dsn:         dsn,
+				databaseRef: databaseRef{server: fingerprint},
+			})
+		}
 	}
 	// Published before the fan-out, not after. If this scrape is cut short, the
 	// intent still reaches the response; a shortfall with no record of what was
 	// intended is indistinguishable from no shortfall.
-	e.coverage.setSelection(e.autoDiscoverDatabases, discoverySucceeded, discovered, len(dsns))
+	e.coverage.setSelection(e.autoDiscoverDatabases, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
 
+	errorsCount, connectionErrorsCount := e.scrapeTargets(ch, d.targets)
+
+	e.coverage.setOutcome(len(d.targets), errorsCount)
+
+	switch {
+	case connectionErrorsCount >= len(d.targets):
+		e.psqlUp.Set(0)
+	default:
+		e.psqlUp.Set(1) // Didn't fail, can mark connection as up for this scrape.
+	}
+
+	switch errorsCount {
+	case 0:
+		e.error.Set(0)
+	default:
+		e.error.Set(1)
+	}
+}
+
+// scrapeTargets runs the per-database fan-out and returns how many targets
+// failed and how many of those failed to connect.
+//
+// Split out of scrape so the per-database outcome reporting can be tested with
+// targets that carry names. scrape builds its targets from discovery, and
+// discovery needs a server, so without this the only reachable test case was
+// the one where no name is known and the per-database gauges are empty.
+func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTarget) (failed, connectionFailures int) {
 	var errorsCount atomic.Int32
 	var connectionErrorsCount atomic.Int32
 	var wg sync.WaitGroup
 
-	for _, dsn := range dsns {
-		dsn := dsn
+	for _, target := range targets {
+		target := target
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -779,37 +827,29 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 					// Deliberately not a connection error: nothing was
 					// connected to, so pg_up keeps the meaning it had.
 					errorsCount.Add(1)
+					e.coverage.setDatabaseOutcome(target.databaseRef, reasonNotAttempted)
 					return
 				}
 				defer e.connSema.Release(1)
 			}
-			if err := e.scrapeDSN(ch, dsn); err != nil {
+			if err := e.scrapeDSN(ch, target.dsn); err != nil {
 				errorsCount.Add(1)
 
 				level.Error(logger).Log("err", err)
 
+				reason := reasonScrape
 				if _, ok := err.(*ErrorConnectToServer); ok {
 					connectionErrorsCount.Add(1)
+					reason = reasonConnect
 				}
+				e.coverage.setDatabaseOutcome(target.databaseRef, reason)
+				return
 			}
+			e.coverage.setDatabaseOutcome(target.databaseRef, "")
 		}()
 	}
 
 	wg.Wait()
 
-	e.coverage.setOutcome(len(dsns), int(errorsCount.Load()))
-
-	switch {
-	case int(connectionErrorsCount.Load()) >= len(dsns):
-		e.psqlUp.Set(0)
-	default:
-		e.psqlUp.Set(1) // Didn't fail, can mark connection as up for this scrape.
-	}
-
-	switch errorsCount.Load() {
-	case 0:
-		e.error.Set(0)
-	default:
-		e.error.Set(1)
-	}
+	return int(errorsCount.Load()), int(connectionErrorsCount.Load())
 }

@@ -308,22 +308,72 @@ func addQueries(content []byte, pgVersion semver.Version, server *Server) error 
 	return nil
 }
 
-func queryDatabases(ctx context.Context, server *Server) ([]string, error) {
-	rows, err := server.db.QueryContext(ctx, "SELECT datname FROM pg_database WHERE datallowconn = true AND datistemplate = false AND datname != current_database() AND has_database_privilege(current_user, datname, 'connect')")
+// catalogDatabase is one row of the connectable-database catalog.
+//
+// current marks the database this connection is attached to. The query used to
+// exclude it with datname != current_database(), which cost the caller the one
+// name it could not get anywhere else: the configured database's own. Callers
+// that need the set without it filter in Go, and callers that need to count or
+// label the whole server no longer have to add one back and hope the addition
+// matches what the server would have said.
+type catalogDatabase struct {
+	name    string
+	current bool
+}
+
+// queryDatabases returns every database on the server that this role may
+// connect to, templates excluded, including the one the connection is on.
+//
+// "Connectable" here is a catalog property, as the monitoring contract
+// requires: datallowconn, not a template, and the role holding CONNECT. A
+// database that fails to answer later is still part of this set, and is
+// reported as a failure rather than removed from it.
+func queryDatabases(ctx context.Context, server *Server) ([]catalogDatabase, error) {
+	rows, err := server.db.QueryContext(ctx, "SELECT datname, datname = current_database() AS is_current FROM pg_database WHERE datallowconn = true AND datistemplate = false AND has_database_privilege(current_user, datname, 'connect')")
 	if err != nil {
 		return nil, fmt.Errorf("Error retrieving databases: %v", err)
 	}
 	defer rows.Close() // nolint: errcheck
 
-	var databaseName string
-	result := make([]string, 0)
+	var db catalogDatabase
+	result := make([]catalogDatabase, 0)
 	for rows.Next() {
-		err = rows.Scan(&databaseName)
+		err = rows.Scan(&db.name, &db.current)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintln("Error retrieving rows:", err))
 		}
-		result = append(result, databaseName)
+		result = append(result, db)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("Error retrieving databases: %v", err)
 	}
 
 	return result, nil
+}
+
+// names returns the database names, dropping the one the connection is on.
+// Discovery builds a DSN per database and already holds one for that database,
+// so adding it again would either duplicate the seed or replace it with a
+// re-serialised form of itself.
+func otherThanCurrent(dbs []catalogDatabase) []string {
+	out := make([]string, 0, len(dbs))
+	for _, db := range dbs {
+		if !db.current {
+			out = append(out, db.name)
+		}
+	}
+	return out
+}
+
+// currentName returns the name of the database the connection is on, and
+// whether the catalog reported one. It is absent only if the current database
+// stopped being connectable while this connection was open, which is possible
+// and must not be guessed at.
+func currentName(dbs []catalogDatabase) (string, bool) {
+	for _, db := range dbs {
+		if db.current {
+			return db.name, true
+		}
+	}
+	return "", false
 }
