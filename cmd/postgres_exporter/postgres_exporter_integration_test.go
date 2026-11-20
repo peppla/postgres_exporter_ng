@@ -1184,3 +1184,274 @@ func (s *IntegrationSuite) TestCollectorIncludeWithAmbiguousDSN(c *C) {
 	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
 		Equals, float64(0))
 }
+
+// withCollector enables a collector that ships disabled, for the duration of
+// one test, and restores the defaults afterwards.
+//
+// Collector enablement lives in package-level flag state, so this mutates
+// something shared. gocheck runs the cases in a suite one at a time, and the
+// restore is deferred, so the blast radius is this test.
+func withCollector(c *C, name string) func() {
+	_, err := kingpin.CommandLine.Parse([]string{"--collector." + name})
+	c.Assert(err, IsNil)
+	return func() {
+		_, err := kingpin.CommandLine.Parse([]string{})
+		c.Assert(err, IsNil)
+	}
+}
+
+// TestIndexIOFansOutAcrossDatabases covers the port that made the index I/O
+// collector fannable.
+//
+// pg_statio_user_indexes carried no datname label, so two databases each
+// holding a public.accounts.accounts_pkey produced label sets identical in
+// every respect. The registry rejects those as duplicates, which is why the
+// collector ran on the configured connection alone and reported nothing about
+// any other database.
+func (s *IntegrationSuite) TestIndexIOFansOutAcrossDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	defer withCollector(c, "statio_user_indexes")()
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "index_io_other"
+	const table = "index_io_marker"
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`)
+		_, _ = admin.db.Exec(`DROP TABLE IF EXISTS ` + table)
+	}
+	cleanup()
+	defer cleanup()
+
+	// The same table and index name in two databases, which is the collision
+	// the label exists to resolve.
+	_, err = admin.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	for _, server := range []*Server{admin, seed} {
+		// Touch the index so statistics exist for it.
+		_, err = server.db.Exec(`SELECT count(*) FROM ` + table + ` WHERE id = 1`)
+		c.Assert(err, IsNil)
+	}
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	c.Assert(pc.Collectors["statio_user_indexes"], NotNil,
+		Commentf("the collector under test is not enabled"))
+
+	families := gather(c, pc)
+	f, ok := families["pg_statio_user_indexes_idx_blks_read_total"]
+	c.Assert(ok, Equals, true, Commentf("the index I/O collector produced nothing"))
+
+	databases := map[string]bool{}
+	for _, m := range f.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		c.Check(labels["datname"], Not(Equals), "",
+			Commentf("an index I/O sample does not say which database it describes"))
+		if labels["relname"] == table {
+			databases[labels["datname"]] = true
+		}
+	}
+	c.Check(databases[other], Equals, true,
+		Commentf("the index in %q did not reach the scrape; saw %v", other, databases))
+	c.Check(len(databases), Equals, 2,
+		Commentf("the same index name in two databases produced %d series, want 2: %v", len(databases), databases))
+}
+
+// TestIndexStatsCollectorAgainstServer covers the ported index statistics
+// collector running against a real server, in a database the DSN does not
+// point at.
+//
+// The collector reproduces the body of pg_stat_user_indexes rather than
+// selecting from it, so that the index's relpages and reltuples come off a
+// join the view already performs. That makes it worth running against each
+// supported version rather than trusting sqlmock, which cannot tell whether
+// the query is valid SQL on PostgreSQL 15 or 19.
+func (s *IntegrationSuite) TestIndexStatsCollectorAgainstServer(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "index_stats_other"
+	const table = "index_stats_marker"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE TABLE ` + table + ` (id int PRIMARY KEY)`)
+	c.Assert(err, IsNil)
+	_, err = seed.db.Exec(`INSERT INTO ` + table + ` SELECT generate_series(1, 10)`)
+	c.Assert(err, IsNil)
+	_, err = seed.db.Exec(`SELECT count(*) FROM ` + table + ` WHERE id = 1`)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	c.Assert(pc.Collectors["stat_user_indexes"], NotNil,
+		Commentf("the index statistics collector is not enabled by default"))
+
+	families := gather(c, pc)
+	for _, name := range []string{
+		"pg_stat_user_indexes_idx_scan",
+		"pg_stat_user_indexes_idx_tup_read",
+		"pg_stat_user_indexes_idx_tup_fetch",
+		"pg_stat_user_indexes_relpages",
+		"pg_stat_user_indexes_reltuples",
+	} {
+		f, ok := families[name]
+		c.Assert(ok, Equals, true, Commentf("%s was not produced", name))
+		found := false
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			c.Check(labels["datname"], Not(Equals), "",
+				Commentf("%s does not say which database it describes", name))
+			if labels["datname"] == other && labels["relname"] == table {
+				found = true
+			}
+		}
+		c.Check(found, Equals, true,
+			Commentf("%s carries nothing for the index seeded in %q", name, other))
+	}
+
+	// The collector reports every collector status it owns, and none failed.
+	for _, m := range families["pg_scrape_collector_success"].GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["collector"] == "stat_user_indexes" {
+			c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+				Commentf("the index statistics collector failed against %q", labels["datname"]))
+		}
+	}
+}
+
+// TestExtensionsFanOutAcrossDatabases is the last of the two collectors that
+// could not fan out.
+//
+// pg_extension is a per-database catalog, and pg_available_extensions reports
+// its installed_version from the connection's own database, so both describe
+// one database while neither said which. Two databases produced identical
+// label sets, so the collector ran on the configured connection alone.
+//
+// An extension installed in one database and not another is what makes the
+// difference visible.
+func (s *IntegrationSuite) TestExtensionsFanOutAcrossDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "extensions_other"
+	// pg_trgm ships with the server and is not installed anywhere by default.
+	const ext = "pg_trgm"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE EXTENSION ` + ext)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+
+	families := gather(c, pc)
+	installed, ok := families["pg_extensions"]
+	c.Assert(ok, Equals, true, Commentf("the extensions collector produced nothing"))
+
+	seen := map[string]map[string]bool{}
+	for _, m := range installed.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		c.Check(labels["datname"], Not(Equals), "",
+			Commentf("an installed-extension sample does not say which database it describes"))
+		if seen[labels["datname"]] == nil {
+			seen[labels["datname"]] = map[string]bool{}
+		}
+		seen[labels["datname"]][labels["name"]] = true
+	}
+
+	c.Check(len(seen) > 1, Equals, true,
+		Commentf("extensions were reported for %d database, so the collector did not fan out", len(seen)))
+	c.Check(seen[other][ext], Equals, true,
+		Commentf("%s is installed in %q but was not reported there: %v", ext, other, seen))
+
+	// The point of the label: the same extension list is not reported for
+	// every database. plpgsql is in both, pg_trgm is in one.
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+	c.Check(seen[control][ext], Equals, false,
+		Commentf("%s is not installed in %q but was reported there", ext, control))
+	c.Check(seen[control]["plpgsql"], Equals, true)
+	c.Check(seen[other]["plpgsql"], Equals, true)
+
+	// pg_available_extensions is reported per database too, because its
+	// installed_version differs between them.
+	available, ok := families["pg_available_extensions"]
+	c.Assert(ok, Equals, true)
+	installedVersions := map[string]string{}
+	for _, m := range available.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["name"] == ext {
+			installedVersions[labels["datname"]] = labels["installed_version"]
+		}
+	}
+	c.Check(installedVersions[other], Not(Equals), "",
+		Commentf("%s reports no installed version in the database that has it", ext))
+	c.Check(installedVersions[control], Equals, "",
+		Commentf("%s reports an installed version in a database that does not have it", ext))
+}

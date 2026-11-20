@@ -556,5 +556,8 @@ func (c *PGStatDatabaseCollector) Update(ctx context.Context, instance *instance
 			)
 		}
 	}
-	return nil
+	// A failure partway through iteration leaves Next returning false exactly
+	// as the end of the rows does. Without this, a truncated scrape reports
+	// success.
+	return rows.Err()
 }

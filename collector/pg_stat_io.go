@@ -421,5 +421,5 @@ func (c *PGStatIOCollector) Update(ctx context.Context, instance *instance, ch c
 		}
 	}
 
-	return nil
+	return rows.Err()
 }

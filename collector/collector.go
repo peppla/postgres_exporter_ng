@@ -134,32 +134,20 @@ const (
 	// scopeCluster runs once per server, on the configured connection.
 	scopeCluster collectorScope = iota
 	// scopeDatabase runs once per selected database, on a connection to it.
+	//
+	// Every metric such a collector produces has to carry a datname label.
+	// Without one, two databases produce series identical in name and labels,
+	// which the registry rejects as duplicates and which an operator could not
+	// tell apart anyway. None of the underlying views supply the database as a
+	// column, so the label is synthesized with current_database().
 	scopeDatabase
-	// scopeDatabaseUnlabelled is a database-local collector whose own metrics
-	// do not carry the database name.
-	//
-	// It reads per-database catalogs, so it describes only the database it
-	// runs in, but nothing in its output says which. Running it in two
-	// databases produces series that are identical in name and labels, which a
-	// registry rejects as duplicates and which an operator could not tell
-	// apart anyway. So it runs on the configured connection alone, which is
-	// what every collector did before the fan-out existed.
-	//
-	// This is a property of the metrics, not of the SQL. Giving these
-	// collectors a datname label would move them to scopeDatabase, and that is
-	// a change to published series rather than a change to scheduling.
-	scopeDatabaseUnlabelled
 )
 
 func (s collectorScope) String() string {
-	switch s {
-	case scopeDatabase:
+	if s == scopeDatabase {
 		return "database"
-	case scopeDatabaseUnlabelled:
-		return "database (unlabelled, control connection only)"
-	default:
-		return "cluster"
 	}
+	return "cluster"
 }
 
 type Collector interface {
@@ -346,7 +334,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	cluster, local, controlOnly := p.byScope()
+	cluster, local := p.byScope()
 
 	sel, err := selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases)
 	if err != nil {
@@ -371,14 +359,12 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// connection that is already open, so it is not opened twice.
 	control := sel.controlTarget()
 	if control != nil && !control.skipDatabaseLocal {
-		for _, set := range []map[string]Collector{local, controlOnly} {
-			wg.Add(len(set))
-			for name, c := range set {
-				go func(name string, c Collector) {
-					defer wg.Done()
-					execute(p.ctx, name, c, inst, ch, p.logger, control.datname)
-				}(name, c)
-			}
+		wg.Add(len(local))
+		for name, c := range local {
+			go func(name string, c Collector) {
+				defer wg.Done()
+				execute(p.ctx, name, c, inst, ch, p.logger, control.datname)
+			}(name, c)
 		}
 	}
 	wg.Wait()
@@ -446,27 +432,21 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 	wg.Wait()
 }
 
-// byScope splits the enabled collectors by where they can run.
+// byScope splits the enabled collectors by where they run.
 //
 // cluster runs once on the configured connection and reports no database.
-// local runs once per selected database. controlOnly runs once on the
-// configured connection and reports that database, because it describes one
-// database but its metrics do not say which.
-func (p PostgresCollector) byScope() (cluster, local, controlOnly map[string]Collector) {
+// local runs once per selected database, including the configured one.
+func (p PostgresCollector) byScope() (cluster, local map[string]Collector) {
 	cluster = make(map[string]Collector, len(p.Collectors))
 	local = make(map[string]Collector)
-	controlOnly = make(map[string]Collector)
 	for name, c := range p.Collectors {
-		switch collectorScopes[name] {
-		case scopeDatabase:
+		if collectorScopes[name] == scopeDatabase {
 			local[name] = c
-		case scopeDatabaseUnlabelled:
-			controlOnly[name] = c
-		default:
-			cluster[name] = c
+			continue
 		}
+		cluster[name] = c
 	}
-	return cluster, local, controlOnly
+	return cluster, local
 }
 
 func (p PostgresCollector) acquire() bool {

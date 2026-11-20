@@ -178,6 +178,13 @@ func queryNamespaceMapping(server *Server, namespace string, mapping MetricMapNa
 			metrics = append(metrics, metric)
 		}
 	}
+	// Next stops on error exactly as it stops at the end of the rows. Without
+	// this, a namespace query that failed or was cancelled partway returns the
+	// rows it managed to read with no error, and the scrape reports success
+	// for a database it only partly collected.
+	if err := rows.Err(); err != nil {
+		return []prometheus.Metric{}, nonfatalErrors, fmt.Errorf("error retrieving rows: %s %w", namespace, err)
+	}
 	return metrics, nonfatalErrors, nil
 }
 
