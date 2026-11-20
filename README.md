@@ -1,7 +1,25 @@
-[![Build Status](https://circleci.com/gh/prometheus-community/postgres_exporter.svg?style=svg)](https://circleci.com/gh/prometheus-community/postgres_exporter)
-[![Coverage Status](https://coveralls.io/repos/github/prometheus-community/postgres_exporter/badge.svg?branch=master)](https://coveralls.io/github/prometheus-community/postgres_exporter?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/percona/postgres_exporter)](https://goreportcard.com/report/github.com/percona/postgres_exporter)
-[![Docker Pulls](https://img.shields.io/docker/pulls/prometheuscommunity/postgres-exporter.svg)](https://hub.docker.com/r/prometheuscommunity/postgres-exporter/tags)
+> ## This is a fork, diverging on purpose
+>
+> `postgres_exporter_ng` starts from
+> [percona/postgres_exporter](https://github.com/percona/postgres_exporter) —
+> the exporter PMM ships — which is itself a fork of
+> [prometheus-community/postgres_exporter](https://github.com/prometheus-community/postgres_exporter).
+> It is being developed into a different exporter, and is **not** kept in sync
+> with either.
+>
+> - History up to `22fb54d` is the Percona fork's, unchanged.
+> - Everything after that commit belongs to this project. It is neither
+>   endorsed by nor merged back into Percona's fork or prometheus-community's.
+> - If you want the exporter PMM ships today, use
+>   [percona/postgres_exporter](https://github.com/percona/postgres_exporter).
+>
+> Apache 2.0 throughout. Upstream's `LICENSE`, `NOTICE` and per-file copyright
+> headers are retained. What this project changed is in the git history, from
+> `22fb54d` onwards.
+>
+> The upstream build, coverage and image badges that used to head this file
+> have been removed: they reported prometheus-community's CI and Docker Hub
+> image, which say nothing about this repository.
 
 # PostgreSQL Server Exporter
 
