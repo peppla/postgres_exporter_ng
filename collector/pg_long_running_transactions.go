@@ -23,7 +23,7 @@ import (
 const longRunningTransactionsSubsystem = "long_running_transactions"
 
 func init() {
-	registerCollector(longRunningTransactionsSubsystem, defaultDisabled, NewPGLongRunningTransactionsCollector)
+	registerCollector(longRunningTransactionsSubsystem, defaultDisabled, scopeCluster, NewPGLongRunningTransactionsCollector)
 }
 
 type PGLongRunningTransactionsCollector struct {

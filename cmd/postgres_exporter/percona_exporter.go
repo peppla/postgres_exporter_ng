@@ -17,6 +17,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/collector"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
@@ -210,6 +211,15 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			[]string{},
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema),
+			// This engine selects its own databases and its set is never
+			// intersected with the legacy engine's. The two are fed the same
+			// values here because these flags are the only database selection
+			// configuration that exists today. Separate keys wait on the
+			// naming decision in contract §4.0b; the mechanism does not.
+			collector.WithDatabaseSelection(
+				dbselect.FromFlag(excludedDatabases),
+				dbselect.FromFlag(strings.Split(*includeDatabases, ",")),
+			),
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())

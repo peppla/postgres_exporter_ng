@@ -24,7 +24,7 @@ import (
 const databaseSubsystem = "database"
 
 func init() {
-	registerCollector(databaseSubsystem, defaultEnabled, NewPGDatabaseCollector)
+	registerCollector(databaseSubsystem, defaultEnabled, scopeCluster, NewPGDatabaseCollector)
 }
 
 type PGDatabaseCollector struct {

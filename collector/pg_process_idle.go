@@ -24,7 +24,7 @@ import (
 
 func init() {
 	// Making this default disabled because we have no tests for it
-	registerCollector(processIdleSubsystem, defaultDisabled, NewPGProcessIdleCollector)
+	registerCollector(processIdleSubsystem, defaultDisabled, scopeCluster, NewPGProcessIdleCollector)
 }
 
 type PGProcessIdleCollector struct {

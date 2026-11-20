@@ -25,7 +25,7 @@ import (
 const databaseWraparoundSubsystem = "database_wraparound"
 
 func init() {
-	registerCollector(databaseWraparoundSubsystem, defaultEnabled, NewPGDatabaseWraparoundCollector)
+	registerCollector(databaseWraparoundSubsystem, defaultEnabled, scopeCluster, NewPGDatabaseWraparoundCollector)
 }
 
 type PGDatabaseWraparoundCollector struct {

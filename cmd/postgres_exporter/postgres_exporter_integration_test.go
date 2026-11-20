@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,8 @@ import (
 	"github.com/go-kit/log"
 	_ "github.com/lib/pq"
 	"github.com/percona/postgres_exporter/collector"
+	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -233,21 +236,27 @@ func (s *IntegrationSuite) TestNamespacedCollectorsAgainstServer(c *C) {
 	success, ok := families["pg_scrape_collector_success"]
 	c.Assert(ok, Equals, true,
 		Commentf("no collector reported a scrape status"))
-	c.Check(len(success.GetMetric()), Equals, len(pc.Collectors))
 
+	// Every enabled collector reports at least once. Database-local ones
+	// report once per database they ran in, so the sample count is no longer
+	// the collector count, which is what the fan-out changed.
+	reported := map[string]int{}
 	var failed []string
 	for _, m := range success.GetMetric() {
-		if m.GetGauge().GetValue() == 1 {
-			continue
-		}
-		name := ""
+		labels := map[string]string{}
 		for _, l := range m.GetLabel() {
-			if l.GetName() == "collector" {
-				name = l.GetValue()
-			}
+			labels[l.GetName()] = l.GetValue()
 		}
-		failed = append(failed, name)
+		reported[labels["collector"]]++
+		if m.GetGauge().GetValue() != 1 {
+			failed = append(failed, labels["collector"]+"/"+labels["datname"])
+		}
 	}
+	for name := range pc.Collectors {
+		c.Check(reported[name] > 0, Equals, true,
+			Commentf("%s reported no status at all", name))
+	}
+	c.Check(len(reported), Equals, len(pc.Collectors))
 	c.Check(failed, IsNil, Commentf("collectors failed against this server: %v", failed))
 
 	// A collector can report success and emit nothing. pg_stat_database has a
@@ -629,4 +638,549 @@ func hostPort(c *C, dsn string) string {
 	u, err := url.Parse(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	return u.Host
+}
+
+// TestCollectorFanOutReachesOtherDatabases is the point of the fan-out.
+//
+// pg_stat_user_tables shows the tables of the database the connection is
+// attached to and nothing else, so before the fan-out the namespaced
+// collectors reported the configured database's tables and said nothing at all
+// about any other database on the server. A server with a hundred databases
+// looked like a server with one.
+//
+// The test seeds a table in a database the DSN does not point at, and requires
+// it to appear in the scrape.
+func (s *IntegrationSuite) TestCollectorFanOutReachesOtherDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const other = "fanout_other"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	seed, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], other))
+	c.Assert(err, IsNil)
+	defer seed.Close()
+	_, err = seed.db.Exec(`CREATE TABLE fanout_marker (id int)`)
+	c.Assert(err, IsNil)
+	// pg_stat_user_tables only shows a relation once statistics exist for it.
+	_, err = seed.db.Exec(`SELECT count(*) FROM fanout_marker`)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	// The seeded table, in a database the DSN does not name.
+	found := false
+	var seenDatabases []string
+	for name, f := range families {
+		if !strings.HasPrefix(name, "pg_stat_user_tables_") {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			seenDatabases = append(seenDatabases, labels["datname"])
+			if labels["datname"] == other && labels["relname"] == "fanout_marker" {
+				found = true
+			}
+		}
+	}
+	c.Check(found, Equals, true,
+		Commentf("a table in %q did not reach the scrape; databases seen: %v", other, uniq(seenDatabases)))
+
+	// The engine reports its own coverage, separately from the legacy engine.
+	for _, name := range []string{
+		"pg_collector_databases_discovered",
+		"pg_collector_databases_selected",
+		"pg_collector_databases_excluded",
+		"pg_collector_database_discovery_success",
+	} {
+		_, ok := families[name]
+		c.Check(ok, Equals, true, Commentf("%s was not published", name))
+	}
+	c.Check(families["pg_collector_database_discovery_success"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+	selected := families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue()
+	c.Check(selected > 1, Equals, true,
+		Commentf("the collectors selected %v databases, so the fan-out was not exercised", selected))
+
+	up, ok := families["pg_collector_database_up"]
+	c.Assert(ok, Equals, true, Commentf("no per-database connection status was published"))
+	c.Check(len(up.GetMetric()), Equals, int(selected),
+		Commentf("a selected database has no connection status"))
+	for _, m := range up.GetMetric() {
+		c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+			Commentf("database reported unreachable: %v", m.GetLabel()))
+	}
+}
+
+// TestCollectorSelectionExcludesDatabases checks that the collectors' own
+// selection is applied, and that an excluded database is reported as a
+// decision rather than as a fault.
+func (s *IntegrationSuite) TestCollectorSelectionExcludesDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	catalog, err := queryDatabases(context.Background(), server)
+	c.Assert(err, IsNil)
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others) > 0, Equals, true,
+		Commentf("the fixture server has one database, so exclusion cannot be exercised"))
+	excluded := others[0]
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		strings.Split(dsn, ",")[0],
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Of([]string{excluded}), dbselect.Absent()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+
+	named, ok := families["pg_collector_database_excluded"]
+	c.Assert(ok, Equals, true, Commentf("the excluded database was counted but not named"))
+	c.Assert(len(named.GetMetric()), Equals, 1)
+	labels := map[string]string{}
+	for _, l := range named.GetMetric()[0].GetLabel() {
+		labels[l.GetName()] = l.GetValue()
+	}
+	c.Check(labels["datname"], Equals, excluded)
+	c.Check(labels["reason"], Equals, dbselect.ReasonExcludeList)
+
+	// An excluded database is not connected to and not reported as a failure.
+	for _, m := range families["pg_collector_database_up"].GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == "datname" {
+				c.Check(l.GetValue(), Not(Equals), excluded,
+					Commentf("an excluded database was connected to anyway"))
+			}
+		}
+	}
+}
+
+func uniq(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestCollectorDiscoveryFailureKeepsExclusion is the first of three
+// regressions for defects found in review of the fan-out.
+//
+// When the catalog could not be read, the control database became a target
+// without ever being put through the selection rule. An operator who had
+// excluded it got its tables collected anyway, and only on the scrape where
+// something else had already gone wrong.
+//
+// SELECT on pg_database is revoked from the monitoring role, which is a
+// per-database privilege, so discovery fails while the connection is healthy.
+func (s *IntegrationSuite) TestCollectorDiscoveryFailureKeepsExclusion(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "nodiscovery"
+	const marker = "discovery_failure_marker"
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP TABLE IF EXISTS ` + marker)
+		_, _ = admin.db.Exec(`GRANT SELECT ON pg_catalog.pg_database TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP OWNED BY ` + role)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE TABLE ` + marker + ` (id int)`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`SELECT count(*) FROM ` + marker)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM ` + role)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		"postgresql://"+role+":secret@"+hostPort(c, dsn)+"/"+control+"?sslmode=disable",
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Of([]string{control}), dbselect.Absent()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Assert(families["pg_collector_database_discovery_success"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0), Commentf("discovery was supposed to fail in this fixture"))
+
+	// The exclusion still applies.
+	c.Check(families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0),
+		Commentf("an excluded database was selected because discovery failed"))
+	for name, f := range families {
+		if !strings.HasPrefix(name, "pg_stat_user_tables_") {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() != "relname" {
+					continue
+				}
+				c.Check(l.GetValue(), Not(Equals), marker,
+					Commentf("a table in the excluded database reached the scrape through %s", name))
+			}
+		}
+	}
+
+	// A discovery failure publishes no discovered total, because there is no
+	// total to report and the one it would invent is 1.
+	_, present := families["pg_collector_databases_discovered"]
+	c.Check(present, Equals, false,
+		Commentf("a database count was published although the catalog could not be read"))
+
+	// Cluster-wide collection still works, which is the point of keeping the
+	// control connection a target.
+	success, ok := families["pg_scrape_collector_success"]
+	c.Assert(ok, Equals, true)
+	cluster := 0
+	for _, m := range success.GetMetric() {
+		if m.GetGauge().GetValue() == 1 {
+			cluster++
+		}
+	}
+	c.Check(cluster > 0, Equals, true,
+		Commentf("no collector succeeded, so cluster-wide collection did not survive the discovery failure"))
+}
+
+// TestCollectorDatabaseUpRequiresAConnection is the second regression.
+//
+// instance.setup called sql.Open, which does not connect, and then asked the
+// version cache, which answers from any database on the same server. So a
+// database that refuses connections was published as up while every collector
+// on it failed. CONNECTION LIMIT 0 is the cheapest way to refuse one.
+func (s *IntegrationSuite) TestCollectorDatabaseUpRequiresAConnection(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const closed = "no_connections_allowed"
+	const role = "limited"
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + closed + ` WITH (FORCE)`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE DATABASE ` + closed + ` CONNECTION LIMIT 0`)
+	c.Assert(err, IsNil)
+	// A connection limit does not apply to superusers, so the scrape has to
+	// run as an ordinary monitoring role for the database to refuse it.
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		"postgresql://"+role+":secret@"+hostPort(c, dsn)+"/"+control+"?sslmode=disable",
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	up, ok := families["pg_collector_database_up"]
+	c.Assert(ok, Equals, true)
+	found := false
+	for _, m := range up.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == "datname" && l.GetValue() == closed {
+				found = true
+				c.Check(m.GetGauge().GetValue(), Equals, float64(0),
+					Commentf("a database that refuses connections was reported as up"))
+			}
+		}
+	}
+	c.Assert(found, Equals, true,
+		Commentf("the unreachable database produced no connection status at all"))
+
+	errs, ok := families["pg_collector_database_error"]
+	c.Assert(ok, Equals, true, Commentf("the unreachable database was not named with a reason"))
+	named := false
+	for _, m := range errs.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["datname"] == closed {
+			named = true
+			c.Check(labels["reason"], Equals, dbselect.ReasonConnect)
+		}
+	}
+	c.Check(named, Equals, true)
+}
+
+// TestCollectorControlFailureIsReported is the third regression.
+//
+// With a control connection that cannot be opened, Collect returned before
+// publishing anything, so the response carried no coverage and no failure. A
+// scrape that collected nothing looked the same as one never configured to
+// collect.
+func (s *IntegrationSuite) TestCollectorControlFailureIsReported(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		"postgresql://nobody:wrong@"+hostPort(c, dsn)+"/postgres?sslmode=disable",
+		[]string{},
+		collector.WithContext(context.Background()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Assert(len(families) > 0, Equals, true,
+		Commentf("a failed control connection produced an empty response"))
+	c.Check(families["pg_collector_database_discovery_success"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0))
+	c.Check(families["pg_collector_database_up"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0))
+
+	errs, ok := families["pg_collector_database_error"]
+	c.Assert(ok, Equals, true, Commentf("the failure was not named with a reason"))
+	labels := map[string]string{}
+	for _, l := range errs.GetMetric()[0].GetLabel() {
+		labels[l.GetName()] = l.GetValue()
+	}
+	c.Check(labels["reason"], Equals, dbselect.ReasonConnect)
+	c.Check(labels["datname"], Equals, "postgres")
+
+	// No discovered total, because discovery never ran.
+	_, present := families["pg_collector_databases_discovered"]
+	c.Check(present, Equals, false,
+		Commentf("a database count was published although nothing was discovered"))
+}
+
+// TestCollectorExclusionWithAmbiguousDSN covers a connection string that names
+// two different databases, in its path and in a dbname parameter.
+//
+// The exporter used to decide selection from the name it parsed out of the
+// DSN, and it read the path first. lib/pq emits both as dbname keywords and
+// sorts its output, and libpq takes the last occurrence, so the database
+// actually connected to is whichever name sorts later. With discovery working
+// the catalog corrects the name, so the mistake only surfaced when discovery
+// had already failed: an excluded database was collected from, and its
+// connection status was labelled with the database it was not connected to.
+//
+// The fixture makes both true at once. The DSN resolves to the database that
+// sorts later, SELECT on pg_database is revoked so discovery fails, and that
+// database is excluded.
+func (s *IntegrationSuite) TestCollectorExclusionWithAmbiguousDSN(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "ambiguous"
+	const marker = "precedence_marker"
+	// The fixture server has postgres and root. "root" sorts after "postgres",
+	// so a DSN naming both resolves to root whichever half it comes from.
+	const connected = "root"
+	const other = "postgres"
+
+	target, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], connected))
+	c.Assert(err, IsNil)
+	defer target.Close()
+
+	// Catalog privileges are per database, and this fixture connects to
+	// `connected`, so the revoke has to happen there rather than on the admin
+	// connection. Revoking in the wrong database leaves discovery working and
+	// the test passing for the wrong reason.
+	cleanup := func() {
+		_, _ = target.db.Exec(`GRANT SELECT ON pg_catalog.pg_database TO PUBLIC`)
+		_, _ = target.db.Exec(`DROP TABLE IF EXISTS ` + marker)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = target.db.Exec(`CREATE TABLE ` + marker + ` (id int)`)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`SELECT count(*) FROM ` + marker)
+	c.Assert(err, IsNil)
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM ` + role)
+	c.Assert(err, IsNil)
+
+	ambiguous := "postgresql://" + role + ":secret@" + hostPort(c, dsn) +
+		"/" + other + "?dbname=" + connected + "&sslmode=disable"
+
+	// The premise: this DSN really does connect to the database that is not in
+	// its path. Without this the rest of the test could pass for the wrong
+	// reason.
+	probe, err := NewServer(ambiguous)
+	c.Assert(err, IsNil)
+	defer probe.Close()
+	var reached string
+	c.Assert(probe.db.QueryRow(`SELECT current_database()`).Scan(&reached), IsNil)
+	c.Assert(reached, Equals, connected,
+		Commentf("the fixture DSN does not reach %q, so it does not test what it claims", connected))
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		ambiguous,
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Of([]string{connected}), dbselect.Absent()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Assert(families["pg_collector_database_discovery_success"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0), Commentf("discovery was supposed to fail in this fixture"))
+	c.Check(families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0),
+		Commentf("the excluded database was selected, so the exclusion was applied to the wrong name"))
+	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+
+	// The connection status names the database that was actually connected to.
+	up, ok := families["pg_collector_database_up"]
+	c.Assert(ok, Equals, true)
+	c.Assert(len(up.GetMetric()), Equals, 1)
+	for _, l := range up.GetMetric()[0].GetLabel() {
+		if l.GetName() == "datname" {
+			c.Check(l.GetValue(), Equals, connected,
+				Commentf("connection status is labelled with a database this scrape never connected to"))
+		}
+	}
+
+	// And nothing from the excluded database reached the scrape.
+	for name, f := range families {
+		if !strings.HasPrefix(name, "pg_stat_user_tables_") {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() != "relname" {
+					continue
+				}
+				c.Check(l.GetValue(), Not(Equals), marker,
+					Commentf("a table in the excluded database reached the scrape through %s", name))
+			}
+		}
+	}
+}
+
+// TestCollectorIncludeWithAmbiguousDSN is the same fixture read the other way.
+// An include list naming the database that is actually connected to must
+// select it, which it cannot do if the name came from the wrong half of the
+// connection string.
+func (s *IntegrationSuite) TestCollectorIncludeWithAmbiguousDSN(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "ambiguous_include"
+	const connected = "root"
+	const other = "postgres"
+
+	// Per-database privileges again: revoke in the database this DSN reaches.
+	target, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], connected))
+	c.Assert(err, IsNil)
+	defer target.Close()
+
+	cleanup := func() {
+		_, _ = target.db.Exec(`GRANT SELECT ON pg_catalog.pg_database TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM ` + role)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		"postgresql://"+role+":secret@"+hostPort(c, dsn)+"/"+other+"?dbname="+connected+"&sslmode=disable",
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Absent(), dbselect.Of([]string{connected})),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Check(families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1),
+		Commentf("an include list naming the connected database did not select it"))
+	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0))
 }

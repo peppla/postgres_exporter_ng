@@ -22,7 +22,7 @@ import (
 const walSubsystem = "wal"
 
 func init() {
-	registerCollector(walSubsystem, defaultDisabled, NewPGWALCollector)
+	registerCollector(walSubsystem, defaultDisabled, scopeCluster, NewPGWALCollector)
 }
 
 type PGWALCollector struct {

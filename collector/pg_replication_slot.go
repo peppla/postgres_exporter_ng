@@ -24,7 +24,7 @@ import (
 const replicationSlotSubsystem = "replication_slot"
 
 func init() {
-	registerCollector(replicationSlotSubsystem, defaultEnabled, NewPGReplicationSlotCollector)
+	registerCollector(replicationSlotSubsystem, defaultEnabled, scopeCluster, NewPGReplicationSlotCollector)
 }
 
 type PGReplicationSlotCollector struct {

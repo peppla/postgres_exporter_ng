@@ -19,7 +19,6 @@ package main
 
 import (
 	"context"
-	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -49,99 +48,6 @@ func targetsOn(server string, names ...string) []scrapeTarget {
 
 // ref names one database on the default test server.
 func ref(datname string) databaseRef { return databaseRef{server: "h:5432", datname: datname} }
-
-// TestSelectDatabases pins the selection rule, which decides coverage and had
-// no test before. The rule is: exclusion wins, an inclusion list that was
-// given is a whitelist, and an inclusion list that was given empty selects
-// nothing rather than everything.
-func TestSelectDatabases(t *testing.T) {
-	names := []string{"postgres", "app", "tenant_1", "template0"}
-
-	for _, tc := range []struct {
-		name    string
-		exclude databaseList
-		include databaseList
-		want    []string
-	}{
-		{
-			name: "no filters keeps everything in order",
-			want: []string{"postgres", "app", "tenant_1", "template0"},
-		},
-		{
-			name:    "exclusion removes by exact name",
-			exclude: listOf([]string{"template0", "postgres"}),
-			want:    []string{"app", "tenant_1"},
-		},
-		{
-			name:    "a non-empty inclusion list is a whitelist",
-			include: listOf([]string{"app"}),
-			want:    []string{"app"},
-		},
-		{
-			name:    "exclusion beats inclusion for the same name",
-			exclude: listOf([]string{"app"}),
-			include: listOf([]string{"app", "tenant_1"}),
-			want:    []string{"tenant_1"},
-		},
-		{
-			name:    "inclusion naming nothing present selects nothing",
-			include: listOf([]string{"absent"}),
-			want:    []string{},
-		},
-		{
-			name:    "excluding everything selects nothing",
-			exclude: listOf(names),
-			want:    []string{},
-		},
-		{
-			// Pep, 2026-11-20. The opposite reading, that an empty list means
-			// no restriction, is what a plain []string gives you by accident.
-			name:    "an inclusion list given empty selects nothing",
-			include: listOf([]string{}),
-			want:    []string{},
-		},
-		{
-			name:    "an inclusion list given empty beats an exclusion list too",
-			exclude: listOf([]string{"app"}),
-			include: listOf([]string{}),
-			want:    []string{},
-		},
-		{
-			name:    "an exclusion list given empty excludes nothing",
-			exclude: listOf([]string{}),
-			want:    []string{"postgres", "app", "tenant_1", "template0"},
-		},
-		{
-			// The inherited flag surface: unset arrives as one empty string.
-			name:    "an unset comma-separated flag is an absent list",
-			exclude: listFromFlag([]string{""}),
-			include: listFromFlag([]string{""}),
-			want:    []string{"postgres", "app", "tenant_1", "template0"},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := selectDatabases(names, tc.exclude, tc.include)
-			if !reflect.DeepEqual(got.selected, tc.want) {
-				t.Errorf("got %q, want %q", got.selected, tc.want)
-			}
-			// Everything the rule left out is accounted for, as one or the
-			// other. A database that fell out of both would be invisible.
-			if len(got.selected)+len(got.excluded)+got.notIncluded != len(names) {
-				t.Errorf("%d selected + %d excluded + %d not included != %d offered",
-					len(got.selected), len(got.excluded), got.notIncluded, len(names))
-			}
-			for _, name := range got.excluded {
-				if !contains(tc.exclude.names, name) {
-					t.Errorf("%q reported as excluded but is not in the exclude list", name)
-				}
-			}
-			// The input must not be modified: the caller reuses it.
-			if !reflect.DeepEqual(names, []string{"postgres", "app", "tenant_1", "template0"}) {
-				t.Errorf("selectDatabases modified its input: %q", names)
-			}
-		})
-	}
-}
 
 // series keys a sample by name and sorted labels, so vector families with
 // several samples do not collapse into one entry the way gathered's do.

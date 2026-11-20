@@ -25,7 +25,7 @@ import (
 const statIOSubsystem = "stat_io"
 
 func init() {
-	registerCollector(statIOSubsystem, defaultDisabled, NewPGStatIOCollector)
+	registerCollector(statIOSubsystem, defaultDisabled, scopeCluster, NewPGStatIOCollector)
 }
 
 type PGStatIOCollector struct {

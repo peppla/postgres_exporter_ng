@@ -16,6 +16,7 @@ package config
 import (
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -224,5 +225,119 @@ func Test_dsnFromString(t *testing.T) {
 				t.Errorf("dsnFromString() = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDSNWithDatabase covers both connection-string forms, because an operator
+// can configure either and a substitution that works on one and not the other
+// would silently monitor a different set of databases.
+func TestDSNWithDatabase(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		db   string
+		want string
+	}{
+		{
+			name: "url with a database",
+			in:   "postgresql://user:pass@host:5432/postgres?sslmode=disable",
+			db:   "app",
+			want: "postgresql://user:pass@host:5432/app?sslmode=disable",
+		},
+		{
+			name: "url with no database",
+			in:   "postgresql://user:pass@host:5432?sslmode=disable",
+			db:   "app",
+			want: "postgresql://user:pass@host:5432/app?sslmode=disable",
+		},
+		{
+			name: "key value form",
+			in:   "host=host port=5432 user=user password=pass dbname=postgres sslmode=disable",
+			db:   "app",
+			want: "postgresql://user:pass@host:5432/app?sslmode=disable",
+		},
+		{
+			name: "key value form with no dbname",
+			in:   "host=host port=5432 user=user password=pass sslmode=disable",
+			db:   "app",
+			want: "postgresql://user:pass@host:5432/app?sslmode=disable",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DSNWithDatabase(tc.in, tc.db)
+			if err != nil {
+				t.Fatalf("DSNWithDatabase: %s", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+			// Round trip: the result must name the database that was asked for.
+			if name, ok := DatabaseFromDSN(got); !ok || name != tc.db {
+				t.Errorf("rewritten DSN names %q (%v), want %q", name, ok, tc.db)
+			}
+		})
+	}
+}
+
+func TestDatabaseFromDSN(t *testing.T) {
+	if name, ok := DatabaseFromDSN("postgresql://u:p@h:5432/app?sslmode=disable"); !ok || name != "app" {
+		t.Errorf("got %q %v, want app true", name, ok)
+	}
+	// libpq falls back to the user name when no database is given. Guessing
+	// that here would put a name on a database nobody configured.
+	if name, ok := DatabaseFromDSN("postgresql://u:p@h:5432?sslmode=disable"); ok {
+		t.Errorf("got %q %v, want an unknown database", name, ok)
+	}
+	if _, ok := DatabaseFromDSN("this is not a dsn"); ok {
+		t.Error("an unparseable DSN reported a database name")
+	}
+}
+
+// TestDSNWithDatabaseClearsStaleDbname is the case that makes the rewrite more
+// than setting a field. A key=value connection string keeps its database in
+// the dbname query parameter, which libpq reads as well as the path, so a
+// rewrite that sets only the path leaves two answers in one string.
+func TestDSNWithDatabaseClearsStaleDbname(t *testing.T) {
+	got, err := DSNWithDatabase("host=h port=5432 user=u password=p dbname=postgres sslmode=disable", "app")
+	if err != nil {
+		t.Fatalf("DSNWithDatabase: %s", err)
+	}
+	if strings.Contains(got, "dbname=postgres") {
+		t.Errorf("the original database is still named in %q", got)
+	}
+	if name, ok := DatabaseFromDSN(got); !ok || name != "app" {
+		t.Errorf("rewritten DSN names %q (%v), want app", name, ok)
+	}
+}
+
+// TestDatabaseFromDSNReadsDbnameQuery covers the other half: a connection
+// string whose database is in the query rather than the path still has one.
+func TestDatabaseFromDSNReadsDbnameQuery(t *testing.T) {
+	if name, ok := DatabaseFromDSN("host=h port=5432 user=u dbname=app"); !ok || name != "app" {
+		t.Errorf("got %q %v, want app true", name, ok)
+	}
+}
+
+// TestDatabaseFromDSNAmbiguous covers a connection string that names two
+// different databases.
+//
+// lib/pq emits both as dbname keywords and sorts its output, and libpq takes
+// the last occurrence, so the database actually connected to is whichever name
+// sorts later. That is not a rule worth reproducing: reading the path would be
+// wrong for one of these and reading the query would be wrong for the other.
+// Reporting no name is what lets the caller ask the server instead of guessing.
+func TestDatabaseFromDSNAmbiguous(t *testing.T) {
+	for _, dsn := range []string{
+		"postgresql://u:p@h:5432/postgres?dbname=root&sslmode=disable",
+		"postgresql://u:p@h:5432/root?dbname=postgres&sslmode=disable",
+	} {
+		if name, ok := DatabaseFromDSN(dsn); ok {
+			t.Errorf("%s: reported %q from a connection string that names two databases", dsn, name)
+		}
+	}
+
+	// The same name twice is not ambiguous.
+	if name, ok := DatabaseFromDSN("postgresql://u:p@h:5432/app?dbname=app&sslmode=disable"); !ok || name != "app" {
+		t.Errorf("got %q %v, want app true", name, ok)
 	}
 }

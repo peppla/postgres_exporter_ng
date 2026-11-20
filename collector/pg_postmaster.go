@@ -23,7 +23,7 @@ import (
 const postmasterSubsystem = "postmaster"
 
 func init() {
-	registerCollector(postmasterSubsystem, defaultDisabled, NewPGPostmasterCollector)
+	registerCollector(postmasterSubsystem, defaultDisabled, scopeCluster, NewPGPostmasterCollector)
 }
 
 type PGPostmasterCollector struct {

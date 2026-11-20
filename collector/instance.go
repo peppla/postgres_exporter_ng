@@ -14,6 +14,7 @@
 package collector
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
@@ -59,7 +60,17 @@ func (i *instance) copy() *instance {
 	}
 }
 
-func (i *instance) setup() error {
+// setup opens the connection and establishes that it works.
+//
+// sql.Open does not connect, and the version cache can answer from another
+// database on the same server without touching this one, so neither of them
+// proves anything about this connection. Without the ping below, a database
+// that refuses connections, for example one with CONNECTION LIMIT 0, was
+// reported as reachable while every collector on it failed.
+//
+// The handle is closed on every failure. Leaving it open on the error path
+// leaks a handle per failed database per scrape.
+func (i *instance) setup(ctx context.Context) error {
 	db, err := sql.Open("postgres", i.dsn)
 	if err != nil {
 		return err
@@ -68,12 +79,19 @@ func (i *instance) setup() error {
 	db.SetMaxIdleConns(1)
 	i.db = db
 
+	if err := db.PingContext(ctx); err != nil {
+		i.db = nil
+		db.Close()
+		return fmt.Errorf("error connecting to database: %w", err)
+	}
+
 	version, _, err := versioncache.GetVersion(i.db, i.name, queryVersion)
 	if err != nil {
+		i.db = nil
+		db.Close()
 		return fmt.Errorf("error querying postgresql version: %w", err)
-	} else {
-		i.version = version
 	}
+	i.version = version
 	return nil
 }
 

@@ -87,7 +87,7 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	defer pc.connSema.Release(1)
 
 	// Set up the database connection for the collector.
-	err := pc.instance.setup()
+	err := pc.instance.setup(pc.ctx)
 	if err != nil {
 		level.Error(pc.logger).Log("msg", "Error opening connection to database", "err", err)
 		return
@@ -98,7 +98,7 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	wg.Add(len(pc.collectors))
 	for name, c := range pc.collectors {
 		go func(name string, c Collector) {
-			execute(pc.ctx, name, c, pc.instance, ch, pc.logger)
+			execute(pc.ctx, name, c, pc.instance, ch, pc.logger, "")
 			wg.Done()
 		}(name, c)
 	}
