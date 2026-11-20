@@ -1690,9 +1690,19 @@ app_lookup:
 }
 
 // TestApplicationQueryWithoutListsNeedsNoName is the other half. A query file
-// that restricts nothing does not need the database name, so a scrape of it
-// must not fail when the name cannot be resolved, and must not pay a round
-// trip asking for it.
+// whose queries all decide where they run without a database name must not
+// fail when that name cannot be resolved, and must not pay a round trip
+// asking for it.
+//
+// Two queries, with the lookup revoked. One omits databases, so it runs
+// everywhere. One writes an explicit empty list, so it runs nowhere. Neither
+// decision refers to a name, so the scrape must succeed and report the
+// database as covered.
+//
+// The empty list is the case that regressed. The lookup was demanded whenever
+// a list was present at all, so a file saying that a query runs nowhere
+// demanded a name on that query's behalf, and where the name could not be
+// read the whole scrape failed for a query that was never going to run.
 func (s *IntegrationSuite) TestApplicationQueryWithoutListsNeedsNoName(c *C) {
 	dsn := os.Getenv("DATA_SOURCE_NAME")
 	c.Assert(dsn, Not(Equals), "")
@@ -1726,6 +1736,11 @@ app_unrestricted:
   query: "SELECT 1::float8 AS value"
   metrics:
     - value: {usage: "GAUGE", description: "Constant one"}
+app_nowhere:
+  query: "SELECT 1::float8 AS value"
+  databases: []
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
 `)
 
 	exporter := NewExporter(
@@ -1740,8 +1755,15 @@ app_unrestricted:
 	_, ran := families["app_unrestricted_value"]
 	c.Check(ran, Equals, true,
 		Commentf("an unrestricted query did not run, so the name lookup was demanded when nothing needed it"))
-	c.Check(families["pg_exporter_databases_scraped"].GetMetric()[0].GetGauge().GetValue(),
-		Equals, float64(1))
+
+	_, ranNowhere := families["app_nowhere_value"]
+	c.Check(ranNowhere, Equals, false,
+		Commentf("a query with an explicit empty list ran somewhere"))
+
+	scraped, ok := families["pg_exporter_databases_scraped"]
+	c.Assert(ok, Equals, true, Commentf("pg_exporter_databases_scraped was not published"))
+	c.Check(scraped.GetMetric()[0].GetGauge().GetValue(), Equals, float64(1),
+		Commentf("the scrape failed although no query needed the database name"))
 }
 
 // TestApplicationQueryVersionRestriction covers per-query version gating,

@@ -191,3 +191,88 @@ func TestRunOnServerParsing(t *testing.T) {
 		})
 	}
 }
+
+// TestQueryNeedsDatabaseName pins which configurations have to ask the server
+// which database it is on.
+//
+// Only a list with names in it does. The case this exists for is the explicit
+// empty list: it decides that the query runs nowhere without reference to any
+// name, so treating it as a query that needs one makes a failed lookup fail a
+// scrape on behalf of a query that was never going to run.
+func TestQueryNeedsDatabaseName(t *testing.T) {
+	absent := queryDatabaseList{}
+	empty := queryDatabaseList{given: true, names: []string{}}
+	listed := queryDatabaseList{given: true, names: []string{"db1", "db2"}}
+
+	for _, tc := range []struct {
+		name   string
+		list   queryDatabaseList
+		master bool
+		want   bool
+	}{
+		{"an omitted list runs everywhere, so no name is needed", absent, false, false},
+		{"an empty list runs nowhere, so no name is needed", empty, false, false},
+		{"a list with names has to compare one", listed, false, true},
+		{"master is answered by the connection", absent, true, false},
+		{"master beats an empty list without a name", empty, true, false},
+		{"master beats a list with names without a name", listed, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.list.needsDatabaseName(tc.master); got != tc.want {
+				t.Errorf("needsDatabaseName(master=%v) = %v, want %v", tc.master, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServerNeedsDatabaseName checks the same rule over a whole loaded query
+// file, which is where the decision is actually taken.
+//
+// One query that needs the name is enough to require the lookup, and no query
+// that needs it means the scrape should not spend a round trip or risk a
+// failure on it.
+func TestServerNeedsDatabaseName(t *testing.T) {
+	absent := queryDatabaseList{}
+	empty := queryDatabaseList{given: true, names: []string{}}
+	listed := queryDatabaseList{given: true, names: []string{"db1"}}
+
+	for _, tc := range []struct {
+		name string
+		file map[string]MetricMapNamespace
+		want bool
+	}{
+		{"an empty file needs nothing", map[string]MetricMapNamespace{}, false},
+		{
+			"queries without lists need nothing",
+			map[string]MetricMapNamespace{"a": {databases: absent}, "b": {databases: absent}},
+			false,
+		},
+		{
+			"a file of empty lists needs nothing",
+			map[string]MetricMapNamespace{"a": {databases: empty}, "b": {databases: empty}},
+			false,
+		},
+		{
+			"master queries need nothing, whatever their lists say",
+			map[string]MetricMapNamespace{"a": {databases: listed, master: true}, "b": {databases: empty, master: true}},
+			false,
+		},
+		{
+			"one restricted query is enough",
+			map[string]MetricMapNamespace{"a": {databases: absent}, "b": {databases: listed}},
+			true,
+		},
+		{
+			"an empty list alongside a restricted one does not mask it",
+			map[string]MetricMapNamespace{"a": {databases: empty}, "b": {databases: listed}},
+			true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &Server{metricMap: tc.file}
+			if got := serverNeedsDatabaseName(server); got != tc.want {
+				t.Errorf("serverNeedsDatabaseName() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

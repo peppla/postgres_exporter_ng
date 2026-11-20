@@ -335,14 +335,14 @@ func getDataSources() ([]string, error) {
 // serverNeedsDatabaseName reports whether any namespace loaded for this server
 // decides where it runs from the database name.
 //
-// A master query does not: master wins over the list and is answered by
-// server.master alone. A query with no list does not either. So the lookup is
-// skipped for the configurations that make up most query files.
+// Most query files contain nothing that does, so the lookup is usually
+// skipped. queryDatabaseList.needsDatabaseName holds the rule, so that what is
+// looked up here and what is decided in runsOn cannot drift apart.
 func serverNeedsDatabaseName(server *Server) bool {
 	server.mappingMtx.RLock()
 	defer server.mappingMtx.RUnlock()
 	for _, mapping := range server.metricMap {
-		if mapping.databases.given && !mapping.master {
+		if mapping.databases.needsDatabaseName(mapping.master) {
 			return true
 		}
 	}

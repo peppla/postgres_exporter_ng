@@ -110,3 +110,23 @@ func (l queryDatabaseList) runsOn(datname string, master, isMaster bool) bool {
 	}
 	return false
 }
+
+// needsDatabaseName reports whether deciding where this query runs requires
+// knowing the name of the database on the other end of the connection.
+//
+// Three of the four configurations decide without one. A master query is
+// answered by the connection alone. An omitted list runs everywhere. An
+// explicit empty list runs nowhere, and nowhere is known without asking who
+// nowhere is. Only a list with names in it has anything to compare a name
+// against.
+//
+// The distinction matters because the caller pays for a wrong answer twice.
+// Looking the name up costs a round trip, and when the lookup fails the whole
+// scrape fails, so demanding a name for a query that was never going to run
+// turns a harmless configuration into a reported failure.
+func (l queryDatabaseList) needsDatabaseName(master bool) bool {
+	if master {
+		return false
+	}
+	return l.given && len(l.names) > 0
+}
