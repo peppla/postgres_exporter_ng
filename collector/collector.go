@@ -71,7 +71,7 @@ var (
 	// coverage problem or full coverage where neither is true.
 	collectorDatabaseUpDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_up"),
-		"Whether the collectors could connect to this database (1 for yes, 0 for no). Published for every database the namespaced collectors selected.",
+		"Whether the collectors could connect to this database (1 for yes, 0 for no). Published for every database the namespaced collectors selected, and also for the configured connection database even when selection left it out, because its connection is what cluster-wide collection runs on. So this can carry one more database than databases_selected counts.",
 		[]string{"server", "datname"},
 		nil,
 	)
@@ -101,7 +101,7 @@ var (
 	)
 	collectorDatabaseErrorDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_error"),
-		"1 for each selected database the collectors did not reach, labelled with why: connect for a connection that failed, not_attempted for work that never started. Reasons are a closed set, never an error message.",
+		"1 for each database the collectors did not reach, labelled with why: connect for a connection that failed, not_attempted for work that never started. Covers the same set as database_up, which includes the configured connection database whether or not selection kept it. Reasons are a closed set, never an error message.",
 		[]string{"server", "datname", "reason"},
 		nil,
 	)

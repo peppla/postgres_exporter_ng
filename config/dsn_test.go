@@ -317,3 +317,27 @@ func TestDatabaseFromDSNReadsDbnameQuery(t *testing.T) {
 		t.Errorf("got %q %v, want app true", name, ok)
 	}
 }
+
+// TestDatabaseFromDSNAmbiguous covers a connection string that names two
+// different databases.
+//
+// lib/pq emits both as dbname keywords and sorts its output, and libpq takes
+// the last occurrence, so the database actually connected to is whichever name
+// sorts later. That is not a rule worth reproducing: reading the path would be
+// wrong for one of these and reading the query would be wrong for the other.
+// Reporting no name is what lets the caller ask the server instead of guessing.
+func TestDatabaseFromDSNAmbiguous(t *testing.T) {
+	for _, dsn := range []string{
+		"postgresql://u:p@h:5432/postgres?dbname=root&sslmode=disable",
+		"postgresql://u:p@h:5432/root?dbname=postgres&sslmode=disable",
+	} {
+		if name, ok := DatabaseFromDSN(dsn); ok {
+			t.Errorf("%s: reported %q from a connection string that names two databases", dsn, name)
+		}
+	}
+
+	// The same name twice is not ambiguous.
+	if name, ok := DatabaseFromDSN("postgresql://u:p@h:5432/app?dbname=app&sslmode=disable"); !ok || name != "app" {
+		t.Errorf("got %q %v, want app true", name, ok)
+	}
+}

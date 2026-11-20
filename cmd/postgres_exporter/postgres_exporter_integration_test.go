@@ -1009,3 +1009,178 @@ func (s *IntegrationSuite) TestCollectorControlFailureIsReported(c *C) {
 	c.Check(present, Equals, false,
 		Commentf("a database count was published although nothing was discovered"))
 }
+
+// TestCollectorExclusionWithAmbiguousDSN covers a connection string that names
+// two different databases, in its path and in a dbname parameter.
+//
+// The exporter used to decide selection from the name it parsed out of the
+// DSN, and it read the path first. lib/pq emits both as dbname keywords and
+// sorts its output, and libpq takes the last occurrence, so the database
+// actually connected to is whichever name sorts later. With discovery working
+// the catalog corrects the name, so the mistake only surfaced when discovery
+// had already failed: an excluded database was collected from, and its
+// connection status was labelled with the database it was not connected to.
+//
+// The fixture makes both true at once. The DSN resolves to the database that
+// sorts later, SELECT on pg_database is revoked so discovery fails, and that
+// database is excluded.
+func (s *IntegrationSuite) TestCollectorExclusionWithAmbiguousDSN(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "ambiguous"
+	const marker = "precedence_marker"
+	// The fixture server has postgres and root. "root" sorts after "postgres",
+	// so a DSN naming both resolves to root whichever half it comes from.
+	const connected = "root"
+	const other = "postgres"
+
+	target, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], connected))
+	c.Assert(err, IsNil)
+	defer target.Close()
+
+	// Catalog privileges are per database, and this fixture connects to
+	// `connected`, so the revoke has to happen there rather than on the admin
+	// connection. Revoking in the wrong database leaves discovery working and
+	// the test passing for the wrong reason.
+	cleanup := func() {
+		_, _ = target.db.Exec(`GRANT SELECT ON pg_catalog.pg_database TO PUBLIC`)
+		_, _ = target.db.Exec(`DROP TABLE IF EXISTS ` + marker)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = target.db.Exec(`CREATE TABLE ` + marker + ` (id int)`)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`SELECT count(*) FROM ` + marker)
+	c.Assert(err, IsNil)
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM ` + role)
+	c.Assert(err, IsNil)
+
+	ambiguous := "postgresql://" + role + ":secret@" + hostPort(c, dsn) +
+		"/" + other + "?dbname=" + connected + "&sslmode=disable"
+
+	// The premise: this DSN really does connect to the database that is not in
+	// its path. Without this the rest of the test could pass for the wrong
+	// reason.
+	probe, err := NewServer(ambiguous)
+	c.Assert(err, IsNil)
+	defer probe.Close()
+	var reached string
+	c.Assert(probe.db.QueryRow(`SELECT current_database()`).Scan(&reached), IsNil)
+	c.Assert(reached, Equals, connected,
+		Commentf("the fixture DSN does not reach %q, so it does not test what it claims", connected))
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		ambiguous,
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Of([]string{connected}), dbselect.Absent()),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Assert(families["pg_collector_database_discovery_success"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0), Commentf("discovery was supposed to fail in this fixture"))
+	c.Check(families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0),
+		Commentf("the excluded database was selected, so the exclusion was applied to the wrong name"))
+	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1))
+
+	// The connection status names the database that was actually connected to.
+	up, ok := families["pg_collector_database_up"]
+	c.Assert(ok, Equals, true)
+	c.Assert(len(up.GetMetric()), Equals, 1)
+	for _, l := range up.GetMetric()[0].GetLabel() {
+		if l.GetName() == "datname" {
+			c.Check(l.GetValue(), Equals, connected,
+				Commentf("connection status is labelled with a database this scrape never connected to"))
+		}
+	}
+
+	// And nothing from the excluded database reached the scrape.
+	for name, f := range families {
+		if !strings.HasPrefix(name, "pg_stat_user_tables_") {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() != "relname" {
+					continue
+				}
+				c.Check(l.GetValue(), Not(Equals), marker,
+					Commentf("a table in the excluded database reached the scrape through %s", name))
+			}
+		}
+	}
+}
+
+// TestCollectorIncludeWithAmbiguousDSN is the same fixture read the other way.
+// An include list naming the database that is actually connected to must
+// select it, which it cannot do if the name came from the wrong half of the
+// connection string.
+func (s *IntegrationSuite) TestCollectorIncludeWithAmbiguousDSN(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "ambiguous_include"
+	const connected = "root"
+	const other = "postgres"
+
+	// Per-database privileges again: revoke in the database this DSN reaches.
+	target, err := NewServer(rewriteDatabase(c, strings.Split(dsn, ",")[0], connected))
+	c.Assert(err, IsNil)
+	defer target.Close()
+
+	cleanup := func() {
+		_, _ = target.db.Exec(`GRANT SELECT ON pg_catalog.pg_database TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = target.db.Exec(`REVOKE SELECT ON pg_catalog.pg_database FROM ` + role)
+	c.Assert(err, IsNil)
+
+	pc, err := collector.NewPostgresCollector(
+		log.NewNopLogger(),
+		[]string{},
+		"postgresql://"+role+":secret@"+hostPort(c, dsn)+"/"+other+"?dbname="+connected+"&sslmode=disable",
+		[]string{},
+		collector.WithContext(context.Background()),
+		collector.WithDatabaseSelection(dbselect.Absent(), dbselect.Of([]string{connected})),
+	)
+	c.Assert(err, IsNil)
+	families := gather(c, pc)
+
+	c.Check(families["pg_collector_databases_selected"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(1),
+		Commentf("an include list naming the connected database did not select it"))
+	c.Check(families["pg_collector_databases_excluded"].GetMetric()[0].GetGauge().GetValue(),
+		Equals, float64(0))
+}

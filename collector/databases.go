@@ -127,7 +127,17 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 
 	// Whatever happens below, the configured connection is a target: it is
 	// what the cluster-wide collectors run on.
+	//
+	// The name it is reported and filtered under comes from the server, not
+	// from the connection string. A DSN can name two different databases, in
+	// its path and in a dbname parameter, and which one is connected to
+	// depends on a sort order inside the driver. Asking costs one row and only
+	// on the path where discovery has already failed, and it turns a guess
+	// that decides whether an exclusion applies into a fact.
 	alone := func(err error) (dbSelection, error) {
+		if name, qerr := queryCurrentDatabase(ctx, inst); qerr == nil {
+			controlName = name
+		}
 		sel := dbSelection{ok: false}
 		sel.targets = []dbTarget{controlTargetFor(&sel, controlName)}
 		return sel, err
@@ -208,4 +218,16 @@ func (s dbSelection) controlTarget() *dbTarget {
 		}
 	}
 	return nil
+}
+
+// queryCurrentDatabase asks the server which database this connection is on.
+//
+// The catalog query answers this as a side effect when it works. This exists
+// for when it does not: the connection is still healthy, and the name decides
+// whether the configured exclusion and inclusion rules apply to this database,
+// so it is worth one row rather than a guess at a connection string.
+func queryCurrentDatabase(ctx context.Context, inst *instance) (string, error) {
+	var name string
+	err := inst.getDB().QueryRowContext(ctx, "SELECT current_database()").Scan(&name)
+	return name, err
 }

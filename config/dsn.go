@@ -267,23 +267,46 @@ func DSNWithDatabase(in, database string) (string, error) {
 }
 
 // DatabaseFromDSN returns the database a connection string names, and whether
-// it names one at all.
+// it names one unambiguously.
 //
-// Both places are read, for the same reason DSNWithDatabase clears both. An
-// absent name is not an error: libpq then falls back to the user name, and
-// guessing that here would put a name on a database nobody configured.
+// A URL can carry the database twice, once in its path and once as a dbname
+// parameter, and the two can disagree. There is no useful rule for which wins.
+// pq.ParseURL emits both as dbname keywords and sorts its output, and libpq
+// takes the last occurrence of a repeated keyword, so the database that is
+// actually connected to is whichever of the two names sorts later. Measured
+// against PostgreSQL 18 with lib/pq:
+//
+//	.../postgres?dbname=root  connects to root, which is the query parameter
+//	.../root?dbname=postgres  connects to root, which is the path
+//
+// Reproducing that in a parser would be depending on a sort order inside a
+// driver, and reporting either half of it would be wrong half the time. So a
+// connection string that names two different databases names none, as far as
+// this function is concerned, and the caller is left to ask the server or to
+// treat the database as unknown.
+//
+// An absent name is likewise not an error: libpq then falls back to the user
+// name, and guessing that here would put a name on a database nobody
+// configured.
 func DatabaseFromDSN(in string) (string, bool) {
 	d, err := dsnFromString(in)
 	if err != nil {
 		return "", false
 	}
-	if name := strings.TrimPrefix(d.path, "/"); name != "" {
-		return name, true
-	}
+	fromPath := strings.TrimPrefix(d.path, "/")
+	fromQuery := ""
 	if d.query != nil {
-		if name := d.query.Get("dbname"); name != "" {
-			return name, true
-		}
+		fromQuery = d.query.Get("dbname")
 	}
-	return "", false
+
+	switch {
+	case fromPath != "" && fromQuery != "" && fromPath != fromQuery:
+		return "", false
+	case fromPath != "":
+		return fromPath, true
+	case fromQuery != "":
+		return fromQuery, true
+	default:
+		return "", false
+	}
 }
