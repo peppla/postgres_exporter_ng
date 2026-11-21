@@ -1,0 +1,596 @@
+# Built-in metric catalogue
+
+What every metric the built-in collectors publish measures, on which versions,
+with what labels, and what you see when collection fails.
+
+`collector/metric_catalog_test.go` checks this file against the code. A metric
+without an entry fails the build, and so does an entry for a metric that is no
+longer published. The labels listed in each section are checked too.
+
+The custom-query engine is not here. Its metrics come from query files an
+operator writes, so there is nothing fixed to catalogue.
+
+## How to read an entry
+
+Scope says where a collector's queries run. A cluster collector runs once per
+server on the configured connection and its answer describes the whole server.
+A database collector runs once per selected database, on a connection to that
+database, and everything it publishes carries `datname`.
+
+Units are stated even when the name carries them, because several names do not
+and two carry the wrong one. Where PostgreSQL reports milliseconds and the
+metric publishes milliseconds, the entry says milliseconds. Prometheus
+convention is seconds, and the gap between the two is recorded in [what is
+wrong with this catalogue](#what-is-wrong-with-this-catalogue) rather than
+quietly corrected here.
+
+Versions are the range this exporter supports, 15 to 19. A narrower range means
+the metric is omitted below it rather than published as zero, which is the
+distinction that lets a missing series mean "not available" instead of "none".
+
+Reset says what makes a counter go backwards. Every statistics view here is
+reset by `pg_stat_reset()` and by a crash that loses the statistics file, and
+some have their own reset functions. A dashboard that does not know this is
+wrong at the moment it matters most.
+
+Partial failure says what an operator sees when collection does not finish.
+Across every collector here the unit of failure is the collector on one
+database: it either publishes its rows or it publishes none of them, and
+`pg_scrape_collector_success` says which. A relation that was never collected
+emits no series at all, which is not the same as a relation with a zero.
+
+## exporter framework
+
+The collectors' own account of what they did. These come from the namespaced
+collector framework rather than from PostgreSQL, so they are present whether or
+not any collector succeeded.
+
+| | |
+| --- | --- |
+| Scope | cluster, with per-database rows where named |
+| Labels | `server`, with `collector`, `datname` and `reason` where listed |
+| Cardinality | a handful per server, plus one per selected database for the per-database families |
+| Reset | none, these describe the last scrape |
+| Availability | always |
+| Partial failure | this is the report of partial failure |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_collector_databases_discovered` | gauge | databases | 15-19 | Connectable databases the server reported, including the connected one. Absent when the catalogue could not be read, because the only number it could invent is 1, which is what a one-database server looks like. |
+| `pg_collector_databases_selected` | gauge | databases | 15-19 | Databases the scrape intended to run database-local collectors against, after exclusion and inclusion. |
+| `pg_collector_databases_excluded` | gauge | databases | 15-19 | Databases configuration left out. A decision, never a failure. |
+| `pg_collector_database_discovery_success` | gauge | boolean | 15-19 | Whether the set of databases could be determined. Zero means the set has collapsed to the connected database. |
+| `pg_collector_database_up` | gauge | boolean | 15-19 | Whether this database could be connected to. Present for every selected database and for the connected one even when selection left it out, so it can carry one more database than `databases_selected` counts. |
+| `pg_collector_database_error` | gauge | boolean | 15-19 | One per database that was not reached, labelled `reason` with `connect` or `not_attempted`. A closed set, never an error message. |
+| `pg_collector_database_excluded` | gauge | boolean | 15-19 | One per database an exclude list named. Databases left out by an include list are counted, not named, because that set can be the whole server. |
+| `pg_scrape_collector_success` | gauge | boolean | 15-19 | Whether one collector finished on one database. `datname` is empty for a cluster collector, which Prometheus treats as absent. |
+| `pg_scrape_collector_duration_seconds` | gauge | seconds | 15-19 | How long one collector took on one database. |
+
+## database
+
+Database sizes, from `pg_database`.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_database` is shared |
+| Labels | `datname` |
+| Cardinality | one series per database on the server |
+| Reset | none, this is a current size |
+| Availability | all versions; needs `CONNECT` on the database or the size is skipped |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_database_size_bytes` | gauge | bytes | 15-19 | Disk space the database occupies, from `pg_database_size()`. Includes every fork and the TOAST relations. |
+
+## database_wraparound
+
+How close each database is to transaction ID wraparound.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_database` is shared |
+| Labels | `datname` |
+| Cardinality | one series per database on the server |
+| Reset | none, these fall when a freeze advances the oldest unfrozen ID |
+| Availability | all versions |
+| Partial failure | the collector fails as a unit; a row whose age is NULL is skipped and emits nothing |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_database_wraparound_age_datfrozenxid_seconds` | gauge | transactions | 15-19 | Transactions since the database's oldest unfrozen transaction ID, from `age(datfrozenxid)`. The name says seconds and the value is a count of transactions. Compare it with `autovacuum_freeze_max_age`, which is 200 million by default. |
+| `pg_database_wraparound_age_datminmxid_seconds` | gauge | multixacts | 15-19 | Multixacts since the database's oldest unreplaced multixact ID, from `mxid_age(datminmxid)`. The name says seconds and the value is a count. Compare it with `autovacuum_multixact_freeze_max_age`. |
+
+## extensions
+
+Which extensions a database has, and which it could have.
+
+| | |
+| --- | --- |
+| Scope | database, `pg_extension` is local to one database |
+| Labels | `datname`, `name`, and `default_version` and `installed_version` or `relocatable` and `version` |
+| Cardinality | one series per extension per selected database, bounded by what is installed |
+| Reset | none |
+| Availability | all versions; reads catalogues only, so no extension is needed to collect it |
+| Partial failure | the collector fails as a unit, per database |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_available_extensions` | gauge | boolean | 15-19 | Always 1. The information is in the labels: an extension available for installation, with the version installed in this database if any. |
+| `pg_extensions` | gauge | boolean | 15-19 | Always 1. An extension installed in this database, with its version as a label. |
+
+## locks
+
+Lock counts by mode.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_locks` reports every database from one connection |
+| Labels | `datname`, `mode` |
+| Cardinality | one series per database per lock mode, so up to eight per database |
+| Reset | none, this is a current count |
+| Availability | all versions; `pg_monitor` or superuser to see other users' locks |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_locks_count` | gauge | locks | 15-19 | Locks currently held or awaited, counted per database and lock mode. |
+
+## long_running_transactions
+
+Transactions that have been open a long time.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_stat_activity` reports every database |
+| Labels | none |
+| Cardinality | two series per server |
+| Reset | none, these describe the present |
+| Availability | all versions; `pg_monitor` to see other users' sessions, otherwise the counts are of your own |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_long_running_transactions` | gauge | transactions | 15-19 | Transactions open longer than the collector's threshold. |
+| `pg_long_running_transactions_oldest_timestamp_seconds` | gauge | seconds | 15-19 | Age of the oldest open transaction. |
+
+## postmaster
+
+When the server started.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | none |
+| Cardinality | one series per server |
+| Reset | the value changes when the server restarts, which is the point of it |
+| Availability | all versions |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_postmaster_start_time_seconds` | gauge | seconds since the epoch | 15-19 | When the postmaster started, from `pg_postmaster_start_time()`. A drop in this is a restart. |
+
+## process_idle
+
+How long sessions have been idle.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_stat_activity` reports every database |
+| Labels | `state`, `application_name` |
+| Cardinality | unbounded. `application_name` is whatever clients set, so a client that puts a request id in it mints a series per request |
+| Reset | none, this describes the present |
+| Availability | all versions; `pg_monitor` to see other users' sessions |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_process_idle_seconds` | histogram | seconds | 15-19 | Idle time of server processes, bucketed. The only histogram the built-in collectors publish. |
+
+## replication
+
+Whether this server is a standby, and how far behind it is.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | none |
+| Cardinality | two series per server |
+| Reset | none |
+| Availability | all versions; the lag is meaningful only on a standby and reads zero on a primary |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_replication_is_replica` | gauge | boolean | 15-19 | 1 on a standby, 0 on a primary, from `pg_is_in_recovery()`. |
+| `pg_replication_lag_seconds` | gauge | seconds | 15-19 | How far behind the primary this standby is, by replay timestamp. Zero on a primary and on an idle standby, which are different situations the value does not distinguish. |
+
+## replication_slot
+
+Replication slot positions.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_replication_slots` is shared |
+| Labels | `slot_name`, `plugin`, `slot_type` |
+| Cardinality | one series per slot, bounded by `max_replication_slots` |
+| Reset | none, LSNs advance and are reset only by recreating a slot |
+| Availability | all versions; `pg_monitor` or superuser |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_replication_slot_slot_current_wal_lsn` | gauge | bytes of WAL | 15-19 | The server's current write-ahead log position, as a number. |
+| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how much WAL the slot is holding. |
+| `pg_replication_slot_slot_is_active` | gauge | boolean | 15-19 | Whether anything is connected to the slot. An inactive slot still holds WAL. |
+
+## stat_activity_autovacuum
+
+When each running autovacuum started.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_stat_activity` reports every database |
+| Labels | `relname` |
+| Cardinality | one series per relation currently being autovacuumed, so bounded by `autovacuum_max_workers` at any moment, but the set of relation names over time is not bounded |
+| Reset | none, a series disappears when the vacuum finishes |
+| Availability | all versions; `pg_monitor` to see the autovacuum workers' queries |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_activity_autovacuum_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When the autovacuum running on this relation started. Absent when nothing is being vacuumed, which is not zero. |
+
+## stat_bgwriter
+
+Background writer and checkpointer activity.
+
+Thirteen of these metrics exist twice, once with the Prometheus `_total`
+suffix and once without. The pair carries the same number with the same
+labels, verified by `TestBgwriterTotalPairsAreDuplicates`. It is duplicated
+data kept for compatibility, and consolidating it is a decision for the
+migration mapping rather than something to do quietly.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | `collector`, `server` |
+| Cardinality | 26 series per server, of which 13 duplicate the other 13 |
+| Reset | `pg_stat_reset_shared('bgwriter')`, and a crash that loses the statistics file |
+| Availability | PostgreSQL 17 moved checkpoint counters from `pg_stat_bgwriter` to `pg_stat_checkpointer`; the collector reads whichever exists. `checkpoints_done` and `slru_written` need 18 |
+| Partial failure | the collector fails as a unit |
+
+Times here are milliseconds, which the names do not say.
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_bgwriter_checkpoints_timed_total` | counter | checkpoints | 15-19 | Scheduled checkpoints performed. |
+| `pg_stat_bgwriter_checkpoints_timed` | counter | checkpoints | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_checkpoints_req_total` | counter | checkpoints | 15-19 | Requested checkpoints performed. A high ratio against timed ones means `max_wal_size` is too small. |
+| `pg_stat_bgwriter_checkpoints_req` | counter | checkpoints | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_checkpoints_done_total` | counter | checkpoints | 18-19 | Checkpoints completed. |
+| `pg_stat_bgwriter_checkpoints_done` | counter | checkpoints | 18-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_checkpoint_write_time_total` | counter | milliseconds | 15-19 | Time spent writing files during checkpoints. |
+| `pg_stat_bgwriter_checkpoint_write_time` | counter | milliseconds | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_checkpoint_sync_time_total` | counter | milliseconds | 15-19 | Time spent syncing files during checkpoints. |
+| `pg_stat_bgwriter_checkpoint_sync_time` | counter | milliseconds | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_checkpoint_total` | counter | buffers | 15-19 | Buffers written during checkpoints. |
+| `pg_stat_bgwriter_buffers_checkpoint` | counter | buffers | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_clean_total` | counter | buffers | 15-19 | Buffers written by the background writer. |
+| `pg_stat_bgwriter_buffers_clean` | counter | buffers | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_maxwritten_clean_total` | counter | occurrences | 15-19 | Times the background writer stopped a scan for having written too many buffers. |
+| `pg_stat_bgwriter_maxwritten_clean` | counter | occurrences | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_backend_total` | counter | buffers | 15-19 | Buffers written by a backend rather than by the writer or a checkpoint. |
+| `pg_stat_bgwriter_buffers_backend` | counter | buffers | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_backend_fsync_total` | counter | occurrences | 15-19 | Times a backend had to run its own fsync. |
+| `pg_stat_bgwriter_buffers_backend_fsync` | counter | occurrences | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_alloc_total` | counter | buffers | 15-19 | Buffers allocated. |
+| `pg_stat_bgwriter_buffers_alloc` | counter | buffers | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_slru_written_total` | counter | buffers | 18-19 | SLRU buffers written during checkpoints and restartpoints. |
+| `pg_stat_bgwriter_slru_written` | counter | buffers | 18-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_stats_reset_total` | counter | seconds since the epoch | 15-19 | When these statistics were last reset. A timestamp published as a counter, so a reset reads as a counter going backwards and `rate()` over it means nothing. |
+| `pg_stat_bgwriter_stats_reset` | counter | seconds since the epoch | 15-19 | The same measurement under the older name, with the same problem. |
+
+## stat_database
+
+Per-database activity, from `pg_stat_database`.
+
+| | |
+| --- | --- |
+| Scope | cluster, the view reports every database from one connection |
+| Labels | `datid`, `datname` |
+| Cardinality | one series per database on the server, per metric |
+| Reset | `pg_stat_reset()` run in that database, and a crash that loses the statistics file |
+| Availability | all versions; the parallel worker counters need 18 |
+| Partial failure | the collector fails as a unit |
+
+Times here are milliseconds, which the names do not say.
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_database_numbackends` | gauge | connections | 15-19 | Backends connected to this database now. The only current-state column in the view. |
+| `pg_stat_database_xact_commit` | counter | transactions | 15-19 | Transactions committed. |
+| `pg_stat_database_xact_rollback` | counter | transactions | 15-19 | Transactions rolled back. |
+| `pg_stat_database_blks_read` | counter | blocks | 15-19 | Disk blocks read. Counts reads from the operating system, which may themselves be cache hits. |
+| `pg_stat_database_blks_hit` | counter | blocks | 15-19 | Blocks found in PostgreSQL's own buffer cache. |
+| `pg_stat_database_tup_returned` | counter | rows | 15-19 | Rows returned by queries, which for a sequential scan is every row examined. |
+| `pg_stat_database_tup_fetched` | counter | rows | 15-19 | Rows fetched by index lookups. |
+| `pg_stat_database_tup_inserted` | counter | rows | 15-19 | Rows inserted. |
+| `pg_stat_database_tup_updated` | counter | rows | 15-19 | Rows updated. |
+| `pg_stat_database_tup_deleted` | counter | rows | 15-19 | Rows deleted. |
+| `pg_stat_database_conflicts` | counter | queries | 15-19 | Queries cancelled by recovery conflicts. Non-zero only on a standby. |
+| `pg_stat_database_temp_files` | counter | files | 15-19 | Temporary files created, whatever `log_temp_files` is set to. |
+| `pg_stat_database_temp_bytes` | counter | bytes | 15-19 | Bytes written to temporary files. |
+| `pg_stat_database_deadlocks` | counter | deadlocks | 15-19 | Deadlocks detected. |
+| `pg_stat_database_blk_read_time` | counter | milliseconds | 15-19 | Time backends spent reading blocks. Zero unless `track_io_timing` is on, which is not the same as no time spent. |
+| `pg_stat_database_blk_write_time` | counter | milliseconds | 15-19 | Time backends spent writing blocks. Zero unless `track_io_timing` is on. |
+| `pg_stat_database_parallel_workers_to_launch` | counter | workers | 18-19 | Parallel workers planned. |
+| `pg_stat_database_parallel_workers_launched` | counter | workers | 18-19 | Parallel workers actually started. The gap from the planned count is parallelism the server could not provide. |
+| `pg_stat_database_stats_reset` | counter | seconds since the epoch | 15-19 | When these statistics were last reset. A timestamp published as a counter, so a reset reads as a counter going backwards. |
+
+## stat_io
+
+I/O by backend type, object and context, from `pg_stat_io`.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | `backend_type`, `io_object`, `io_context` |
+| Cardinality | one series per combination the server reports, which is bounded by PostgreSQL's own enumerations and is around a hundred per metric |
+| Reset | `pg_stat_reset_shared('io')`, and a crash that loses the statistics file |
+| Availability | `pg_stat_io` was added in PostgreSQL 16, so nothing here is published on 15 |
+| Partial failure | the collector fails as a unit |
+
+Times here are milliseconds, which the names do not say, and they are zero
+unless `track_io_timing` is on.
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_io_reads_total` | counter | operations | 16-19 | Read operations. |
+| `pg_stat_io_read_bytes_total` | counter | bytes | 16-19 | Bytes read. |
+| `pg_stat_io_read_time_total` | counter | milliseconds | 16-19 | Time spent reading. |
+| `pg_stat_io_writes_total` | counter | operations | 16-19 | Write operations. |
+| `pg_stat_io_write_bytes_total` | counter | bytes | 16-19 | Bytes written. |
+| `pg_stat_io_write_time_total` | counter | milliseconds | 16-19 | Time spent writing. |
+| `pg_stat_io_writebacks_total` | counter | blocks | 16-19 | Blocks the process asked the kernel to write out. |
+| `pg_stat_io_writeback_time_total` | counter | milliseconds | 16-19 | Time spent asking for writeback. |
+| `pg_stat_io_extends_total` | counter | operations | 16-19 | Relation extend operations. |
+| `pg_stat_io_extend_bytes_total` | counter | bytes | 16-19 | Bytes added by extends. |
+| `pg_stat_io_extend_time_total` | counter | milliseconds | 16-19 | Time spent extending. |
+| `pg_stat_io_hits_total` | counter | operations | 16-19 | Times a wanted block was already in a shared buffer. |
+| `pg_stat_io_evictions_total` | counter | operations | 16-19 | Times a block was written out of a buffer to free it. |
+| `pg_stat_io_reueses_total` | counter | operations | 16-19 | Times a buffer in a size-limited ring was reused. The name is misspelled: it should be `reuses`. |
+| `pg_stat_io_fsyncs_total` | counter | operations | 16-19 | fsync calls. |
+| `pg_stat_io_fsync_time_total` | counter | milliseconds | 16-19 | Time spent in fsync. |
+
+## stat_statements
+
+Per-statement execution totals, from the `pg_stat_statements` extension.
+
+| | |
+| --- | --- |
+| Scope | cluster, the view carries `dbid` and reports every database from one connection |
+| Labels | `user`, `datname`, `queryid` |
+| Cardinality | unbounded in practice. One series per distinct statement shape per user per database, up to `pg_stat_statements.max`, which defaults to 5000 |
+| Reset | `pg_stat_statements_reset()`, and eviction when the tracked set is full, which drops a statement's history without resetting anything else |
+| Availability | needs the `pg_stat_statements` extension created and in `shared_preload_libraries`. Disabled by default in this exporter |
+| Partial failure | the collector fails as a unit |
+
+This family converts PostgreSQL's milliseconds to seconds, which the rest of
+the exporter does not.
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_statements_calls_total` | counter | calls | 15-19 | Times the statement was executed. |
+| `pg_stat_statements_rows_total` | counter | rows | 15-19 | Rows the statement returned or affected. |
+| `pg_stat_statements_seconds_total` | counter | seconds | 15-19 | Total execution time. |
+| `pg_stat_statements_block_read_seconds_total` | counter | seconds | 15-19 | Time spent reading blocks. Zero unless `track_io_timing` is on. |
+| `pg_stat_statements_block_write_seconds_total` | counter | seconds | 15-19 | Time spent writing blocks. Zero unless `track_io_timing` is on. |
+
+## stat_user_indexes
+
+Per-index usage and size estimates.
+
+| | |
+| --- | --- |
+| Scope | database, these catalogues describe one database |
+| Labels | `datname`, `schemaname`, `relname`, `indexrelname` |
+| Cardinality | one series per index per selected database, per metric. The largest family here on a schema with many indexes |
+| Reset | `pg_stat_reset()` in that database for the scan counters; the page and tuple estimates are maintained by the index build and by vacuum and analyze |
+| Availability | all versions. Covers indexes of ordinary, TOAST and materialised-view relations, outside `pg_catalog`, `information_schema` and the TOAST schemas |
+| Partial failure | the collector fails as a unit, per database. An index that was not collected emits no series |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_user_indexes_idx_scan` | counter | scans | 15-19 | Index scans started on this index. Zero over a long window is the usual sign of an unused index. |
+| `pg_stat_user_indexes_idx_tup_read` | counter | entries | 15-19 | Index entries returned by scans. |
+| `pg_stat_user_indexes_idx_tup_fetch` | counter | rows | 15-19 | Live table rows fetched by simple index scans on this index. |
+| `pg_stat_user_indexes_relpages` | gauge | pages | 15-19 | The planner's estimate of the index's size in pages, from `pg_class`. An estimate, not a measurement. |
+| `pg_stat_user_indexes_reltuples` | gauge | entries | 15-19 | The planner's estimate of the number of index entries. Unlike a table's, it is not expected to carry the -1 that means never analyzed. |
+
+## stat_user_tables
+
+Per-table activity, maintenance history and catalogue estimates.
+
+Reads `pg_class` and the per-relation statistics functions directly rather
+than the `pg_stat_user_tables` view, which is what lets the catalogue columns
+below be published alongside the activity counters from one scan.
+
+| | |
+| --- | --- |
+| Scope | database, these catalogues describe one database |
+| Labels | `datname`, `schemaname`, `relname` |
+| Cardinality | one series per relation per selected database, per metric |
+| Reset | `pg_stat_reset()` in that database for the counters and the last-run timestamps; the `pg_class` estimates are updated by vacuum and analyze and do not reset |
+| Availability | all versions. Covers ordinary, TOAST, materialised-view and partitioned relations outside the system schemas. `n_tup_newpage_upd` needs 16, `relallfrozen` and the four `total_*_time` metrics need 18 |
+| Partial failure | the collector fails as a unit, per database. A relation that was not collected emits no series, which is not a zero |
+
+Times here are milliseconds, which the names do not say.
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_user_tables_seq_scan` | counter | scans | 15-19 | Sequential scans started on this table. |
+| `pg_stat_user_tables_seq_tup_read` | counter | rows | 15-19 | Live rows fetched by sequential scans. |
+| `pg_stat_user_tables_idx_scan` | counter | scans | 15-19 | Index scans started on this table, summed over its indexes. Not interchangeable with the per-index family, which has a different scope and an extra label. |
+| `pg_stat_user_tables_idx_tup_fetch` | counter | rows | 15-19 | Live rows fetched by index scans on this table. |
+| `pg_stat_user_tables_n_tup_ins` | counter | rows | 15-19 | Rows inserted. |
+| `pg_stat_user_tables_n_tup_upd` | counter | rows | 15-19 | Rows updated. |
+| `pg_stat_user_tables_n_tup_del` | counter | rows | 15-19 | Rows deleted. |
+| `pg_stat_user_tables_n_tup_hot_upd` | counter | rows | 15-19 | Rows updated without needing an index update. |
+| `pg_stat_user_tables_n_live_tup` | gauge | rows | 15-19 | Estimated live rows. An estimate from the statistics collector, not a count. |
+| `pg_stat_user_tables_n_dead_tup` | gauge | rows | 15-19 | Estimated dead rows awaiting vacuum. |
+| `pg_stat_user_tables_n_mod_since_analyze` | gauge | rows | 15-19 | Estimated rows changed since the last analyze. What autovacuum compares against its analyze threshold. |
+| `pg_stat_user_tables_last_vacuum` | gauge | seconds since the epoch | 15-19 | When the table was last vacuumed by hand. Zero when it never has been, which is also a valid timestamp in 1970. |
+| `pg_stat_user_tables_last_autovacuum` | gauge | seconds since the epoch | 15-19 | When autovacuum last vacuumed it. |
+| `pg_stat_user_tables_last_analyze` | gauge | seconds since the epoch | 15-19 | When the table was last analyzed by hand. |
+| `pg_stat_user_tables_last_autoanalyze` | gauge | seconds since the epoch | 15-19 | When autovacuum last analyzed it. |
+| `pg_stat_user_tables_vacuum_count` | counter | runs | 15-19 | Manual vacuums. |
+| `pg_stat_user_tables_autovacuum_count` | counter | runs | 15-19 | Autovacuum vacuums. |
+| `pg_stat_user_tables_analyze_count` | counter | runs | 15-19 | Manual analyzes. |
+| `pg_stat_user_tables_autoanalyze_count` | counter | runs | 15-19 | Autovacuum analyzes. |
+| `pg_stat_user_tables_total_vacuum_time` | counter | milliseconds | 18-19 | Time spent vacuuming this table by hand. |
+| `pg_stat_user_tables_total_autovacuum_time` | counter | milliseconds | 18-19 | Time autovacuum spent vacuuming it. |
+| `pg_stat_user_tables_total_analyze_time` | counter | milliseconds | 18-19 | Time spent analyzing it by hand. |
+| `pg_stat_user_tables_total_autoanalyze_time` | counter | milliseconds | 18-19 | Time autovacuum spent analyzing it. |
+| `pg_stat_user_tables_size_bytes` | gauge | bytes | 15-19 | Total disk space for the table including indexes and TOAST, from `pg_total_relation_size()`. |
+
+Eight more metrics in this family arrive with the `pg_class` rewrite that is
+still in review: `n_tup_newpage_upd`, `n_ins_since_vacuum`, `relpages`,
+`reltuples`, `relallvisible`, `relallfrozen`, `relfrozenxid_age` and
+`relminmxid_age`. They are left out until that merges, because this file
+describes what is published and the test above enforces that in both
+directions.
+
+## stat_wal_receiver
+
+The WAL receiver on a standby.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | `upstream_host`, `slot_name`, `status` |
+| Cardinality | one series per metric on a standby, none on a primary |
+| Reset | the LSNs are taken modulo 2^52 before publishing, so they wrap, and a wrap looks like a counter reset |
+| Availability | all versions. Publishes nothing on a primary, where `pg_stat_wal_receiver` is empty, and nothing on Aurora. Disabled by default in this exporter. A row with any NULL in it is skipped entirely |
+| Partial failure | the collector fails as a unit |
+
+The LSN and time metrics are published as counters. A timestamp is not a
+counter, and an LSN taken modulo 2^52 is not one either.
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_wal_receiver_receive_start_lsn` | counter | bytes of WAL, modulo 2^52 | 15-19 | The first log position used when the receiver started. |
+| `pg_stat_wal_receiver_receive_start_tli` | gauge | timeline | 15-19 | The first timeline used when the receiver started. |
+| `pg_stat_wal_receiver_flushed_lsn` | counter | bytes of WAL, modulo 2^52 | 15-19 | The last position received and flushed to disk. |
+| `pg_stat_wal_receiver_received_tli` | gauge | timeline | 15-19 | The timeline of the last position received. |
+| `pg_stat_wal_receiver_last_msg_send_time` | counter | seconds since the epoch | 15-19 | When the upstream sender sent its last message. |
+| `pg_stat_wal_receiver_last_msg_receipt_time` | counter | seconds since the epoch | 15-19 | When this server received it. The difference from the send time is the one-way delay, assuming the clocks agree. |
+| `pg_stat_wal_receiver_latest_end_lsn` | counter | bytes of WAL, modulo 2^52 | 15-19 | The last position reported back to the sender. |
+| `pg_stat_wal_receiver_latest_end_time` | counter | seconds since the epoch | 15-19 | When that was reported. |
+| `pg_stat_wal_receiver_upstream_node` | gauge | node id | 15-19 | The upstream node id, parsed out of a `repmgr_slot_N` slot name. Absent unless the slot follows that convention. |
+
+## statio_user_indexes
+
+Buffer and disk reads per index.
+
+| | |
+| --- | --- |
+| Scope | database, these catalogues describe one database |
+| Labels | `datname`, `schemaname`, `relname`, `indexrelname` |
+| Cardinality | one series per index per selected database, per metric |
+| Reset | `pg_stat_reset()` in that database |
+| Availability | all versions |
+| Partial failure | the collector fails as a unit, per database |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_statio_user_indexes_idx_blks_read_total` | counter | blocks | 15-19 | Blocks read from disk for this index. |
+| `pg_statio_user_indexes_idx_blks_hit_total` | counter | blocks | 15-19 | Blocks found in the buffer cache for this index. |
+
+## statio_user_tables
+
+Buffer and disk reads per table, including its TOAST relations.
+
+| | |
+| --- | --- |
+| Scope | database, these catalogues describe one database |
+| Labels | `datname`, `schemaname`, `relname` |
+| Cardinality | one series per relation per selected database, per metric |
+| Reset | `pg_stat_reset()` in that database |
+| Availability | all versions. The TOAST metrics are zero for a table without a TOAST relation, which is not the same as absent |
+| Partial failure | the collector fails as a unit, per database |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_statio_user_tables_heap_blocks_read` | counter | blocks | 15-19 | Blocks read from disk for the table itself. |
+| `pg_statio_user_tables_heap_blocks_hit` | counter | blocks | 15-19 | Blocks found in cache for the table itself. |
+| `pg_statio_user_tables_idx_blocks_read` | counter | blocks | 15-19 | Blocks read from disk across all the table's indexes. Not interchangeable with the per-index family. |
+| `pg_statio_user_tables_idx_blocks_hit` | counter | blocks | 15-19 | Blocks found in cache across all the table's indexes. |
+| `pg_statio_user_tables_toast_blocks_read` | counter | blocks | 15-19 | Blocks read from disk for the table's TOAST relation. |
+| `pg_statio_user_tables_toast_blocks_hit` | counter | blocks | 15-19 | Blocks found in cache for the TOAST relation. |
+| `pg_statio_user_tables_tidx_blocks_read` | counter | blocks | 15-19 | Blocks read from disk for the TOAST relation's indexes. |
+| `pg_statio_user_tables_tidx_blocks_hit` | counter | blocks | 15-19 | Blocks found in cache for the TOAST relation's indexes. |
+
+## wal
+
+Write-ahead log on disk.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | none |
+| Cardinality | two series per server |
+| Reset | none, these are current sizes |
+| Availability | all versions; needs `pg_monitor` or superuser to list the WAL directory |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_wal_segments` | gauge | segments | 15-19 | Files in `pg_wal`, from `pg_ls_waldir()`. |
+| `pg_wal_size_bytes` | gauge | bytes | 15-19 | Total size of those files. Growth here with a lagging or inactive replication slot is the usual way a disk fills. |
+
+## What is wrong with this catalogue
+
+Writing it down surfaced these. None is fixed here, because every one of them
+changes a metric name, type or value that something is already reading, and
+that belongs with the compatibility mapping rather than with the description.
+
+Two metrics are named in seconds and carry transaction counts.
+`pg_database_wraparound_age_datfrozenxid_seconds` and
+`pg_database_wraparound_age_datminmxid_seconds` publish `age(datfrozenxid)`
+and `mxid_age(datminmxid)` unchanged, which PostgreSQL returns as integers.
+An alert written as though the value were a duration compares a transaction
+count against a number of seconds, and the two have no fixed conversion. These
+are the ones most likely to be wrong in somebody's alerting today.
+
+Thirteen bgwriter metrics are published twice under two names with identical
+values, which is 13 wasted series per server and two names a query could pick
+from with no way to tell they are the same.
+
+Sixty-four counters do not end in `_total`. The convention is not decoration:
+tooling that distinguishes counters from gauges by name gets these wrong.
+`collector/metric_catalog_test.go` records all sixty-four so that no new one
+joins them.
+
+Seven timestamps are published as counters, in the bgwriter, stat_database and
+wal receiver families. A timestamp goes backwards when something is reset, and
+a counter that goes backwards is read as a counter reset, so `rate()` over one
+of these produces a number that means nothing.
+
+Three WAL positions are published as counters after being taken modulo 2^52.
+They wrap, and a wrap is indistinguishable from a reset.
+
+Time is published in two units. `pg_stat_statements` divides PostgreSQL's
+milliseconds into seconds; bgwriter, stat_database, stat_io and
+stat_user_tables publish milliseconds under names that say nothing about the
+unit. Both are defensible on their own and together they mean a dashboard
+author has to check each family.
+
+`pg_stat_io_reueses_total` is a misspelling of `reuses`.
+
+Three label sets are unbounded, and nothing in the exposition says so.
+`pg_stat_statements` mints a series per statement shape per user per database,
+`pg_process_idle_seconds` mints one per `application_name` that any client
+chooses to send, and `pg_stat_activity_autovacuum_timestamp_seconds` mints one
+per relation that has ever been autovacuumed while a scrape was running.
