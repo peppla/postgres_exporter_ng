@@ -231,10 +231,12 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 		var metrics []prometheus.Metric
 		var nonFatalErrors []error
 		var err error
+		collectedAt := scrapeStart
 		if scrapeMetric {
 			metrics, nonFatalErrors, err = queryNamespaceMapping(server, namespace, mapping)
 		} else {
 			metrics = cachedMetric.metrics
+			collectedAt = cachedMetric.lastScrape
 		}
 
 		// Serious error - a namespace disappeared
@@ -249,14 +251,41 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 			}
 		}
 
-		// Emit the metrics into the channel
+		// Samples from the cache carry the time they were collected, not the
+		// time of this scrape.
+		//
+		// The contract is explicit that old values must never be republished
+		// with fresh timestamps as though recollected, and that is what this
+		// did: with cache_seconds at 60 and a scrape every 5 seconds, one
+		// measurement was recorded twelve times, each at a different moment,
+		// and a reader could not tell a value that had just been measured from
+		// one that was a minute old.
+		//
+		// Prometheus stores one sample per series per timestamp, so repeating
+		// a timestamped sample leaves the series with a point per collection
+		// instead of a point per scrape. That is a visible change to the data,
+		// and it is the data being right rather than looking continuous.
+		age := scrapeStart.Sub(collectedAt)
 		for _, metric := range metrics {
+			if age > 0 {
+				metric = prometheus.NewMetricWithTimestamp(collectedAt, metric)
+			}
 			ch <- metric
 		}
 
+		// How old what this namespace served is. Zero while it is being
+		// collected every scrape, which is every namespace that does not set
+		// cache_seconds.
+		ch <- prometheus.MustNewConstMetric(
+			cacheAgeDesc(server), prometheus.GaugeValue, age.Seconds(), namespace)
+
 		if scrapeMetric {
-			// Only cache if metric is meaningfully cacheable
-			if mapping.cacheSeconds > 0 {
+			// A failed query is not an answer, so it is not cached. Caching it
+			// would publish the failure as an empty namespace for the whole
+			// cache lifetime, and the retry would not happen until it expired:
+			// one slow moment on the server blanked a namespace for a minute
+			// and reported no error after the first scrape.
+			if mapping.cacheSeconds > 0 && err == nil {
 				server.cacheMtx.Lock()
 				server.metricCache[namespace] = cachedMetrics{
 					metrics:    metrics,
@@ -268,4 +297,18 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 	}
 
 	return namespaceErrors
+}
+
+// cacheAgeDesc describes the age of the samples a namespace served.
+//
+// Built per server because the constant labels are the server's. The legacy
+// engine builds descriptors per scrape throughout, so this is in keeping with
+// its surroundings rather than a new cost.
+func cacheAgeDesc(server *Server) *prometheus.Desc {
+	return prometheus.NewDesc(
+		"pg_exporter_namespace_cache_age_seconds",
+		"Age in seconds of the samples this namespace served. Zero means they were collected during this scrape. A positive value means they came from the cache that cache_seconds configures, and those samples carry the time they were collected rather than the time of this scrape.",
+		[]string{"namespace"},
+		server.labels,
+	)
 }
