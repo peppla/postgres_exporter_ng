@@ -146,7 +146,7 @@ func TestEveryMetricHasExactlyOneValueType(t *testing.T) {
 		switch len(d.Types) {
 		case 1:
 		case 0:
-			t.Errorf("%s (%s:%d) is defined but the inventory cannot see it emitted: it is published through something readMetricInventory does not follow",
+			t.Errorf("%s (%s:%d) is defined but the inventory cannot see where it is emitted. Pass the descriptor as a named variable to MustNewConstMetric or to a local emit(desc, vtype, value), rather than through a struct field or a table of descriptors, which cannot be followed by reading the source",
 				d.Name, d.File, d.Line)
 		default:
 			t.Errorf("%s is emitted as %v, so its type depends on which code path produced it", d.Name, d.Types)

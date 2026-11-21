@@ -64,6 +64,16 @@ var (
 		[]string{"slot_name", "plugin", "slot_type"}, nil,
 	)
 
+	pgReplicationSlotRestartLsnDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(
+			namespace,
+			replicationSlotSubsystem,
+			"slot_restart_lsn",
+		),
+		"The oldest write-ahead log position this slot still needs, as a byte offset from the start of the log. The distance from the server's current position is how much log the slot is holding on disk.",
+		[]string{"slot_name", "plugin", "slot_type"}, nil,
+	)
+
 	pgReplicationSlotQuery = `SELECT
 		slot_name,
 		plugin,
@@ -74,6 +84,7 @@ var (
 		    pg_current_wal_lsn() - '0/0'
 		END AS current_wal_lsn,
 		COALESCE(confirmed_flush_lsn, '0/0') - '0/0' AS confirmed_flush_lsn,
+		restart_lsn - '0/0' AS restart_lsn,
 		active
 	FROM pg_replication_slots;`
 )
@@ -93,8 +104,9 @@ func (PGReplicationSlotCollector) Update(ctx context.Context, instance *instance
 		var slotType sql.NullString
 		var walLSN sql.NullFloat64
 		var flushLSN sql.NullFloat64
+		var restartLSN sql.NullFloat64
 		var isActive sql.NullBool
-		if err := rows.Scan(&slotName, &plugin, &slotType, &walLSN, &flushLSN, &isActive); err != nil {
+		if err := rows.Scan(&slotName, &plugin, &slotType, &walLSN, &flushLSN, &restartLSN, &isActive); err != nil {
 			return err
 		}
 
@@ -123,6 +135,16 @@ func (PGReplicationSlotCollector) Update(ctx context.Context, instance *instance
 			pgReplicationSlotCurrentWalDesc,
 			prometheus.GaugeValue, walLSNMetric, slotNameLabel, pluginLabel, slotTypeLabel,
 		)
+
+		// Published whether or not the slot is active, unlike the flush
+		// position below. An inactive slot is exactly the case where this
+		// matters, because it is still holding log that nothing will confirm.
+		if restartLSN.Valid {
+			ch <- prometheus.MustNewConstMetric(
+				pgReplicationSlotRestartLsnDesc,
+				prometheus.GaugeValue, restartLSN.Float64, slotNameLabel, pluginLabel, slotTypeLabel,
+			)
+		}
 		if isActive.Valid && isActive.Bool {
 			var flushLSNMetric float64
 			if flushLSN.Valid {

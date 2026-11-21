@@ -1,12 +1,17 @@
 # Migration mapping
 
-Which built-in collector replaces which shipped query file, and what is lost or
-doubled on the way.
+Which built-in collector replaces which shipped query file, and what is left to
+write before each file can go.
 
-The exporter has two metric engines behind one `/metrics`. Built-in monitoring
-is the Go collectors catalogued in [metric-catalog.md](metric-catalog.md). The
-other engine runs query files, and the files PMM ships cover ground the Go
-collectors also cover.
+The target is that the query engine collects no built-in metric at all. Built-in
+monitoring is the Go collectors catalogued in
+[metric-catalog.md](metric-catalog.md), and the query engine exists for
+application queries an operator writes. A shipped query file that produces
+monitoring is built-in monitoring depending on configuration that can be edited
+or deleted, which is what the contract's §4.0 settled against.
+
+So nothing below is a verdict that a file should stay. Where a file cannot be
+retired, this says what has to be written first.
 
 `collector/metric_migration_test.go` checks this file against those query
 files, so a namespace added to one of them cannot stay undocumented here.
@@ -34,6 +39,31 @@ the truth unless it pins `server`.
 
 Nine more families are published **twice under two names**. A query cannot
 match both at once, so a dashboard uses one and silently ignores the other.
+
+The collectors written to replace the high-resolution file use canonical names
+rather than the `pg_custom_` ones, because a built-in metric should not be
+named custom. That is a rename for anything reading them, listed below with
+the others. If dashboard continuity matters more than the names, this is the
+decision to overturn, and it is cheaper to overturn now than later.
+
+```
+pg_custom_stat_replication_write_lsn_bytes      ->  pg_stat_replication_write_lsn_bytes
+pg_custom_stat_replication_flush_lsn_bytes      ->  pg_stat_replication_flush_lsn_bytes
+pg_custom_stat_replication_replay_lsn_bytes     ->  pg_stat_replication_replay_lsn_bytes
+pg_custom_stat_replication_write_lag_seconds    ->  pg_stat_replication_write_lag_seconds
+pg_custom_stat_replication_flush_lag_seconds    ->  pg_stat_replication_flush_lag_seconds
+pg_custom_stat_replication_replay_lag_seconds   ->  pg_stat_replication_replay_lag_seconds
+pg_custom_stat_subscription_last_msg_send_time  ->  pg_stat_subscription_last_msg_send_time_seconds
+pg_custom_stat_subscription_last_msg_receipt_time -> pg_stat_subscription_last_msg_receipt_time_seconds
+pg_custom_publication_puballtables              ->  pg_publication_puballtables
+pg_custom_publication_pubinsert                 ->  pg_publication_pubinsert
+pg_custom_publication_pubupdate                 ->  pg_publication_pubupdate
+pg_custom_publication_pubdelete                 ->  pg_publication_pubdelete
+pg_custom_stat_activity_walsender_backend_start_unix -> pg_stat_activity_walsender_backend_start_seconds
+pg_custom_replication_slots_restart_lsn_bytes   ->  pg_replication_slot_slot_restart_lsn
+pg_custom_replication_slots_active              ->  pg_replication_slot_slot_is_active
+pg_custom_replication_slots_confirmed_flush_lsn_bytes -> pg_replication_slot_slot_confirmed_flush_lsn
+```
 
 ```
 pg_statio_user_tables_heap_blks_hit    ->  pg_statio_user_tables_heap_blocks_hit
@@ -81,18 +111,35 @@ would be the retirement doing exactly what stage 4 says not to do.
 
 | namespace | replacement | status |
 | --- | --- | --- |
-| `pg_custom_replication_slots` | the `replication_slot` collector | partly covered. The built-in publishes the current and confirmed-flush positions and whether the slot is active; the query file also publishes `restart_lsn` |
-| `pg_custom_stat_wal_receiver` | the `stat_wal_receiver` collector | partly covered, and the built-in ships disabled. The query file also publishes the receiver's lag in bytes and in seconds, which the built-in does not compute |
-| `pg_custom_stat_replication` | none | not covered. No Go collector reads `pg_stat_replication`, so a primary's view of its standbys exists only here |
-| `pg_custom_stat_activity_walsender` | none | not covered |
-| `pg_custom_stat_subscription` | none | not covered. Logical replication subscriptions exist only here |
-| `pg_custom_publication` | none | not covered |
+| `pg_custom_replication_slots` | the `replication_slot` collector | nearly covered. `restart_lsn` is published now. The built-in publishes the confirmed-flush position only for an active slot, while the query file publishes it always |
+| `pg_custom_stat_wal_receiver` | the `stat_wal_receiver` collector | partly covered, and the built-in ships disabled. The query file also publishes `written_lsn`, the lag in bytes and the lag in seconds, which the built-in does not compute |
+| `pg_custom_stat_replication` | the `stat_replication` collector | covered |
+| `pg_custom_stat_activity_walsender` | the `stat_activity_walsender` collector | covered |
+| `pg_custom_stat_subscription` | the `stat_subscription` collector | covered, and one of its metrics works for the first time |
+| `pg_custom_publication` | the `publication` collector | covered, and across every selected database rather than the connected one alone |
 
-This file must not be retired. Four of its six namespaces have no built-in
-equivalent at all, and the two that do are covered only in part. Replacing it
-means writing collectors for `pg_stat_replication`, `pg_stat_subscription` and
-`pg_publication` first, and adding `restart_lsn` and the receiver lag
-calculations to the collectors that exist.
+Four of the six are covered by collectors written for this. Three things are
+left before the file can go.
+
+The `stat_wal_receiver` collector needs `written_lsn`, the lag in bytes and the
+lag in seconds. The lag calculations are the ones that matter, since they are
+what an operator reads, and the built-in collector publishes positions without
+differencing them.
+
+The `replication_slot` collector publishes the confirmed-flush position only
+when the slot is active. An inactive slot is where that number matters, since
+it is the one holding log that nothing will confirm, so this has to become
+unconditional.
+
+Both `stat_wal_receiver` and `postmaster` ship disabled, so enabling them is
+part of the same change rather than a separate decision.
+
+`pg_custom_stat_subscription_received_lsn` has never been published. The file
+selects `received_lsn` without converting it, and a `pg_lsn` reaches the query
+engine as the string `0/1FDF5FA0`, which it cannot parse into a number. It logs
+one line at info level and publishes nothing. Measured against PostgreSQL 18
+rather than read off the code. The collector converts it in SQL, so
+`pg_stat_subscription_received_lsn_bytes` is a metric that exists.
 
 ## The legacy engine's own built-in maps
 
