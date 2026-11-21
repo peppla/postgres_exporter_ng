@@ -58,5 +58,11 @@ func sanitizeQuery(q string) string {
 	q = strings.ReplaceAll(q, "*", "\\*")
 	q = strings.ReplaceAll(q, "^", "\\^")
 	q = strings.ReplaceAll(q, "$", "\\$")
+	// + and | were missing until a query contained one. An unescaped + binds
+	// to the space before it, so "bigint + pg_" became "bigint", one or more
+	// spaces, "pg_", which matches nothing with a literal + in it. The failure
+	// reads as two identical-looking queries that do not match.
+	q = strings.ReplaceAll(q, "+", "\\+")
+	q = strings.ReplaceAll(q, "|", "\\|")
 	return q
 }
