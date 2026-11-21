@@ -438,9 +438,11 @@ Times here are milliseconds, which the names do not say.
 | `pg_stat_user_tables_n_tup_upd` | counter | rows | 15-19 | Rows updated. |
 | `pg_stat_user_tables_n_tup_del` | counter | rows | 15-19 | Rows deleted. |
 | `pg_stat_user_tables_n_tup_hot_upd` | counter | rows | 15-19 | Rows updated without needing an index update. |
+| `pg_stat_user_tables_n_tup_newpage_upd` | counter | rows | 16-19 | Rows whose update put the new version on a different heap page. |
 | `pg_stat_user_tables_n_live_tup` | gauge | rows | 15-19 | Estimated live rows. An estimate from the statistics collector, not a count. |
 | `pg_stat_user_tables_n_dead_tup` | gauge | rows | 15-19 | Estimated dead rows awaiting vacuum. |
 | `pg_stat_user_tables_n_mod_since_analyze` | gauge | rows | 15-19 | Estimated rows changed since the last analyze. What autovacuum compares against its analyze threshold. |
+| `pg_stat_user_tables_n_ins_since_vacuum` | gauge | rows | 15-19 | Estimated rows inserted since the last vacuum. A gauge because vacuum moves its reference point, not an insertion counter. |
 | `pg_stat_user_tables_last_vacuum` | gauge | seconds since the epoch | 15-19 | When the table was last vacuumed by hand. Zero when it never has been, which is also a valid timestamp in 1970. |
 | `pg_stat_user_tables_last_autovacuum` | gauge | seconds since the epoch | 15-19 | When autovacuum last vacuumed it. |
 | `pg_stat_user_tables_last_analyze` | gauge | seconds since the epoch | 15-19 | When the table was last analyzed by hand. |
@@ -454,13 +456,12 @@ Times here are milliseconds, which the names do not say.
 | `pg_stat_user_tables_total_analyze_time` | counter | milliseconds | 18-19 | Time spent analyzing it by hand. |
 | `pg_stat_user_tables_total_autoanalyze_time` | counter | milliseconds | 18-19 | Time autovacuum spent analyzing it. |
 | `pg_stat_user_tables_size_bytes` | gauge | bytes | 15-19 | Total disk space for the table including indexes and TOAST, from `pg_total_relation_size()`. |
-
-Eight more metrics in this family arrive with the `pg_class` rewrite that is
-still in review: `n_tup_newpage_upd`, `n_ins_since_vacuum`, `relpages`,
-`reltuples`, `relallvisible`, `relallfrozen`, `relfrozenxid_age` and
-`relminmxid_age`. They are left out until that merges, because this file
-describes what is published and the test above enforces that in both
-directions.
+| `pg_stat_user_tables_relpages` | gauge | pages | 15-19 | The planner's estimate of the table's size in pages. An estimate, not a measurement. |
+| `pg_stat_user_tables_reltuples` | gauge | rows | 15-19 | The planner's estimate of live rows. -1 means the table has never been analyzed, and that value is published rather than flattened to zero. |
+| `pg_stat_user_tables_relallvisible` | gauge | pages | 15-19 | Pages marked all-visible. The gap from `relpages` is what an index-only scan cannot skip. |
+| `pg_stat_user_tables_relallfrozen` | gauge | pages | 18-19 | Pages marked all-frozen. |
+| `pg_stat_user_tables_relfrozenxid_age` | gauge | transactions | 15-19 | Transactions since this relation's oldest unfrozen transaction ID. An invalid zero ID becomes zero here, including for partitioned parents, and a zero therefore does not mean a freshly frozen relation. |
+| `pg_stat_user_tables_relminmxid_age` | gauge | multixacts | 15-19 | Multixacts since this relation's oldest multixact ID, with the same zero caveat. |
 
 ## stat_wal_receiver
 
