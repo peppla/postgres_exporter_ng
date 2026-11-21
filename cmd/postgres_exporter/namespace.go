@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
 	"github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
@@ -199,19 +198,27 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 	for namespace, mapping := range server.metricMap {
 		level.Debug(logger).Log("msg", "Querying namespace", "namespace", namespace)
 
-		if mapping.master && !server.master {
-			level.Debug(logger).Log("msg", "Query skipped...")
+		// Where this query runs. master: true means the configured connection
+		// database and only it, whatever the databases list says. An absent
+		// list means every database the engine reaches, which is why built-in
+		// namespaces, whose list is always absent, behave exactly as before.
+		if !mapping.databases.runsOn(server.datname, mapping.master, server.master) {
+			level.Debug(logger).Log("msg", "Query skipped for this database",
+				"namespace", namespace, "datname", server.datname)
 			continue
 		}
 
-		// check if the query is to be run on specific database server version range or not
-		if len(server.runonserver) > 0 {
-			serVersion, _ := semver.Parse(server.lastMapVersion.String())
-			runServerRange, _ := semver.ParseRange(server.runonserver)
-			if !runServerRange(serVersion) {
-				level.Debug(logger).Log("msg", "Query skipped for this database version", "version", server.lastMapVersion.String(), "target_version", server.runonserver)
-				continue
-			}
+		// A query can restrict itself to a range of PostgreSQL versions. The
+		// restriction belongs to the query, not to the server: a file holding
+		// one query for 16 and later and another for everything must run each
+		// where it applies. This used to read a server field that nothing
+		// assigned, so every query in a file shared one restriction, which was
+		// always empty.
+		if mapping.runOnServer != nil && !mapping.runOnServer(server.lastMapVersion) {
+			level.Debug(logger).Log("msg", "Query skipped for this database version",
+				"namespace", namespace, "version", server.lastMapVersion.String(),
+				"target_version", mapping.runOnServerRaw)
+			continue
 		}
 
 		scrapeMetric := false

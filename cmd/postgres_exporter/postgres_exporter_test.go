@@ -43,12 +43,12 @@ func (s *FunctionalSuite) SetUpSuite(c *C) {
 func (s *FunctionalSuite) TestSemanticVersionColumnDiscard(c *C) {
 	testMetricMap := map[string]intermediateMetricMap{
 		"test_namespace": {
-			map[string]ColumnMapping{
+			columnMappings: map[string]ColumnMapping{
 				"metric_which_stays":    {COUNTER, "This metric should not be eliminated", nil, nil},
 				"metric_which_discards": {COUNTER, "This metric should be forced to DISCARD", nil, nil},
 			},
-			true,
-			0,
+			master:       true,
+			cacheSeconds: 0,
 		},
 	}
 

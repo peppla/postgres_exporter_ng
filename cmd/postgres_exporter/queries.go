@@ -32,12 +32,13 @@ const (
 
 // UserQuery represents a user defined query, including support for Aurora, if needed
 type UserQuery struct {
-	Query        string    `yaml:"query"`         // Standard query
-	QueryAurora  string    `yaml:"query_aurora"`  // Aurora specific query
-	Metrics      []Mapping `yaml:"metrics"`       // Metrics to be collected
-	Master       bool      `yaml:"master"`        // Querying only for master database
-	CacheSeconds uint64    `yaml:"cache_seconds"` // Number of seconds to cache the namespace result metrics for.
-	RunOnServer  string    `yaml:"runonserver"`   // Querying to run on which server version
+	Query        string            `yaml:"query"`         // Standard query
+	QueryAurora  string            `yaml:"query_aurora"`  // Aurora specific query
+	Metrics      []Mapping         `yaml:"metrics"`       // Metrics to be collected
+	Master       bool              `yaml:"master"`        // Querying only for master database
+	Databases    queryDatabaseList `yaml:"databases"`     // Databases to run against; omitted means all
+	CacheSeconds uint64            `yaml:"cache_seconds"` // Number of seconds to cache the namespace result metrics for.
+	RunOnServer  string            `yaml:"runonserver"`   // Querying to run on which server version
 }
 
 // UserQueries represents a set of UserQuery objects
@@ -212,6 +213,9 @@ func parseUserQueries(content []byte, dist string) (map[string]intermediateMetri
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := rejectNullDatabases(content); err != nil {
+		return nil, nil, err
+	}
 
 	// Stores the loaded map representation
 	metricMaps := make(map[string]intermediateMetricMap)
@@ -242,9 +246,16 @@ func parseUserQueries(content []byte, dist string) (map[string]intermediateMetri
 		if !ok {
 			// Namespace for metric not found - add it.
 			newMetricMap := make(map[string]ColumnMapping)
+			runOnServer, err := parseRunOnServer(specs.RunOnServer)
+			if err != nil {
+				return nil, nil, fmt.Errorf("query %q: %w", metric, err)
+			}
 			metricMap = intermediateMetricMap{
 				columnMappings: newMetricMap,
 				master:         specs.Master,
+				databases:      specs.Databases,
+				runOnServer:    runOnServer,
+				runOnServerRaw: specs.RunOnServer,
 				cacheSeconds:   specs.CacheSeconds,
 			}
 			metricMaps[metric] = metricMap
@@ -376,4 +387,22 @@ func currentName(dbs []catalogDatabase) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// parseRunOnServer turns a query's runonserver field into a version range.
+//
+// It is parsed once, when the file loads, so an unparseable range stops the
+// file rather than producing a query that silently never matches. The field
+// was previously parsed at execution with the error discarded, and the value
+// it was compared against was never assigned, so the restriction did nothing
+// at all.
+func parseRunOnServer(raw string) (semver.Range, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	r, err := semver.ParseRange(raw)
+	if err != nil {
+		return nil, fmt.Errorf("runonserver %q is not a version range: %w", raw, err)
+	}
+	return r, nil
 }

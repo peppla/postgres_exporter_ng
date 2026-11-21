@@ -32,7 +32,10 @@ type Server struct {
 	distribution string
 	labels       prometheus.Labels
 	master       bool
-	runonserver  string
+	// datname is the database this connection is on, used to decide where an
+	// application query with its own databases list runs. Empty when it is
+	// not known, which the caller resolves before running those queries.
+	datname string
 
 	// Last version used to calculate metric map. If mismatch on scrape,
 	// then maps are recalculated.

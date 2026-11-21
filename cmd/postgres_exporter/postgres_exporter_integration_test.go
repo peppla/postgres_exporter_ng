@@ -304,9 +304,9 @@ func (s *IntegrationSuite) TestUnknownMetricParsingDoesntCrash(c *C) {
 	emptyMaps := make(map[string]intermediateMetricMap, 0)
 	for k := range exporter.builtinMetricMaps {
 		emptyMaps[k] = intermediateMetricMap{
-			map[string]ColumnMapping{},
-			true,
-			0,
+			columnMappings: map[string]ColumnMapping{},
+			master:         true,
+			cacheSeconds:   0,
 		}
 	}
 	exporter.builtinMetricMaps = emptyMaps
@@ -1454,4 +1454,377 @@ func (s *IntegrationSuite) TestExtensionsFanOutAcrossDatabases(c *C) {
 		Commentf("%s reports no installed version in the database that has it", ext))
 	c.Check(installedVersions[control], Equals, "",
 		Commentf("%s reports an installed version in a database that does not have it", ext))
+}
+
+// TestApplicationQueryDatabaseSelection drives the per-query databases rule
+// against a real server, which is where the contract says it has to be
+// proved rather than at parse time.
+//
+// Four queries in one file, against a server with more than one database:
+// one with no list, one naming a single database, one with an explicit empty
+// list, and one with master: true and a list that does not contain the
+// configured database.
+func (s *IntegrationSuite) TestApplicationQueryDatabaseSelection(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	catalog, err := queryDatabases(context.Background(), server)
+	c.Assert(err, IsNil)
+	control, found := currentName(catalog)
+	c.Assert(found, Equals, true)
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others) > 0, Equals, true,
+		Commentf("the fixture server has one database, so per-query selection cannot be exercised"))
+	other := others[0]
+
+	const fixture = `
+app_everywhere:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_one_database:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases:
+    - %s
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_no_databases:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases: []
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_master_only:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  master: true
+  databases:
+    - %s
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`
+	// The master query's list names a database that is not the configured
+	// one, so a list that could suppress or redirect a master query would
+	// show up here.
+	dir := writeQueryFile(c, "app.yaml", fmt.Sprintf(fixture, other, other))
+
+	exporter := NewExporter(
+		strings.Split(dsn, ",")[:1],
+		AutoDiscoverDatabases(true),
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+	)
+	c.Assert(exporter, NotNil)
+	families := gather(c, exporter)
+
+	where := func(metric string) []string {
+		f, ok := families[metric]
+		if !ok {
+			return nil
+		}
+		var names []string
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "datname" {
+					names = append(names, l.GetValue())
+				}
+			}
+		}
+		sort.Strings(names)
+		return names
+	}
+
+	// An omitted list means every database the engine reaches.
+	everywhere := where("app_everywhere_value")
+	c.Check(len(everywhere), Equals, len(catalog),
+		Commentf("a query with no databases list ran in %v, the server has %d connectable databases", everywhere, len(catalog)))
+
+	// A list of one means that one.
+	c.Check(where("app_one_database_value"), DeepEquals, []string{other},
+		Commentf("a query naming %q ran somewhere else", other))
+
+	// An explicit empty list means nowhere, which is the opposite of omitted
+	// and the distinction a plain slice cannot carry.
+	c.Check(where("app_no_databases_value"), IsNil,
+		Commentf("a query with databases: [] ran anyway"))
+
+	// master: true means the configured connection database and only it, even
+	// though the list names a different one.
+	c.Check(where("app_master_only_value"), DeepEquals, []string{control},
+		Commentf("a master query did not run on the configured database alone"))
+}
+
+// TestApplicationQueryDatabasesWithoutDiscovery covers the case the name
+// resolution exists for.
+//
+// With discovery on, every target already carries a database name and the
+// per-query list can be applied straight away. With discovery off there is one
+// target and no name, so a list would match nothing and an application query
+// restricted to the database it is actually pointed at would silently never
+// run. The exporter asks the server instead, once, and only when some loaded
+// query has a list to apply.
+func (s *IntegrationSuite) TestApplicationQueryDatabasesWithoutDiscovery(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	var control string
+	c.Assert(server.db.QueryRow(`SELECT current_database()`).Scan(&control), IsNil)
+
+	const fixture = `
+app_here:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases:
+    - %s
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_elsewhere:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  databases:
+    - a_database_that_does_not_exist
+  metrics:
+    - datname: {usage: "LABEL", description: "Database"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`
+	dir := writeQueryFile(c, "app.yaml", fmt.Sprintf(fixture, control))
+
+	// Discovery deliberately off: one target, and no name from the catalog.
+	exporter := NewExporter(
+		strings.Split(dsn, ",")[:1],
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+	)
+	c.Assert(exporter, NotNil)
+	families := gather(c, exporter)
+
+	_, here := families["app_here_value"]
+	c.Check(here, Equals, true,
+		Commentf("a query naming the database it is pointed at did not run, so the name was never resolved"))
+	_, elsewhere := families["app_elsewhere_value"]
+	c.Check(elsewhere, Equals, false,
+		Commentf("a query naming a database that does not exist ran anyway"))
+}
+
+// TestApplicationQueryNameLookupFailureIsNotSuccess is the regression for a
+// defect in the first version of per-query database selection.
+//
+// When the database name could not be resolved, the scrape logged a warning
+// and carried on with an empty name. Every query with a databases list then
+// matched nothing, so none of them ran, while the scrape returned no error and
+// coverage reported the database as covered. An unknown identity is not an
+// intentional non-match, and the two must not produce the same output.
+//
+// EXECUTE on pg_catalog.current_database() is revoked for the role, which is a
+// per-database privilege, so the connection, version detection and ordinary
+// queries all keep working and only the name lookup fails.
+func (s *IntegrationSuite) TestApplicationQueryNameLookupFailureIsNotSuccess(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "noname"
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	cleanup := func() {
+		_, _ = admin.db.Exec(`GRANT EXECUTE ON FUNCTION pg_catalog.current_database() TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM ` + role)
+	c.Assert(err, IsNil)
+
+	fixture := fmt.Sprintf(`
+app_lookup:
+  query: "SELECT 1::float8 AS value"
+  databases:
+    - %s
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+`, control)
+	dir := writeQueryFile(c, "app.yaml", fixture)
+
+	// Discovery off, so the name is not supplied by the catalog and has to be
+	// asked for.
+	exporter := NewExporter(
+		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + control + "?sslmode=disable"},
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+		DisableDefaultMetrics(true),
+		DisableSettingsMetrics(true),
+	)
+	c.Assert(exporter, NotNil)
+	families := gather(c, exporter)
+
+	count := func(name string) float64 {
+		f, ok := families[name]
+		c.Assert(ok, Equals, true, Commentf("%s was not published", name))
+		return f.GetMetric()[0].GetGauge().GetValue()
+	}
+	c.Check(count("pg_exporter_databases_scraped"), Equals, float64(0),
+		Commentf("the database was reported as covered although no restricted query could run"))
+	c.Check(count("pg_exporter_databases_failed"), Equals, float64(1))
+
+	_, ran := families["app_lookup_value"]
+	c.Check(ran, Equals, false,
+		Commentf("the fixture is wrong: the query ran, so the name lookup did not fail"))
+}
+
+// TestApplicationQueryWithoutListsNeedsNoName is the other half. A query file
+// whose queries all decide where they run without a database name must not
+// fail when that name cannot be resolved, and must not pay a round trip
+// asking for it.
+//
+// Two queries, with the lookup revoked. One omits databases, so it runs
+// everywhere. One writes an explicit empty list, so it runs nowhere. Neither
+// decision refers to a name, so the scrape must succeed and report the
+// database as covered.
+//
+// The empty list is the case that regressed. The lookup was demanded whenever
+// a list was present at all, so a file saying that a query runs nowhere
+// demanded a name on that query's behalf, and where the name could not be
+// read the whole scrape failed for a query that was never going to run.
+func (s *IntegrationSuite) TestApplicationQueryWithoutListsNeedsNoName(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "noname_nolist"
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	cleanup := func() {
+		_, _ = admin.db.Exec(`GRANT EXECUTE ON FUNCTION pg_catalog.current_database() TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM ` + role)
+	c.Assert(err, IsNil)
+
+	dir := writeQueryFile(c, "app.yaml", `
+app_unrestricted:
+  query: "SELECT 1::float8 AS value"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_nowhere:
+  query: "SELECT 1::float8 AS value"
+  databases: []
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+`)
+
+	exporter := NewExporter(
+		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + control + "?sslmode=disable"},
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+		DisableDefaultMetrics(true),
+		DisableSettingsMetrics(true),
+	)
+	families := gather(c, exporter)
+
+	_, ran := families["app_unrestricted_value"]
+	c.Check(ran, Equals, true,
+		Commentf("an unrestricted query did not run, so the name lookup was demanded when nothing needed it"))
+
+	_, ranNowhere := families["app_nowhere_value"]
+	c.Check(ranNowhere, Equals, false,
+		Commentf("a query with an explicit empty list ran somewhere"))
+
+	scraped, ok := families["pg_exporter_databases_scraped"]
+	c.Assert(ok, Equals, true, Commentf("pg_exporter_databases_scraped was not published"))
+	c.Check(scraped.GetMetric()[0].GetGauge().GetValue(), Equals, float64(1),
+		Commentf("the scrape failed although no query needed the database name"))
+}
+
+// TestApplicationQueryVersionRestriction covers per-query version gating,
+// which was parsed and then ignored.
+//
+// runonserver was read from a Server field that nothing ever assigned, and
+// compared against a version that was also never assigned, so every query in a
+// file shared one restriction and that restriction was always empty. A query
+// written for PostgreSQL 16 and later ran on 15, and one written for 13 only
+// ran on 19.
+//
+// Three queries against the running server: one restricted to a range that
+// includes it, one to a range that excludes it, and one unrestricted. The
+// excluded one must not run while the other two do, which is also what shows
+// the restriction belongs to the query rather than to the file.
+func (s *IntegrationSuite) TestApplicationQueryVersionRestriction(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	var major int
+	c.Assert(server.db.QueryRow(`SELECT current_setting('server_version_num')::int / 10000`).Scan(&major), IsNil)
+
+	fixture := fmt.Sprintf(`
+app_supported:
+  query: "SELECT 1::float8 AS value"
+  runonserver: ">=%d.0.0"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_unsupported:
+  query: "SELECT 1::float8 AS value"
+  runonserver: ">=%d.0.0"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+app_any_version:
+  query: "SELECT 1::float8 AS value"
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one"}
+`, major, major+10)
+	dir := writeQueryFile(c, "app.yaml", fixture)
+
+	exporter := NewExporter(
+		strings.Split(dsn, ",")[:1],
+		WithUserQueriesEnabled(LR),
+		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
+		DisableDefaultMetrics(true),
+		DisableSettingsMetrics(true),
+	)
+	families := gather(c, exporter)
+
+	_, supported := families["app_supported_value"]
+	c.Check(supported, Equals, true,
+		Commentf("a query restricted to >=%d did not run on PostgreSQL %d", major, major))
+
+	_, unsupported := families["app_unsupported_value"]
+	c.Check(unsupported, Equals, false,
+		Commentf("a query restricted to >=%d ran on PostgreSQL %d", major+10, major))
+
+	_, any := families["app_any_version_value"]
+	c.Check(any, Equals, true,
+		Commentf("an unrestricted query did not run, so one query's restriction reached another"))
 }
