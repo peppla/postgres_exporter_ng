@@ -26,6 +26,7 @@ package collector
 
 import (
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -159,4 +160,107 @@ func TestRenamedMetricsStillExistOnBothSides(t *testing.T) {
 			t.Errorf("the mapping sends readers of %s to %s, which no collector publishes", from, to)
 		}
 	}
+}
+
+const breakingChangesPath = "../docs/breaking-changes.md"
+
+// removalRow matches a row of the removal table: a metric that goes, and
+// either the metric that replaces it or a note that nothing does yet.
+var removalRow = regexp.MustCompile("(?m)^\\| `(pg_custom_[a-z0-9_]+)` \\| (?:`(pg_[a-z0-9_]+)`|([^|]+)) \\|")
+
+// TestBreakingChangesListEveryCustomMetric is what stops a metric
+// disappearing without anyone being told.
+//
+// Pep decided on 2026-11-21 that every pg_custom_ metric goes. Each one is
+// something a dashboard or an alert can be using, so each one needs a row
+// saying what replaces it. A metric still produced by a shipped query file and
+// missing from that table is a removal nobody has written down.
+func TestBreakingChangesListEveryCustomMetric(t *testing.T) {
+	content, err := os.ReadFile(breakingChangesPath)
+	if err != nil {
+		t.Fatalf("reading the breaking changes: %s", err)
+	}
+
+	listed := map[string]bool{}
+	for _, m := range removalRow.FindAllStringSubmatch(string(content), -1) {
+		listed[m[1]] = true
+	}
+	if len(listed) == 0 {
+		t.Fatal("no removals were found in the breaking changes, so this test proves nothing")
+	}
+
+	var produced int
+	for _, path := range shippedQueryFiles {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %s", path, err)
+		}
+		doc := map[string]queryFileNamespace{}
+		if err := yaml.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("parsing %s: %s", path, err)
+		}
+		for ns, body := range doc {
+			if !strings.HasPrefix(ns, "pg_custom_") {
+				continue
+			}
+			for _, entry := range body.Metrics {
+				for column, spec := range entry {
+					if spec.Usage == "LABEL" || spec.Usage == "DISCARD" {
+						continue
+					}
+					name := ns + "_" + column
+					produced++
+					if !listed[name] {
+						t.Errorf("%s produces %s, which the breaking changes do not list. Every pg_custom_ metric that goes needs a row saying what replaces it",
+							path, name)
+					}
+				}
+			}
+		}
+	}
+	if produced == 0 {
+		t.Error("no pg_custom_ metrics were found in the shipped query files. If they are all gone, this test and the table it checks can go too")
+	}
+}
+
+// TestBreakingChangeReplacementsExist checks the other half: a row that names
+// a replacement has to name one that is published.
+//
+// A table of renames pointing at metrics that do not exist is worse than no
+// table, because someone follows it and finds nothing. A row may say the
+// replacement is not written yet, which is a different and honest answer.
+func TestBreakingChangeReplacementsExist(t *testing.T) {
+	content, err := os.ReadFile(breakingChangesPath)
+	if err != nil {
+		t.Fatalf("reading the breaking changes: %s", err)
+	}
+
+	defs, err := readMetricInventory(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := map[string]bool{}
+	for _, d := range defs {
+		published[d.Name] = true
+	}
+
+	var named, pending int
+	for _, m := range removalRow.FindAllStringSubmatch(string(content), -1) {
+		removed, replacement, note := m[1], m[2], strings.TrimSpace(m[3])
+		if replacement == "" {
+			pending++
+			if note == "" {
+				t.Errorf("%s has an empty replacement cell: name a metric or say that none is written yet", removed)
+			}
+			continue
+		}
+		named++
+		if !published[replacement] {
+			t.Errorf("%s is listed as replaced by %s, which no collector publishes", removed, replacement)
+		}
+	}
+	if named == 0 {
+		t.Error("no replacements were named at all")
+	}
+	t.Logf("%d removals with a replacement, %d still to write", named, pending)
 }

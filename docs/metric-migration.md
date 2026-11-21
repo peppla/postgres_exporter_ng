@@ -100,39 +100,36 @@ so adding a database needs no configuration change.
 | namespace | replacement | status |
 | --- | --- | --- |
 | `pg_database` | the `database` collector | fully covered, and duplicated today |
-| `pg_postmaster` | the `postmaster` collector | covered, but the built-in collector ships disabled, so today only the query file publishes it |
+| `pg_postmaster` | the `postmaster` collector | covered, and the collector is enabled now |
 | `pg_replication` | the `replication` collector, as `pg_replication_lag_seconds` | covered under a different name |
 
-Retiring this file means enabling the `postmaster` collector in the same
-change. Nothing else publishes the server start time, and losing it silently
-would be the retirement doing exactly what stage 4 says not to do.
+Everything this file produces has a replacement that is switched on. It can be
+retired once the two renames below are agreed, since `pg_replication_lag` and
+`pg_custom_database_size_custom_bytes` are the only names that change.
 
 ## queries-hr.yml
 
 | namespace | replacement | status |
 | --- | --- | --- |
-| `pg_custom_replication_slots` | the `replication_slot` collector | nearly covered. `restart_lsn` is published now. The built-in publishes the confirmed-flush position only for an active slot, while the query file publishes it always |
-| `pg_custom_stat_wal_receiver` | the `stat_wal_receiver` collector | partly covered, and the built-in ships disabled. The query file also publishes `written_lsn`, the lag in bytes and the lag in seconds, which the built-in does not compute |
+| `pg_custom_replication_slots` | the `replication_slot` collector | covered. `restart_lsn` is published, and the confirmed-flush position is published for inactive slots too |
+| `pg_custom_stat_wal_receiver` | the `stat_wal_receiver` collector | partly covered. The query file also publishes `written_lsn`, the lag in bytes and the lag in seconds, which the built-in does not compute |
 | `pg_custom_stat_replication` | the `stat_replication` collector | covered |
 | `pg_custom_stat_activity_walsender` | the `stat_activity_walsender` collector | covered |
 | `pg_custom_stat_subscription` | the `stat_subscription` collector | covered, and one of its metrics works for the first time |
 | `pg_custom_publication` | the `publication` collector | covered, and across every selected database rather than the connected one alone |
 
-Four of the six are covered by collectors written for this. Three things are
-left before the file can go.
+Five of the six are covered by collectors written for this. One thing is left
+before the file can go.
 
-The `stat_wal_receiver` collector needs `written_lsn`, the lag in bytes and the
-lag in seconds. The lag calculations are the ones that matter, since they are
+The `stat_wal_receiver` collector needs `written_lsn`, the lag in bytes and
+the lag in seconds. The lag figures are the ones that matter, since they are
 what an operator reads, and the built-in collector publishes positions without
-differencing them.
+differencing them. That change touches the same query as an open correction to
+the collector's column order, so it waits for that to land rather than being
+written twice.
 
-The `replication_slot` collector publishes the confirmed-flush position only
-when the slot is active. An inactive slot is where that number matters, since
-it is the one holding log that nothing will confirm, so this has to become
-unconditional.
-
-Both `stat_wal_receiver` and `postmaster` ship disabled, so enabling them is
-part of the same change rather than a separate decision.
+`stat_wal_receiver` and `postmaster` shipped disabled and are enabled now. A
+replacement that is off is not a replacement.
 
 `pg_custom_stat_subscription_received_lsn` has never been published. The file
 selects `received_lsn` without converting it, and a `pg_lsn` reaches the query

@@ -145,16 +145,26 @@ func (PGReplicationSlotCollector) Update(ctx context.Context, instance *instance
 				prometheus.GaugeValue, restartLSN.Float64, slotNameLabel, pluginLabel, slotTypeLabel,
 			)
 		}
-		if isActive.Valid && isActive.Bool {
-			var flushLSNMetric float64
-			if flushLSN.Valid {
-				flushLSNMetric = flushLSN.Float64
-			}
-			ch <- prometheus.MustNewConstMetric(
-				pgReplicationSlotCurrentFlushDesc,
-				prometheus.GaugeValue, flushLSNMetric, slotNameLabel, pluginLabel, slotTypeLabel,
-			)
+		// Published whether or not the slot is active. It used to be published
+		// only for an active slot, which left out the case an operator cares
+		// about: an inactive slot whose consumer has gone away is the one
+		// holding write-ahead log that nothing will confirm, and the distance
+		// between this and the server's current position is how much.
+		//
+		// A physical slot has no confirmed flush position at all, and the
+		// query turns that NULL into zero. Zero there reads as a consumer that
+		// has confirmed nothing rather than as a slot the column does not
+		// apply to. That is recorded in the catalogue rather than changed
+		// here, because it is a separate decision from publishing the value
+		// for inactive slots.
+		var flushLSNMetric float64
+		if flushLSN.Valid {
+			flushLSNMetric = flushLSN.Float64
 		}
+		ch <- prometheus.MustNewConstMetric(
+			pgReplicationSlotCurrentFlushDesc,
+			prometheus.GaugeValue, flushLSNMetric, slotNameLabel, pluginLabel, slotTypeLabel,
+		)
 		ch <- prometheus.MustNewConstMetric(
 			pgReplicationSlotIsActiveDesc,
 			prometheus.GaugeValue, isActiveValue, slotNameLabel, pluginLabel, slotTypeLabel,

@@ -749,6 +749,12 @@ author has to check each family.
 
 `pg_stat_io_reueses_total` is a misspelling of `reuses`.
 
+`pg_replication_slot_slot_confirmed_flush_lsn` is zero for a physical slot,
+which has no confirmed flush position. The query coalesces the NULL away, so a
+column that does not apply reads as a consumer that has confirmed nothing. The
+contract asks for missing and zero to stay distinguishable and here they do
+not.
+
 Three label sets are unbounded, and nothing in the exposition says so.
 `pg_stat_statements` mints a series per statement shape per user per database,
 `pg_process_idle_seconds` mints one per `application_name` that any client

@@ -91,6 +91,10 @@ func TestPgReplicationSlotCollectorInActive(t *testing.T) {
 	expected := []MetricResult{
 		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 6, metricType: dto.MetricType_GAUGE},
 		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 4, metricType: dto.MetricType_GAUGE},
+		// The confirmed flush position, now published for an inactive slot
+		// too. That is the slot holding log nothing will confirm, which is
+		// the case worth seeing.
+		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 12, metricType: dto.MetricType_GAUGE},
 		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 0, metricType: dto.MetricType_GAUGE},
 	}
 
@@ -133,6 +137,10 @@ func TestPgReplicationSlotCollectorActiveNil(t *testing.T) {
 	expected := []MetricResult{
 		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 6, metricType: dto.MetricType_GAUGE},
 		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 4, metricType: dto.MetricType_GAUGE},
+		// The confirmed flush position, now published for an inactive slot
+		// too. That is the slot holding log nothing will confirm, which is
+		// the case worth seeing.
+		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 12, metricType: dto.MetricType_GAUGE},
 		{labels: labelMap{"slot_name": "test_slot", "plugin": "test_decoding", "slot_type": "physical"}, value: 0, metricType: dto.MetricType_GAUGE},
 	}
 
