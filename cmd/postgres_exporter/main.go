@@ -127,10 +127,16 @@ func main() {
 		return
 	}
 
-	// Load the config file if specified, otherwise use default/DSN settings
+	// Load the config file if specified, otherwise use default/DSN settings.
+	//
+	// A file that was named and could not be read is fatal. It used to be a
+	// warning, after which the exporter ran on defaults: with limits in the
+	// file, that means an operator who tightened a budget and mistyped a key
+	// gets the default budget, with one warning line to say so.
 	if *configFile != "" {
 		if err := c.ReloadConfig(*configFile, logger); err != nil {
-			level.Warn(logger).Log("msg", "Error loading config", "err", err)
+			level.Error(logger).Log("msg", "Error loading config", "err", err)
+			os.Exit(1)
 		}
 	} else {
 		level.Debug(logger).Log("msg", "No config file provided, using default/DSN settings")
@@ -163,8 +169,25 @@ func main() {
 		"version":          versionCollector,
 	}
 
-	connSema := semaphore.NewWeighted(*maxConnections)
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors))
+	// The operational budget, from the configuration file and the one flag
+	// that overlaps it. Validated here so a budget that cannot be satisfied
+	// stops the exporter starting rather than producing scrapes that fail for
+	// a reason nobody connects to the configuration.
+	limits, err := resolveLimits(c.GetConfig(), maxConnectionsSet, *maxConnections)
+	if err != nil {
+		level.Error(logger).Log("msg", "Invalid limits", "err", err.Error())
+		os.Exit(1)
+	}
+	level.Info(logger).Log("msg", "Operational budget",
+		"connections", limits.Connections,
+		"concurrent_requests", limits.ConcurrentRequests,
+		"request_timeout", limits.RequestTimeout,
+		"max_request_timeout", limits.MaxRequestTimeout,
+		"response_reserve_max", limits.ResponseReserveMax,
+		"response_reserve_fraction", limits.ResponseReserveFraction)
+
+	connSema := semaphore.NewWeighted(limits.Connections)
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits))
 
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{

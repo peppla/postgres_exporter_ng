@@ -17,6 +17,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/collector"
+	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -39,20 +41,52 @@ var (
 	collectCustomQueryMrDirectory = kingpin.Flag("collect.custom_query.mr.directory", "Path to custom queries with medium resolution directory.").Envar("PG_EXPORTER_EXTEND_QUERY_MR_PATH").String()
 	collectCustomQueryHrDirectory = kingpin.Flag("collect.custom_query.hr.directory", "Path to custom queries with high resolution directory.").Envar("PG_EXPORTER_EXTEND_QUERY_HR_PATH").String()
 
-	maxConnections = kingpin.Flag("max-connections", "Maximum number of connections to use").Default("5").Envar("PG_EXPORTER_MAX_CONNECTIONS").Int64()
+	// maxConnectionsSet says whether the operator passed the flag at all,
+	// which its value cannot: the default is a real number and someone
+	// passing that number explicitly still said it.
+	maxConnectionsSet bool
+	maxConnections    = kingpin.Flag("max-connections", "Maximum number of connections to use (DEPRECATED: use limits.connections)").Default("5").Envar("PG_EXPORTER_MAX_CONNECTIONS").IsSetByUser(&maxConnectionsSet).Int64()
 )
 
 // Handler returns a http.Handler that serves metrics. Can be used instead of
 // run for hooking up custom HTTP servers.
-func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector) http.Handler {
+//
+// limits is the budget one scrape may spend. The request gate is built once,
+// here, rather than per request: it is a limit on how many collections run at
+// the same time, so it has to be the same object across them.
+func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits) http.Handler {
+	requestGate := semaphore.NewWeighted(limits.ConcurrentRequests)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seconds, err := strconv.Atoi(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"))
-		// To support also older ones vmagents.
-		if err != nil {
-			seconds = 10
+		// Refused before any SQL runs, and not queued. A queue turns an
+		// overloaded exporter into a slow one, and the scrapes waiting in it
+		// are already late by the time they reach a database.
+		if !requestGate.TryAcquire(1) {
+			http.Error(w,
+				fmt.Sprintf("%d collections already in flight", limits.ConcurrentRequests),
+				http.StatusServiceUnavailable)
+			return
+		}
+		defer requestGate.Release(1)
+
+		// What the scraper asked for, if it said. Older vmagents send no
+		// header, which is the fallback rather than an error.
+		var asked time.Duration
+		if seconds, err := strconv.Atoi(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds")); err == nil {
+			asked = time.Duration(seconds) * time.Second
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(seconds)*time.Second)
+		// Whatever is left of a deadline already on the request can only
+		// shorten the budget.
+		var parentRemaining time.Duration
+		if deadline, ok := r.Context().Deadline(); ok {
+			parentRemaining = time.Until(deadline)
+		}
+
+		// Collection stops before the reserve, which is what pays for
+		// gathering, encoding and writing the response. A scrape that
+		// collected everything and could not send it is a failed scrape.
+		ctx, cancel := context.WithTimeout(r.Context(), limits.CollectionBudget(asked, parentRemaining))
 		defer cancel()
 
 		filters := r.URL.Query()["collect[]"]
@@ -84,7 +118,7 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 			}
 		}
 
-		registry := makeRegistry(ctx, dsns, connSema, globalCollectors, f)
+		registry := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits)
 
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
 		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
@@ -110,8 +144,18 @@ type Filters struct {
 }
 
 // makeRegistry creates a new prometheus registry with default and percona exporters.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters) *prometheus.Registry {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits) *prometheus.Registry {
 	registry := prometheus.NewRegistry()
+
+	// Every connection this scrape opens gets a bound on how long it may take
+	// to establish, shortened by whatever is left of the collection budget.
+	// Done once here, for both engines, because the per-database connection
+	// strings are derived from these and keep their parameters.
+	remaining := time.Duration(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline)
+	}
+	dsns = withConnectTimeout(dsns, limits.ConnectTimeoutFor(remaining))
 
 	excludedDatabases := strings.Split(*excludeDatabases, ",")
 	logger.Log("msg", "Excluded databases", "databases", fmt.Sprintf("%v", excludedDatabases))
@@ -291,4 +335,24 @@ func (e *Exporter) addCustomQueriesFromFile(path string, version semver.Version,
 
 	// Mark user queries as successfully loaded
 	e.userQueriesError.WithLabelValues(path, hashsumStr).Set(0)
+}
+
+// withConnectTimeout bounds how long each connection string may spend being
+// established.
+//
+// A string that cannot be parsed is passed through unchanged. Refusing it here
+// would turn a connection error, which the scrape reports per target, into a
+// scrape that produces nothing, and the parse failure will be reported by
+// whichever engine tries to use it.
+func withConnectTimeout(dsns []string, timeout time.Duration) []string {
+	out := make([]string, len(dsns))
+	for i, dsn := range dsns {
+		bounded, err := config.DSNWithConnectTimeout(dsn, timeout)
+		if err != nil {
+			out[i] = dsn
+			continue
+		}
+		out[i] = bounded
+	}
+	return out
 }
