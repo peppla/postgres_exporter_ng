@@ -100,6 +100,59 @@ auth_modules:
       sslmode: disable
 ```
 
+### limits
+
+This section bounds what one scrape may cost. Every key is optional and takes
+the default below when left out.
+
+```yaml
+limits:
+  connections: 5
+  concurrent_requests: 4
+  request_timeout: 10s
+  max_request_timeout: 60s
+  connect_timeout: 3s
+  response_reserve:
+    max: 1s
+    fraction: 0.1
+```
+
+| key | default | what it bounds | takes effect |
+| --- | --- | --- | --- |
+| `connections` | 5 | open PostgreSQL connections held by the process, across both engines, counting idle pooled ones | restart |
+| `concurrent_requests` | 4 | collection requests in flight; beyond it a request gets 503 before any SQL runs | restart |
+| `request_timeout` | 10s | the budget for a scrape that sends no timeout header | restart |
+| `max_request_timeout` | 60s | the cap, however long a scraper asks for | restart |
+| `connect_timeout` | 3s | one attempt to establish a connection, shortened by what is left of the scrape's budget | restart |
+| `response_reserve.max` | 1s | the most of a budget kept back for producing the response | restart |
+| `response_reserve.fraction` | 0.1 | the share of a budget kept back, when that is less than the cap | restart |
+
+These are starting values, not measured operating limits. What a scrape costs
+the exporter has been measured; what it costs the monitored server has been
+measured for one collector on one shape.
+
+The budget of a scrape is the shortest of what the scraper asked for,
+`max_request_timeout`, and whatever is left of a deadline already on the
+request. Nothing lengthens it. Collection then stops a reserve before the end,
+so a scrape that collected everything still has time to send it. The reserve is
+the smaller of `response_reserve.max` and `response_reserve.fraction` of the
+budget, which keeps a short scrape from reserving most of itself.
+
+`connect_timeout` is not a convenience. The driver waits indefinitely without
+one, and the deadline on a scrape does not reach its dial or its startup
+handshake, so a server that accepts a connection and then says nothing would
+hold a scrape open past every other limit here.
+
+Values and the relationships between them are checked at startup, so a budget
+that cannot be satisfied stops the exporter rather than producing scrapes that
+fail for a reason nobody connects to the configuration. There is no cap on how
+many databases are monitored and no silent truncation of samples. Selection is
+what limits the set, in `monitoring.databases`.
+
+`--max-connections` sets the same number as `limits.connections`. It is
+deprecated, and setting both is refused at startup rather than resolved by a
+precedence rule.
+
 ## Building and running
 
     git clone https://github.com/percona/postgres_exporter.git

@@ -17,7 +17,9 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -309,4 +311,50 @@ func DatabaseFromDSN(in string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// DSNWithConnectTimeout returns the connection string with a connect_timeout
+// no longer than d.
+//
+// Without one, lib/pq waits indefinitely. Its own documentation says zero or
+// unspecified means wait forever, and that is not only about the TCP connect:
+// a server that accepts a connection and then says nothing holds the attempt
+// open through the startup handshake. Measured against a listener that accepts
+// and never answers, a scrape with a ten-second deadline did not return at
+// all, because the context a caller passes to PingContext or QueryContext does
+// not reach pq's dial or its startup. connect_timeout is what pq honours
+// there: it bounds the dial and sets a deadline across the handshake.
+//
+// A connect_timeout already in the string is kept when it is shorter. The
+// budget is a ceiling, so an operator may ask for less and may not ask for
+// more.
+//
+// pq reads the value in whole seconds, and zero means wait forever, so a
+// budget under a second becomes one second rather than rounding down into no
+// timeout at all. That lets a connection outlive a very short budget by under
+// a second, which is the price of not reintroducing the unbounded wait.
+func DSNWithConnectTimeout(in string, d time.Duration) (string, error) {
+	if d <= 0 {
+		return in, nil
+	}
+	parsed, err := dsnFromString(in)
+	if err != nil {
+		return "", err
+	}
+
+	seconds := int(d / time.Second)
+	if d%time.Second != 0 || seconds == 0 {
+		seconds++
+	}
+
+	if parsed.query == nil {
+		parsed.query = url.Values{}
+	}
+	if existing := parsed.query.Get("connect_timeout"); existing != "" {
+		if n, err := strconv.Atoi(existing); err == nil && n > 0 && n < seconds {
+			return parsed.GetConnectionString(), nil
+		}
+	}
+	parsed.query.Set("connect_timeout", strconv.Itoa(seconds))
+	return parsed.GetConnectionString(), nil
 }
