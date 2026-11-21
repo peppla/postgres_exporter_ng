@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	stdlog "log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,11 +70,18 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		}
 		defer requestGate.Release(1)
 
-		// What the scraper asked for, if it said. Older vmagents send no
-		// header, which is the fallback rather than an error.
-		var asked time.Duration
-		if seconds, err := strconv.Atoi(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds")); err == nil {
-			asked = time.Duration(seconds) * time.Second
+		// What the scraper asked for, if it said. Prometheus sends this as a
+		// decimal, so 0.25 is a quarter of a second and reading it as a whole
+		// number threw away everything a scraper with a sub-second budget
+		// asked for and used the ten-second fallback instead.
+		//
+		// A header that is present and unusable is refused rather than
+		// ignored. Falling back silently gives a scraper a budget it did not
+		// ask for, which is how a 250ms request ran for two seconds.
+		asked, err := requestedTimeout(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 
 		// Whatever is left of a deadline already on the request can only
@@ -355,4 +363,27 @@ func withConnectTimeout(dsns []string, timeout time.Duration) []string {
 		out[i] = bounded
 	}
 	return out
+}
+
+// requestedTimeout reads the scrape timeout header.
+//
+// An absent header is not an error: older agents send none, and the configured
+// fallback is for them. Anything else has to be a positive, finite number of
+// seconds, because the alternative is treating a malformed value as absent and
+// handing out a budget nobody asked for.
+func requestedTimeout(header string) (time.Duration, error) {
+	if header == "" {
+		return 0, nil
+	}
+	seconds, err := strconv.ParseFloat(header, 64)
+	if err != nil {
+		return 0, fmt.Errorf("X-Prometheus-Scrape-Timeout-Seconds %q is not a number", header)
+	}
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, fmt.Errorf("X-Prometheus-Scrape-Timeout-Seconds %q is not a finite number", header)
+	}
+	if seconds <= 0 {
+		return 0, fmt.Errorf("X-Prometheus-Scrape-Timeout-Seconds %q is not positive", header)
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }

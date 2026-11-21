@@ -272,7 +272,7 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 		server.datname = name
 	}
 
-	return server.Scrape(ch, e.disableSettingsMetrics)
+	return server.Scrape(e.ctx, ch, e.disableSettingsMetrics)
 }
 
 // try to get the DataSource

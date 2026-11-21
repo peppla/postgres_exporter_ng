@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -35,16 +36,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	_ "github.com/lib/pq"
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/sync/semaphore"
 	. "gopkg.in/check.v1"
 )
 
@@ -168,14 +172,14 @@ func (s *IntegrationSuite) TestAllNamespacesReturnResults(c *C) {
 		c.Assert(len(server.metricMap) > 0, Equals, true,
 			Commentf("checkMapVersions produced no namespaces to query"))
 
-		err = querySettings(rec.ch, server)
+		err = querySettings(context.Background(), rec.ch, server)
 		if !c.Check(err, Equals, nil) {
 			fmt.Println("## ERRORS FOUND")
 			fmt.Println(err)
 		}
 
 		// This should never happen in our test cases.
-		errMap := queryNamespaceMappings(rec.ch, server)
+		errMap := queryNamespaceMappings(context.Background(), rec.ch, server)
 		if !c.Check(len(errMap), Equals, 0) {
 			fmt.Println("## NAMESPACE ERRORS FOUND")
 			for namespace, err := range errMap {
@@ -1917,4 +1921,137 @@ func (s *IntegrationSuite) TestTableCatalogMetricsAgainstServer(c *C) {
 				Commentf("the table collector failed against %q on PostgreSQL %d", labels["datname"], major))
 		}
 	}
+}
+
+// withQueryDirectory points one resolution's custom-query directory at a
+// fixture and switches that resolution on, then puts both back.
+//
+// The handler reads these from package-level flag state rather than from
+// arguments, so a test going through the handler has to set them there. Two
+// pieces of state, not one: the directory, and the boolean that decides
+// whether the exporter built from it does anything. Setting only the directory
+// produces a registered exporter that collects nothing, an empty body and a
+// scrape that looks instant, which is how the first version of the
+// cancellation test below passed while measuring nothing at all.
+func withQueryDirectory(c *C, res MetricResolution, dir string) func() {
+	var path *string
+	var enabled *bool
+	switch res {
+	case HR:
+		path, enabled = collectCustomQueryHrDirectory, collectCustomQueryHr
+	case MR:
+		path, enabled = collectCustomQueryMrDirectory, collectCustomQueryMr
+	case LR:
+		path, enabled = collectCustomQueryLrDirectory, collectCustomQueryLr
+	default:
+		c.Fatalf("unknown resolution %v", res)
+	}
+	previousPath, previousEnabled := *path, *enabled
+	*path, *enabled = dir, true
+	return func() { *path, *enabled = previousPath, previousEnabled }
+}
+
+// scrapeHTTP serves one request through the real handler and returns the
+// status, the body and how long it took.
+func scrapeHTTP(dsn string, limits budget.Limits, header string, collect ...string) (int, string, time.Duration) {
+	q := url.Values{}
+	for _, v := range collect {
+		q.Add("collect[]", v)
+	}
+	req := httptest.NewRequest("GET", "/metrics?"+q.Encode(), nil)
+	if header != "" {
+		req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", header)
+	}
+	rec := httptest.NewRecorder()
+
+	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits)
+
+	start := time.Now()
+	h.ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String(), time.Since(start)
+}
+
+// TestRequestBudgetCancelsALongQuery is the check the earlier budget tests
+// could not make.
+//
+// They held a connection open against a listener that never answered, which
+// exercises connect_timeout and nothing else. A query that has already started
+// on a real server is cancelled only if the collection context reaches it, and
+// the legacy engine ran its queries through a context-free Query, so a
+// two-second statement outran a one-second budget and the scrape returned
+// after two seconds with a 200.
+func (s *IntegrationSuite) TestRequestBudgetCancelsALongQuery(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	dir := writeQueryFile(c, "slow.yaml", `
+slow_application_query:
+  query: "SELECT 1::float8 AS value FROM pg_sleep(5)"
+  metrics:
+    - value: {usage: "GAUGE", description: "a query that takes five seconds"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	limits := budget.Defaults()
+	limits.RequestTimeout = 30 * time.Second
+	limits.MaxRequestTimeout = 60 * time.Second
+
+	// The premise. Without this the rest measures a query that never ran: a
+	// scrape that collects nothing is fast and produces no sample, which is
+	// exactly what a cancelled one looks like.
+	code, body, elapsed := scrapeHTTP(dsn, limits, "", "custom_query.lr")
+	c.Assert(code, Equals, 200)
+	c.Assert(strings.Contains(body, "slow_application_query_value"), Equals, true,
+		Commentf("the slow query did not run with a thirty-second budget, so this test cannot show it being cancelled"))
+	c.Assert(elapsed > 4*time.Second, Equals, true,
+		Commentf("the slow query returned in %s, so it is not slow and nothing below is a cancellation", elapsed))
+
+	for _, tc := range []struct {
+		name   string
+		header string
+	}{
+		// Whole seconds, which the old parser read.
+		{"an integer budget", "1"},
+		// A fraction, which the old parser threw away entirely, falling back
+		// to ten seconds for a scraper that asked for a quarter of one.
+		{"a fractional budget", "0.25"},
+	} {
+		code, body, elapsed := scrapeHTTP(dsn, limits, tc.header, "custom_query.lr")
+
+		c.Check(code, Equals, 200, Commentf("%s", tc.name))
+		c.Check(elapsed < 4*time.Second, Equals, true,
+			Commentf("%s: the scrape took %s, so the five-second query was not cancelled", tc.name, elapsed))
+		c.Check(strings.Contains(body, "slow_application_query_value"), Equals, false,
+			Commentf("%s: a cancelled query produced a sample", tc.name))
+	}
+}
+
+// TestInvalidTimeoutHeaderIsRefused covers the other half of the same defect.
+//
+// A header that cannot be read used to be ignored, so a scraper that sent
+// something malformed silently got the configured fallback instead of the
+// budget it meant. Refusing it is the only way the sender finds out.
+func (s *IntegrationSuite) TestInvalidTimeoutHeaderIsRefused(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	for _, tc := range []struct{ name, header string }{
+		{"not a number", "garbage"},
+		{"empty-ish", " "},
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"not finite", "NaN"},
+		{"infinite", "Inf"},
+	} {
+		code, _, _ := scrapeHTTP(dsn, budget.Defaults(), tc.header, "exporter")
+		c.Check(code, Equals, 400,
+			Commentf("%s: header %q returned %d, want 400", tc.name, tc.header, code))
+	}
+
+	// An absent header is not an error. Older agents send none and the
+	// configured fallback exists for them.
+	code, _, _ := scrapeHTTP(dsn, budget.Defaults(), "", "exporter")
+	c.Check(code, Equals, 200, Commentf("a scrape with no timeout header was refused"))
 }

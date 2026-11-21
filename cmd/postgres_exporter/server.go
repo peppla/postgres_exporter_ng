@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -131,19 +132,24 @@ func (s *Server) String() string {
 }
 
 // Scrape loads metrics.
-func (s *Server) Scrape(ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
+//
+// ctx carries the collection budget. Every query below has to run under it,
+// or the budget bounds only the parts of a scrape that happen to consult it:
+// a slow statement reached through a context-free Query runs to completion
+// whatever the scrape was allowed.
+func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
 	s.mappingMtx.RLock()
 	defer s.mappingMtx.RUnlock()
 
 	var err error
 
 	if !disableSettingsMetrics && s.master {
-		if err = querySettings(ch, s); err != nil {
+		if err = querySettings(ctx, ch, s); err != nil {
 			err = fmt.Errorf("error retrieving settings: %s", err)
 		}
 	}
 
-	errMap := queryNamespaceMappings(ch, s)
+	errMap := queryNamespaceMappings(ctx, ch, s)
 	if len(errMap) > 0 {
 		err = fmt.Errorf("queryNamespaceMappings returned %d errors", len(errMap))
 		level.Error(logger).Log("msg", "NAMESPACE ERRORS FOUND")

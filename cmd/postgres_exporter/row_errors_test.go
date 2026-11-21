@@ -69,7 +69,7 @@ func TestQueryNamespaceMappingReportsRowErrors(t *testing.T) {
 		queryOverrides: map[string]string{namespace: query},
 	}
 
-	metrics, _, err := queryNamespaceMapping(server, namespace, MetricMapNamespace{})
+	metrics, _, err := queryNamespaceMapping(context.Background(), server, namespace, MetricMapNamespace{})
 	if !errors.Is(err, errLegacyRowFailure) {
 		t.Errorf("row error lost: got %v", err)
 	}

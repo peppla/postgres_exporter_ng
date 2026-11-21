@@ -18,6 +18,7 @@
 package budget
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -165,5 +166,34 @@ func TestCollectionBudgetIsAlwaysPositive(t *testing.T) {
 		if got := l.CollectionBudget(budget, 0); got <= 0 {
 			t.Errorf("a budget of %s left %s for collection", budget, got)
 		}
+	}
+}
+
+// TestValidateRejectsNonFiniteNumbers is the case a bounds check written as
+// two comparisons cannot catch.
+//
+// Every comparison against NaN is false, so `f <= 0 || f >= 1` accepts NaN.
+// The reserve then comes out NaN, the collection budget comes out NaN, and
+// context.WithTimeout is handed a duration that is not a number.
+func TestValidateRejectsNonFiniteNumbers(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fraction float64
+	}{
+		{"not a number", math.NaN()},
+		{"positive infinity", math.Inf(1)},
+		{"negative infinity", math.Inf(-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := Defaults()
+			l.ResponseReserveFraction = tc.fraction
+			err := l.Validate()
+			if err == nil {
+				t.Fatalf("a reserve fraction of %v was accepted", tc.fraction)
+			}
+			if !strings.Contains(err.Error(), "finite") {
+				t.Errorf("error %q does not say the value is not finite", err)
+			}
+		})
 	}
 }

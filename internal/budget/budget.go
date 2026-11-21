@@ -31,6 +31,7 @@ package budget
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -111,6 +112,12 @@ func (l Limits) Validate() error {
 	}
 	if l.ResponseReserveMax <= 0 {
 		return fmt.Errorf("response_reserve.max must be positive, got %s", l.ResponseReserveMax)
+	}
+	// NaN first. Every comparison against NaN is false, so a NaN fraction
+	// passes a bounds check written as two comparisons and then produces a
+	// NaN reserve and a NaN collection budget.
+	if math.IsNaN(l.ResponseReserveFraction) || math.IsInf(l.ResponseReserveFraction, 0) {
+		return fmt.Errorf("response_reserve.fraction must be a finite number, got %v", l.ResponseReserveFraction)
 	}
 	if l.ResponseReserveFraction <= 0 || l.ResponseReserveFraction >= 1 {
 		return fmt.Errorf("response_reserve.fraction must be above 0 and below 1, got %v", l.ResponseReserveFraction)
