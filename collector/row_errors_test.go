@@ -89,6 +89,11 @@ func TestCollectorsReportRowErrors(t *testing.T) {
 		columns [][]string
 		version semver.Version
 		build   func() Collector
+		// dsn is needed by a collector that asks which distribution it is
+		// talking to. That answer is cached per host:port, so each such case
+		// needs its own, or the query runs or does not depending on which
+		// test ran first.
+		dsn string
 	}{
 		{
 			name:    "extensions, available",
@@ -122,6 +127,31 @@ func TestCollectorsReportRowErrors(t *testing.T) {
 			version: semver.Version{Major: 18},
 			build:   factory(NewPGStatIOCollector),
 		},
+		{
+			// Two queries: the column probe, then the view itself. The probe
+			// has its own case below, because this harness fails the last
+			// query and the probe is the first.
+			name: "stat_wal_receiver",
+			columns: [][]string{
+				{"column_name"},
+				{
+					"upstream_host", "slot_name", "status", "receive_start_lsn",
+					"receive_start_tli", "flushed_lsn", "received_tli",
+					"last_msg_send_time", "last_msg_receipt_time",
+					"latest_end_lsn", "latest_end_time", "upstream_node",
+				},
+			},
+			queries: [][]driver.Value{
+				{"flushed_lsn"},
+				{
+					"upstream", "slot", "streaming", int64(1200668684563608), 1,
+					int64(1200668684563609), 1, 1687321275.0, 1687321276.0,
+					int64(1200668684563610), 1687321277.0, 5,
+				},
+			},
+			build: factory(NewPGStatWalReceiverCollector),
+			dsn:   "postgres://u:p@walreceiver-rows:5432/d",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, mock, err := sqlmock.New()
@@ -129,6 +159,13 @@ func TestCollectorsReportRowErrors(t *testing.T) {
 				t.Fatalf("opening a stub connection: %s", err)
 			}
 			defer db.Close()
+
+			// A collector that checks the distribution asks first, and that
+			// query is not one of this collector's own.
+			if tc.dsn != "" {
+				mock.ExpectQuery("aurora_version").
+					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+			}
 
 			// Every query but the last returns cleanly. The last one returns a
 			// row and then fails, so Next stops for a reason that is not the
@@ -143,7 +180,7 @@ func TestCollectorsReportRowErrors(t *testing.T) {
 
 			ch, wait := drainMetrics()
 			err = tc.build().Update(context.Background(),
-				&instance{db: db, version: tc.version}, ch)
+				&instance{db: db, version: tc.version, dsn: tc.dsn}, ch)
 			wait()
 
 			if !errors.Is(err, errRowFailure) {
@@ -162,5 +199,47 @@ func factory(create func(collectorConfig) (Collector, error)) func() Collector {
 			panic(err)
 		}
 		return c
+	}
+}
+
+// TestWalReceiverProbeReportsRowErrors covers the one iterator in this
+// repository whose result is a decision rather than a metric.
+//
+// The probe asks whether pg_stat_wal_receiver has a flushed_lsn column, and
+// reads the answer from whether Next returns a row. False means the column is
+// absent and also means the lookup failed, so without the Err check a failed
+// probe silently selects the query for a server that does not have the column
+// and drops flushed_lsn from one that does.
+func TestWalReceiverProbeReportsRowErrors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("opening a stub connection: %s", err)
+	}
+	defer db.Close()
+
+	// The distribution check runs before any of this collector's own queries.
+	// Its answer is cached per host:port, so this test carries a dsn of its
+	// own and the query runs here whatever else has run before.
+	mock.ExpectQuery("aurora_version").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	// The probe returns no row and fails, which is what a cancelled or broken
+	// lookup looks like from Next alone.
+	mock.ExpectQuery(sanitizeQuery(pgStatWalColumnQuery)).
+		WillReturnRows(sqlmock.NewRows([]string{"column_name"}).
+			AddRow("flushed_lsn").RowError(0, errRowFailure))
+
+	ch, wait := drainMetrics()
+	err = factory(NewPGStatWalReceiverCollector)().Update(context.Background(),
+		&instance{db: db, dsn: "postgres://u:p@walreceiver-probe:5432/d"}, ch)
+	wait()
+
+	if !errors.Is(err, errRowFailure) {
+		t.Errorf("the probe swallowed its row error and chose a query anyway: got %v", err)
+	}
+	// The second query must not have run. If it did, the collector decided
+	// which columns the server has from a failed lookup.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
 	}
 }
