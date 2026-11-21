@@ -1965,7 +1965,7 @@ func scrapeHTTP(dsn string, limits budget.Limits, header string, collect ...stri
 	rec := httptest.NewRecorder()
 
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
-		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits)
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits))
 
 	start := time.Now()
 	h.ServeHTTP(rec, req)

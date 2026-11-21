@@ -21,6 +21,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
@@ -187,7 +188,9 @@ func main() {
 		"response_reserve_fraction", limits.ResponseReserveFraction)
 
 	connSema := semaphore.NewWeighted(limits.Connections)
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits))
+	// One admission gate for every endpoint that collects.
+	collectionGate := NewCollectionGate(limits)
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate))
 
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{
@@ -209,10 +212,21 @@ func main() {
 		http.Handle("/", landingPage)
 	}
 
-	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema))
+	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema, limits, collectionGate))
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *webConfig.WebListenAddresses)
-	srv := &http.Server{}
+	// A backstop under the per-request write deadline. A handler sets its own
+	// from the request's budget, and this covers anything that does not, plus
+	// the time before a handler runs. Both exist because a client that stops
+	// reading otherwise holds its connection, and its admission slot, for as
+	// long as it likes.
+	//
+	// The read timeout is separate and deliberately generous: it bounds a
+	// client that opens a connection and sends nothing.
+	srv := &http.Server{
+		WriteTimeout:      limits.MaxRequestTimeout,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
 	if err := web.ListenAndServe(srv, webConfig, promslog.New(&promslog.Config{})); err != nil {
 		level.Error(logger).Log("msg", "Error running HTTP server", "err", err)
 		os.Exit(1)

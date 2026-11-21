@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -32,6 +33,7 @@ import (
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -251,7 +253,7 @@ func TestConcurrentRequestsAreRefusedNotQueued(t *testing.T) {
 	limits.RequestTimeout = 2 * time.Second
 
 	h := Handler(log.NewNopLogger(), []string{dsn},
-		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, limits)
+		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits))
 
 	first := make(chan int, 1)
 	go func() {
@@ -314,7 +316,7 @@ func TestRequestBudgetBoundsACollection(t *testing.T) {
 
 	dsn := fmt.Sprintf("postgresql://u:p@%s/d?sslmode=disable", listener.Addr().String())
 	h := Handler(log.NewNopLogger(), []string{dsn},
-		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, budget.Defaults())
+		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, budget.Defaults(), NewCollectionGate(budget.Defaults()))
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=postgres", nil)
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", "1")
@@ -328,4 +330,121 @@ func TestRequestBudgetBoundsACollection(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Errorf("a one-second scrape took %s, so the requested budget was not applied", elapsed)
 	}
+}
+
+// TestASlowReaderDoesNotHoldItsSlotForever covers the gap between reserving
+// time for a response and bounding the writing of one.
+//
+// The collection budget stops collection. It says nothing about a client that
+// accepts the connection, lets the exporter finish collecting, and then stops
+// reading. The handler blocks in Write holding its admission slot, and with
+// one slot configured every other scrape is refused for as long as that
+// client cares to wait.
+//
+// This runs over a real socket, because the gap only exists there: an
+// in-memory recorder never blocks. What is measured is when the handler
+// returns, since that is when the slot comes back, and it has to happen
+// without the client reading a byte.
+func TestASlowReaderDoesNotHoldItsSlotForever(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %s", err)
+	}
+	defer listener.Close()
+
+	limits := budget.Defaults()
+	limits.ConcurrentRequests = 1
+	limits.RequestTimeout = time.Second
+	limits.MaxRequestTimeout = 2 * time.Second
+	gate := NewCollectionGate(limits)
+
+	// A body far larger than any socket buffer, so a client that stops
+	// reading blocks the write rather than letting it complete.
+	returned := make(chan time.Duration, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		release, ok := admit(w, gate, limits)
+		if !ok {
+			return
+		}
+		defer release()
+		boundResponseWrite(w, limits.RequestBudget(0, 0))
+		start := time.Now()
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 64<<20))
+		returned <- time.Since(start)
+	})
+	// Deliberately no WriteTimeout on the server. main sets one as a
+	// backstop, and leaving it out here is what makes this a test of the
+	// per-request deadline rather than of the server-wide one.
+	srv := &http.Server{Handler: handler}
+	go func() { _ = srv.Serve(listener) }()
+	defer srv.Close()
+
+	stalled, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dialling: %s", err)
+	}
+	defer stalled.Close()
+	if _, err := stalled.Write([]byte("GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatalf("sending the request: %s", err)
+	}
+
+	select {
+	case took := <-returned:
+		// The write deadline is the request budget, one second here. Anything
+		// near the test timeout means the handler was still blocked.
+		if took > 10*time.Second {
+			t.Errorf("the handler was blocked writing for %s", took)
+		}
+		// And the slot is free again, which is the point.
+		rec := httptest.NewRecorder()
+		release, ok := admit(rec, gate, limits)
+		if !ok {
+			t.Error("the admission slot was not released when the blocked write gave up")
+		} else {
+			release()
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the handler never returned, so a client that stops reading holds its admission slot indefinitely")
+	}
+}
+
+// TestRejectionsAreCounted checks that a refusal leaves a trace.
+//
+// A 503 that nothing counts is an overload nobody can see afterwards, because
+// the request that would have reported it is the one being refused.
+func TestRejectionsAreCounted(t *testing.T) {
+	before := counterValue(t, collectionRejected)
+
+	limits := budget.Defaults()
+	limits.ConcurrentRequests = 1
+
+	// Take the only slot, then try to take it again.
+	gate := NewCollectionGate(limits)
+	rec := httptest.NewRecorder()
+	release, ok := admit(rec, gate, limits)
+	if !ok {
+		t.Fatal("the first admission failed on a fresh gate")
+	}
+	second := httptest.NewRecorder()
+	if _, ok := admit(second, gate, limits); ok {
+		release()
+		t.Fatal("a second admission succeeded with one slot configured")
+	}
+	release()
+
+	if second.Code != http.StatusServiceUnavailable {
+		t.Errorf("a refused request returned %d", second.Code)
+	}
+	if after := counterValue(t, collectionRejected); after != before+1 {
+		t.Errorf("the rejection counter went from %v to %v", before, after)
+	}
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	pb := &dto.Metric{}
+	if err := c.Write(pb); err != nil {
+		t.Fatalf("reading the counter: %s", err)
+	}
+	return pb.GetCounter().GetValue()
 }

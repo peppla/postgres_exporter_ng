@@ -55,20 +55,16 @@ var (
 // limits is the budget one scrape may spend. The request gate is built once,
 // here, rather than per request: it is a limit on how many collections run at
 // the same time, so it has to be the same object across them.
-func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits) http.Handler {
-	requestGate := semaphore.NewWeighted(limits.ConcurrentRequests)
-
+func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Refused before any SQL runs, and not queued. A queue turns an
 		// overloaded exporter into a slow one, and the scrapes waiting in it
 		// are already late by the time they reach a database.
-		if !requestGate.TryAcquire(1) {
-			http.Error(w,
-				fmt.Sprintf("%d collections already in flight", limits.ConcurrentRequests),
-				http.StatusServiceUnavailable)
+		release, ok := admit(w, gate, limits)
+		if !ok {
 			return
 		}
-		defer requestGate.Release(1)
+		defer release()
 
 		// What the scraper asked for, if it said. Prometheus sends this as a
 		// decimal, so 0.25 is a quarter of a second and reading it as a whole
@@ -78,7 +74,7 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		// A header that is present and unusable is refused rather than
 		// ignored. Falling back silently gives a scraper a budget it did not
 		// ask for, which is how a 250ms request ran for two seconds.
-		asked, err := requestedTimeout(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"))
+		asked, err := requestedTimeout(r.Header.Values("X-Prometheus-Scrape-Timeout-Seconds"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -96,6 +92,8 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		// collected everything and could not send it is a failed scrape.
 		ctx, cancel := context.WithTimeout(r.Context(), limits.CollectionBudget(asked, parentRemaining))
 		defer cancel()
+
+		boundResponseWrite(w, limits.RequestBudget(asked, parentRemaining))
 
 		filters := r.URL.Query()["collect[]"]
 		level.Debug(logger).Log("msg", "Collect query", "filters", filters)
@@ -154,6 +152,12 @@ type Filters struct {
 // makeRegistry creates a new prometheus registry with default and percona exporters.
 func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits) *prometheus.Registry {
 	registry := prometheus.NewRegistry()
+
+	// Always, whatever was selected. A refused request serves no metrics of
+	// its own, so the count has to reach a scraper through the requests that
+	// were not refused, and the counter is package-level so it survives the
+	// registry being rebuilt per request.
+	registry.MustRegister(collectionRejected)
 
 	// Every connection this scrape opens gets a bound on how long it may take
 	// to establish, shortened by whatever is left of the collection budget.
@@ -367,13 +371,26 @@ func withConnectTimeout(dsns []string, timeout time.Duration) []string {
 
 // requestedTimeout reads the scrape timeout header.
 //
-// An absent header is not an error: older agents send none, and the configured
-// fallback is for them. Anything else has to be a positive, finite number of
-// seconds, because the alternative is treating a malformed value as absent and
-// handing out a budget nobody asked for.
-func requestedTimeout(header string) (time.Duration, error) {
-	if header == "" {
+// It takes the header's values rather than its value, because an absent
+// header and a header present with nothing in it are different requests and
+// Header.Get returns the empty string for both. Only an absent header is
+// entitled to the configured fallback: a scraper that sent the header meant
+// something by it, and if that something cannot be read, saying so is the
+// only way it finds out.
+//
+// A value has to be a finite number of seconds that is positive and still
+// positive as a duration. Those are not the same test. Durations are counted
+// in nanoseconds, so a tenth of a nanosecond is a positive number that rounds
+// to zero, and zero is the value this function returns for an absent header,
+// so it would have been handed the fallback and run for as long as the
+// fallback allows.
+func requestedTimeout(values []string) (time.Duration, error) {
+	if len(values) == 0 {
 		return 0, nil
+	}
+	header := values[0]
+	if strings.TrimSpace(header) == "" {
+		return 0, fmt.Errorf("X-Prometheus-Scrape-Timeout-Seconds was sent with no value")
 	}
 	seconds, err := strconv.ParseFloat(header, 64)
 	if err != nil {
@@ -385,5 +402,63 @@ func requestedTimeout(header string) (time.Duration, error) {
 	if seconds <= 0 {
 		return 0, fmt.Errorf("X-Prometheus-Scrape-Timeout-Seconds %q is not positive", header)
 	}
-	return time.Duration(seconds * float64(time.Second)), nil
+	asked := time.Duration(seconds * float64(time.Second))
+	if asked <= 0 {
+		return 0, fmt.Errorf("X-Prometheus-Scrape-Timeout-Seconds %q is shorter than the smallest duration this can express", header)
+	}
+	return asked, nil
+}
+
+// collectionRejected counts refused admissions. A 503 that nothing counts is
+// an overload nobody can see afterwards, because the request that would have
+// reported it is the one being refused.
+var collectionRejected = prometheus.NewCounter(prometheus.CounterOpts{
+	Namespace: "pg",
+	Subsystem: "exporter",
+	Name:      "collection_requests_rejected_total",
+	Help:      "Collection requests refused because the configured number were already in flight. Refused before any SQL runs, and never queued.",
+})
+
+// NewCollectionGate builds the gate that limits how many collections run at
+// once.
+//
+// One gate for the process, passed to every endpoint that collects, the same
+// way the connection semaphore is. The limit is on what this process asks of
+// a database, so an endpoint with a gate of its own is a second helping of
+// the same budget.
+func NewCollectionGate(limits budget.Limits) *semaphore.Weighted {
+	return semaphore.NewWeighted(limits.ConcurrentRequests)
+}
+
+// admit takes a slot for this collection, or refuses the request.
+//
+// The returned function gives the slot back. It is held for the whole of
+// ServeHTTP, which includes writing the response, so a client that stops
+// reading cannot hold a slot longer than the write deadline allows.
+func admit(w http.ResponseWriter, gate *semaphore.Weighted, limits budget.Limits) (func(), bool) {
+	if !gate.TryAcquire(1) {
+		collectionRejected.Inc()
+		http.Error(w,
+			fmt.Sprintf("%d collections already in flight", limits.ConcurrentRequests),
+			http.StatusServiceUnavailable)
+		return func() {}, false
+	}
+	return func() { gate.Release(1) }, true
+}
+
+// boundResponseWrite stops a client that will not read from holding its
+// admission slot indefinitely.
+//
+// Reserving time for the response bounds how long collection may take, not
+// how long writing takes. A reader that accepts the connection and stops
+// reading leaves the handler blocked in Write, holding its slot, with every
+// other scrape refused. The deadline is the whole request budget, because a
+// write that outlives the budget is already late.
+func boundResponseWrite(w http.ResponseWriter, budget time.Duration) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget)); err != nil {
+		// A ResponseWriter that cannot take a deadline, which httptest's
+		// recorder cannot. Nothing to do about it here, and the server's own
+		// WriteTimeout still applies in production.
+		level.Debug(logger).Log("msg", "This response cannot carry a write deadline", "err", err)
+	}
 }

@@ -14,21 +14,47 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
 )
 
-func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semaphore.Weighted) http.HandlerFunc {
+func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semaphore.Weighted, limits budget.Limits, gate *semaphore.Weighted) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
+		// The probe collects, so it spends the same budget as /metrics. It
+		// used to take neither the admission slot nor a deadline, so the
+		// limits were process-wide in name and endpoint-wide in fact: enough
+		// probes could run past every number the operator configured.
+		release, ok := admit(w, gate, limits)
+		if !ok {
+			return
+		}
+		defer release()
+
+		asked, err := requestedTimeout(r.Header.Values("X-Prometheus-Scrape-Timeout-Seconds"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var parentRemaining time.Duration
+		if deadline, hasDeadline := r.Context().Deadline(); hasDeadline {
+			parentRemaining = time.Until(deadline)
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), limits.CollectionBudget(asked, parentRemaining))
+		defer cancel()
+		boundResponseWrite(w, limits.RequestBudget(asked, parentRemaining))
+
 		conf := c.GetConfig()
 		params := r.URL.Query()
 		target := params.Get("target")
@@ -78,7 +104,11 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 			WithConnectionsSemaphore(connSema),
 		}
 
-		dsns := []string{dsn.GetConnectionString()}
+		remaining := time.Duration(0)
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			remaining = time.Until(deadline)
+		}
+		dsns := withConnectTimeout([]string{dsn.GetConnectionString()}, limits.ConnectTimeoutFor(remaining))
 		exporter := NewExporter(dsns, opts...)
 
 		// defer func() {
