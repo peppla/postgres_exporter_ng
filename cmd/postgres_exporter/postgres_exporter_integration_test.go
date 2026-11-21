@@ -35,6 +35,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
@@ -1454,4 +1455,69 @@ func (s *IntegrationSuite) TestExtensionsFanOutAcrossDatabases(c *C) {
 		Commentf("%s reports no installed version in the database that has it", ext))
 	c.Check(installedVersions[control], Equals, "",
 		Commentf("%s reports an installed version in a database that does not have it", ext))
+}
+
+// TestSessionTimeoutsReachTheServer is the premise check for the statement and
+// lock timeouts.
+//
+// They are written into libpq's options parameter, which is a free-form
+// argument string carried through a URL. A unit test can only say that the
+// string was built; whether the server reads it, and whether URL encoding
+// survives the trip through the driver, is something only a server can answer.
+// A rejected options string would fail the connection, and a mangled one would
+// leave the session at its defaults while every test still passed.
+func (s *IntegrationSuite) TestSessionTimeoutsReachTheServer(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	bounded, err := config.DSNWithSessionTimeouts(
+		strings.Split(dsn, ",")[0], 5*time.Second, 500*time.Millisecond)
+	c.Assert(err, IsNil)
+
+	server, err := NewServer(bounded)
+	c.Assert(err, IsNil)
+	defer server.Close()
+
+	for _, tc := range []struct{ setting, want string }{
+		{"statement_timeout", "5s"},
+		{"lock_timeout", "500ms"},
+	} {
+		var got string
+		c.Assert(server.db.QueryRow("SHOW "+tc.setting).Scan(&got), IsNil)
+		c.Check(got, Equals, tc.want,
+			Commentf("%s on the session is %q, want %q", tc.setting, got, tc.want))
+	}
+
+	// And the connection still reaches the database it names, so the rewrite
+	// did not disturb the rest of the string.
+	var datname string
+	c.Assert(server.db.QueryRow("SELECT current_database()").Scan(&datname), IsNil)
+	expected, ok := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(ok, Equals, true)
+	c.Check(datname, Equals, expected)
+}
+
+// TestSessionTimeoutsBoundAStatement checks that the server enforces what was
+// set, rather than merely reporting it.
+func (s *IntegrationSuite) TestSessionTimeoutsBoundAStatement(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	bounded, err := config.DSNWithSessionTimeouts(
+		strings.Split(dsn, ",")[0], 300*time.Millisecond, 100*time.Millisecond)
+	c.Assert(err, IsNil)
+
+	server, err := NewServer(bounded)
+	c.Assert(err, IsNil)
+	defer server.Close()
+
+	start := time.Now()
+	_, err = server.db.Exec("SELECT pg_sleep(30)")
+	elapsed := time.Since(start)
+
+	c.Assert(err, NotNil, Commentf("a thirty-second statement finished, so nothing bounded it"))
+	c.Check(strings.Contains(err.Error(), "canceling statement due to statement timeout"), Equals, true,
+		Commentf("the statement ended with %q, not a statement timeout", err))
+	c.Check(elapsed < 10*time.Second, Equals, true,
+		Commentf("the statement took %s, so the timeout was not what stopped it", elapsed))
 }

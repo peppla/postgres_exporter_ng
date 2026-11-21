@@ -18,10 +18,10 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
-	"strings"
 
 	"github.com/blang/semver/v4"
 	"github.com/lib/pq"
+	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 )
 
@@ -140,17 +140,9 @@ func parseServerName(url string) (string, error) {
 		dsn = url
 	}
 
-	pairs := strings.Split(dsn, " ")
-	kv := make(map[string]string, len(pairs))
-	for _, pair := range pairs {
-		splitted := strings.SplitN(pair, "=", 2)
-		if len(splitted) != 2 {
-			return "", fmt.Errorf("malformed dsn %q", dsn)
-		}
-		// Newer versions of pq.ParseURL quote values so trim them off if they exist
-		key := strings.Trim(splitted[0], "'\"")
-		value := strings.Trim(splitted[1], "'\"")
-		kv[key] = value
+	kv, err := config.ParseKeyValue(dsn)
+	if err != nil {
+		return "", fmt.Errorf("malformed dsn %q: %w", dsn, err)
 	}
 
 	var fingerprint string

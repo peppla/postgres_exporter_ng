@@ -238,8 +238,10 @@ func (s *FunctionalSuite) TestParseFingerprint(c *C) {
 			fingerprint: "example:5432",
 		},
 		{
+			// The message now carries why, since both engines read the
+			// keyword form through one parser that says what it objected to.
 			url: "xyz",
-			err: "malformed dsn \"xyz\"",
+			err: "malformed dsn \"xyz\": invalid input",
 		},
 	}
 

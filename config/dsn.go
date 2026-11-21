@@ -218,7 +218,11 @@ func parseKeyValue(in string) (map[string]string, error) {
 				part = []rune{}
 				// Do something with the value
 			}
-		case c == '=':
+		case c == '=' && !inQuote:
+			// Only outside quotes. libpq's options value is itself a list of
+			// settings written as -c name=value, so a quoted value can hold
+			// equals signs of its own, and treating one of those as the
+			// separator splits the pair in the wrong place and loses the rest.
 			if inPart {
 				inPart = false
 				key = string(part)
@@ -232,7 +236,14 @@ func parseKeyValue(in string) (map[string]string, error) {
 		}
 	}
 
-	if key != "" && len(part) > 0 {
+	if len(part) > 0 {
+		// Text left over that never became a key=value pair. The old
+		// per-engine parsers rejected this, and silently returning an empty
+		// map instead would turn a malformed connection string into a
+		// connection to localhost on the default port.
+		if key == "" {
+			return out, fmt.Errorf("invalid input")
+		}
 		out[key] = string(part)
 	}
 
@@ -357,4 +368,72 @@ func DSNWithConnectTimeout(in string, d time.Duration) (string, error) {
 	}
 	parsed.query.Set("connect_timeout", strconv.Itoa(seconds))
 	return parsed.GetConnectionString(), nil
+}
+
+// DSNWithSessionTimeouts returns the connection string with statement_timeout
+// and lock_timeout set on the session, through libpq's options parameter.
+//
+// These are server-side backstops. The context a scrape runs under already
+// cancels a query when its budget runs out, and lib/pq sends a cancel request
+// when it does, but that depends on the exporter still being there to send it.
+// A session timeout is enforced by the server, so a statement is bounded even
+// if the exporter is killed, the network drops, or the cancel itself cannot be
+// delivered.
+//
+// A value the connection string already sets is left alone. Unlike
+// connect_timeout, which is a parameter of its own and a number this code can
+// compare, options is a free-form argument string, and quietly appending to it
+// would override whatever an operator wrote there without being able to say
+// whether the result is shorter or longer than what they asked for.
+//
+// PostgreSQL takes both as milliseconds when given a bare number.
+func DSNWithSessionTimeouts(in string, statement, lock time.Duration) (string, error) {
+	parsed, err := dsnFromString(in)
+	if err != nil {
+		return "", err
+	}
+	if parsed.query == nil {
+		parsed.query = url.Values{}
+	}
+
+	options := parsed.query.Get("options")
+	for _, setting := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"statement_timeout", statement},
+		{"lock_timeout", lock},
+	} {
+		if setting.value <= 0 || strings.Contains(options, setting.name) {
+			continue
+		}
+		ms := setting.value.Milliseconds()
+		if ms < 1 {
+			// Rounding to zero would disable the timeout rather than shorten
+			// it, which is the opposite of what the caller asked for.
+			ms = 1
+		}
+		if options != "" {
+			options += " "
+		}
+		options += fmt.Sprintf("-c %s=%d", setting.name, ms)
+	}
+
+	if options == "" {
+		return parsed.GetConnectionString(), nil
+	}
+	parsed.query.Set("options", options)
+	return parsed.GetConnectionString(), nil
+}
+
+// ParseKeyValue splits a libpq key=value connection string, honouring quoted
+// values.
+//
+// Exported because both engines had their own copy of this, each splitting on
+// plain spaces and on the first equals sign. That rejects any connection
+// string with a quoted value containing a space, which includes a password
+// with a space in it, an application_name with one, and the options string the
+// session timeouts are written into.
+func ParseKeyValue(in string) (map[string]string, error) {
+	return parseKeyValue(in)
 }

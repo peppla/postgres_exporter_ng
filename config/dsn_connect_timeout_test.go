@@ -134,3 +134,132 @@ func TestDSNWithConnectTimeoutKeepsTheDatabase(t *testing.T) {
 		}
 	}
 }
+
+// TestDSNWithSessionTimeouts pins what reaches the server session.
+//
+// PostgreSQL reads both as milliseconds when given a bare number, and zero
+// disables rather than shortens, so the rounding has to go up for the same
+// reason connect_timeout's does.
+func TestDSNWithSessionTimeouts(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		dsn       string
+		statement time.Duration
+		lock      time.Duration
+		want      []string
+		notWant   []string
+	}{
+		{
+			name: "both are set", dsn: "postgresql://u@host/db",
+			statement: 5 * time.Second, lock: 500 * time.Millisecond,
+			want: []string{"statement_timeout%3D5000", "lock_timeout%3D500"},
+		},
+		{
+			name: "a sub-millisecond value becomes one, not zero",
+			dsn:  "postgresql://u@host/db", statement: time.Microsecond, lock: time.Microsecond,
+			want: []string{"statement_timeout%3D1", "lock_timeout%3D1"},
+		},
+		{
+			name: "zero means leave it unset", dsn: "postgresql://u@host/db",
+			statement: 0, lock: 0,
+			notWant: []string{"statement_timeout", "lock_timeout", "options"},
+		},
+		{
+			// An operator who wrote their own options gets to keep them.
+			name:      "a value already in options is left alone",
+			dsn:       "postgresql://u@host/db?options=-c%20statement_timeout%3D250",
+			statement: 5 * time.Second, lock: 500 * time.Millisecond,
+			want:    []string{"statement_timeout%3D250", "lock_timeout%3D500"},
+			notWant: []string{"statement_timeout%3D5000"},
+		},
+		{
+			// Appending to an unrelated options string rather than replacing
+			// it: losing search_path would change what the queries see.
+			name:      "unrelated options survive",
+			dsn:       "postgresql://u@host/db?options=-c%20search_path%3Dpublic",
+			statement: 5 * time.Second, lock: 500 * time.Millisecond,
+			want: []string{"search_path%3Dpublic", "statement_timeout%3D5000", "lock_timeout%3D500"},
+		},
+		{
+			name:      "a keyword string too",
+			dsn:       "host=localhost user=postgres dbname=db",
+			statement: 5 * time.Second, lock: 500 * time.Millisecond,
+			want: []string{"statement_timeout%3D5000", "lock_timeout%3D500"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DSNWithSessionTimeouts(tc.dsn, tc.statement, tc.lock)
+			if err != nil {
+				t.Fatalf("DSNWithSessionTimeouts(%q): %s", tc.dsn, err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("%q does not contain %q", got, want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got, notWant) {
+					t.Errorf("%q contains %q and should not", got, notWant)
+				}
+			}
+		})
+	}
+}
+
+// TestParseKeyValueHandlesQuotedValues covers the parser both engines use to
+// read a libpq keyword string.
+//
+// Each had its own copy that split on plain spaces and on the first equals
+// sign. That rejects any connection string with a quoted value containing a
+// space, and reads one containing an equals sign in the wrong place. The
+// options string the session timeouts are written into has both.
+func TestParseKeyValueHandlesQuotedValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want map[string]string
+	}{
+		{
+			name: "plain pairs",
+			in:   "host=localhost port=5432 dbname=postgres",
+			want: map[string]string{"host": "localhost", "port": "5432", "dbname": "postgres"},
+		},
+		{
+			name: "quoted pairs, as pq.ParseURL emits them",
+			in:   "dbname='postgres' host='127.0.0.1' port='5432'",
+			want: map[string]string{"dbname": "postgres", "host": "127.0.0.1", "port": "5432"},
+		},
+		{
+			// The case the session timeouts need: spaces and equals signs
+			// inside one quoted value.
+			name: "an options value with spaces and equals signs",
+			in:   "host='127.0.0.1' options='-c statement_timeout=5000 -c lock_timeout=500' user='root'",
+			want: map[string]string{
+				"host":    "127.0.0.1",
+				"options": "-c statement_timeout=5000 -c lock_timeout=500",
+				"user":    "root",
+			},
+		},
+		{
+			// The same fault reached anyone whose password had a space in it.
+			name: "a password with a space",
+			in:   "host='h' password='two words' user='u'",
+			want: map[string]string{"host": "h", "password": "two words", "user": "u"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseKeyValue(tc.in)
+			if err != nil {
+				t.Fatalf("ParseKeyValue(%q): %s", tc.in, err)
+			}
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Errorf("%s = %q, want %q", k, got[k], want)
+				}
+			}
+			if len(got) != len(tc.want) {
+				t.Errorf("parsed %d keys, want %d: %v", len(got), len(tc.want), got)
+			}
+		})
+	}
+}

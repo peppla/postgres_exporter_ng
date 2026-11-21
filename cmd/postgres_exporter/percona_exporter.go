@@ -155,7 +155,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining = time.Until(deadline)
 	}
-	dsns = withConnectTimeout(dsns, limits.ConnectTimeoutFor(remaining))
+	dsns = withTimeouts(dsns, limits, remaining)
 
 	excludedDatabases := strings.Split(*excludeDatabases, ",")
 	logger.Log("msg", "Excluded databases", "databases", fmt.Sprintf("%v", excludedDatabases))
@@ -319,17 +319,22 @@ func (e *Exporter) addCustomQueriesFromFile(path string, version semver.Version,
 	e.userQueriesError.WithLabelValues(path, hashsumStr).Set(0)
 }
 
-// withConnectTimeout bounds how long each connection string may spend being
-// established.
+// withTimeouts bounds how long each connection string may spend connecting,
+// and how long its statements may run once connected.
 //
 // A string that cannot be parsed is passed through unchanged. Refusing it here
 // would turn a connection error, which the scrape reports per target, into a
 // scrape that produces nothing, and the parse failure will be reported by
 // whichever engine tries to use it.
-func withConnectTimeout(dsns []string, timeout time.Duration) []string {
+func withTimeouts(dsns []string, limits budget.Limits, remaining time.Duration) []string {
 	out := make([]string, len(dsns))
 	for i, dsn := range dsns {
-		bounded, err := config.DSNWithConnectTimeout(dsn, timeout)
+		bounded, err := config.DSNWithConnectTimeout(dsn, limits.ConnectTimeoutFor(remaining))
+		if err != nil {
+			out[i] = dsn
+			continue
+		}
+		bounded, err = config.DSNWithSessionTimeouts(bounded, limits.StatementTimeout, limits.LockTimeout)
 		if err != nil {
 			out[i] = dsn
 			continue
