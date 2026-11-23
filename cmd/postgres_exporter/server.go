@@ -24,6 +24,7 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/distribution"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/percona/postgres_exporter/internal/querycache"
@@ -44,6 +45,10 @@ type Server struct {
 	// application query with its own databases list runs. Empty when it is
 	// not known, which the caller resolves before running those queries.
 	datname string
+	// role is the login role this connection names, for the diagnostics that
+	// have to tell two targets apart. Empty when the connection string names
+	// none and libpq falls back to the operating system user.
+	role string
 
 	// Last version used to calculate metric map. If mismatch on scrape,
 	// then maps are recalculated.
@@ -85,8 +90,11 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 
 	level.Debug(logger).Log("msg", "Established new database connection", "fingerprint", fingerprint)
 
+	role, _ := config.UserFromDSN(dsn)
+
 	s := &Server{
 		db:     db,
+		role:   role,
 		master: false,
 		labels: prometheus.Labels{
 			serverLabelName: fingerprint,
@@ -144,20 +152,11 @@ func (s *Server) String() string {
 	return s.labels[serverLabelName]
 }
 
-// cacheIdentity returns an opaque identity for the connection this server
-// holds, for keying cached results by where they came from.
+// cacheIdentity hashes this server's connection string to separate connection
+// contexts without keeping a credential in a cache key.
 //
-// Not the fingerprint. That is host and port, and targets share a host and
-// port: one per database when discovery runs, and as many as DATA_SOURCE_NAME
-// configures, which can differ by database, by role, or by anything else a
-// connection string carries. Measured with two URLs on one host and port, at
-// postgres and at root: keyed by the fingerprint they shared an entry, so the
-// second response served one target's metrics for both and dropped the other
-// database from exposition. Two login roles against one database collided the
-// same way.
-//
-// Hashed rather than keyed by the connection string itself, which carries a
-// password: a map key reaches a panic message or a dump eventually.
+// The fingerprint cannot do it: it is host and port, which targets share. They
+// differ by database, by role, or by anything else the string carries.
 func (s *Server) cacheIdentity() string {
 	sum := sha256.Sum256([]byte(s.dsn))
 	return hex.EncodeToString(sum[:])

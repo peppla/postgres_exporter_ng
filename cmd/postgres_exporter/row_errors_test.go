@@ -29,10 +29,12 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 var errLegacyRowFailure = errors.New("the connection went away mid-result")
@@ -76,6 +78,62 @@ func TestQueryNamespaceMappingReportsRowErrors(t *testing.T) {
 	if len(metrics) != 0 {
 		t.Errorf("a failed namespace query returned %d metrics, want none", len(metrics))
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
+// TestQuerySettingsReportsRowErrors covers the third iterator in this engine.
+//
+// Partial emission is expected here: the settings already sent are sent, and
+// the error says the rest were not read. What must not happen is the scrape
+// reporting success, which is what a loop without Err() does. The error is
+// formatted with %v, so it is matched on its text rather than with errors.Is.
+func TestQuerySettingsReportsRowErrors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("opening a stub connection: %s", err)
+	}
+	defer db.Close()
+
+	// Two rows, failing on the second, so the first arrives and a version
+	// that ignored the error would report one setting and no failure.
+	mock.ExpectQuery("FROM pg_settings").WillReturnRows(
+		sqlmock.NewRows([]string{"name", "setting", "unit", "short_desc", "vartype"}).
+			AddRow("max_connections", "100", "", "Sets the maximum number of concurrent connections.", "integer").
+			AddRow("work_mem", "4096", "kB", "Sets the maximum memory to be used for query workspaces.", "integer").
+			RowError(1, errLegacyRowFailure))
+
+	ch := make(chan prometheus.Metric, 8)
+	err = querySettings(context.Background(), ch, &Server{db: db, labels: prometheus.Labels{"server": "test"}})
+	close(ch)
+
+	if err == nil {
+		t.Fatal("expected settings iterator failure, got <nil>")
+	}
+	if !strings.Contains(err.Error(), errLegacyRowFailure.Error()) {
+		t.Errorf("the row error is not in the reported error: got %v", err)
+	}
+
+	emitted := 0
+	var first float64
+	for metric := range ch {
+		pb := &dto.Metric{}
+		if err := metric.Write(pb); err != nil {
+			t.Fatalf("writing a metric: %s", err)
+		}
+		if emitted == 0 {
+			first = pb.GetGauge().GetValue()
+		}
+		emitted++
+	}
+	if emitted != 1 {
+		t.Fatalf("a settings read that failed on its second row emitted %d metrics, want the one it managed to read", emitted)
+	}
+	if first != 100 {
+		t.Errorf("the emitted setting reads %v, want the 100 of the row that arrived", first)
+	}
+
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("there were unfulfilled expectations: %s", err)
 	}

@@ -233,17 +233,15 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 
 	server.datname = target.datname
 
-	// Discovery names every database it finds. Without discovery nothing has,
-	// and the connection string usually does: a URL carries the database in
-	// its path and a key=value string in dbname. Reading it costs no round
-	// trip and is what stops a per-database series from being published with
-	// no database on it, which Prometheus reads as absent and which two
-	// targets on one host then share.
+	// Discovery names every database it finds. Without discovery the
+	// connection string usually names one, in a URL path or in dbname, and
+	// reading it costs no round trip. A per-database series needs the name,
+	// and Prometheus reads an empty label as absent, so two targets on one
+	// host would share a label set without it.
 	//
-	// It returns nothing when the string names no database, because libpq then
-	// falls back to the role name, and when it names two different ones. The
-	// server is asked below, where a query needs the name to decide where it
-	// runs.
+	// It names none when the string omits the database, where libpq falls
+	// back to the role name, and when the string names two. The server is
+	// asked below, where a query needs the name to decide where it runs.
 	if server.datname == "" {
 		if name, ok := config.DatabaseFromDSN(dsn); ok {
 			server.datname = name

@@ -229,10 +229,7 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 		// the query again however long cache_seconds was.
 		key := querycache.Key{
 			// The connection this came from, not the host and port it
-			// reached. Several targets share a host and port, and keyed by
-			// the fingerprint they shared a cache entry: one target's metrics
-			// were served for another, and one of the two disappeared from
-			// exposition.
+			// reached, which targets share.
 			Target:    server.cacheIdentity(),
 			Database:  server.datname,
 			Collector: collector,
@@ -249,15 +246,11 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 		var nonFatalErrors []error
 		var err error
 
-		// Read from the cache's clock, so the age below is a difference
-		// between two readings of one clock rather than of two.
-		//
-		// Read here, where this namespace's query is about to run, and not
-		// once for the whole scrape. A scrape collects one namespace after
-		// another, so a time taken before all of them dates a result to
-		// before the work that preceded it. It also orders two overlapping
-		// collections of the same namespace, which a per-scrape start time
-		// cannot: two scrapes can begin in the same moment.
+		// This namespace's collection time, read where its query runs rather
+		// than once per scrape: a scrape collects one namespace after another,
+		// and the time also orders two overlapping collections of the same
+		// namespace. Read from the cache's clock, so the age below is a
+		// difference between two readings of one clock.
 		now := cache.Now()
 		collectedAt := now
 
@@ -298,11 +291,10 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 		// and it is the data being right rather than looking continuous.
 		//
 		// A cacheable namespace is stamped on every response, including the
-		// one that collected it. Stamped only on cache hits, one collection
-		// got two instants: the response that collected it was recorded when
-		// the scraper read it, and later responses at the collection time. A
-		// namespace that does not ask to be cached is collected every scrape,
-		// so it is left unstamped and recorded as it was before.
+		// one that collected it, so that one collection is one instant
+		// however many responses carry it. A namespace that does not ask to
+		// be cached is collected every scrape and is left unstamped, so the
+		// scraper records it when it reads it.
 		cacheable := mapping.cacheSeconds > 0
 		age := now.Sub(collectedAt)
 		if age < 0 {
@@ -315,16 +307,19 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 			ch <- metric
 		}
 
-		// How old what this namespace served is, for the namespaces where
-		// that can be anything but zero. Published for every namespace, it
-		// was a series per namespace per database reporting a constant: a
-		// stock installation caches nothing, so all of them read zero, and
-		// the number of them is the one thing on this endpoint that grows
-		// with both the query files and the databases.
-		if cacheable {
+		// How old what this namespace served is. Published for a cacheable
+		// namespace that produced an answer.
+		//
+		// Not for the others: without cache_seconds the age can only read
+		// zero, and a series per namespace per database saying so is the one
+		// thing here that grows with both the query files and the databases.
+		// Not for a failed collection either, which has no samples to be the
+		// age of, and reported zero: freshly collected, which is how a
+		// namespace nothing could be read from looked like one read in full.
+		if cacheable && err == nil {
 			ch <- prometheus.MustNewConstMetric(
 				cacheAgeDesc(server), prometheus.GaugeValue, age.Seconds(),
-				namespace, server.datname)
+				namespace, server.datname, server.role)
 		}
 
 		// A failed query is not an answer, so it is not cached. Caching it
@@ -349,14 +344,18 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 func cacheAgeDesc(server *Server) *prometheus.Desc {
 	return prometheus.NewDesc(
 		"pg_exporter_namespace_cache_age_seconds",
-		"Age in seconds of the samples this namespace served, per database. Published for the namespaces that set cache_seconds and for no others. Zero means they were collected during this scrape. A positive value means they came from the cache, and those samples carry the time they were collected rather than the time of this scrape.",
-		// datname as well as namespace, because a query runs once per
-		// database it selects. Without it, two databases produced the same
-		// label set and the registry rejected the second as a duplicate,
-		// which is the same mistake the collectors made before they carried
-		// a database name. It is empty when the name is not known, which
+		"Age in seconds of the samples this namespace served, per database and role. Published for the namespaces that set cache_seconds, and not for a collection that failed. Zero means they were collected during this scrape. A positive value means they came from the cache, and those samples carry the time they were collected rather than the time of this scrape.",
+		// One series per collection, so the labels have to say which
+		// collection. The constant labels carry host and port, which several
+		// targets share: they differ by database, by role, or by something
+		// else the connection string carries. datname and the role name the
+		// first two, and two targets differing only in a connection parameter
+		// beyond them still share a label set, which collects the same data
+		// twice and reports it once.
+		//
+		// Either is empty when the connection string does not name it, which
 		// Prometheus reads as absent.
-		[]string{"namespace", "datname"},
+		[]string{"namespace", "datname", "usename"},
 		server.labels,
 	)
 }

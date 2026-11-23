@@ -225,13 +225,24 @@ func TestAFailedQueryIsNotCached(t *testing.T) {
 		},
 	}
 
-	_, errs := collectNamespaces(t, server, cache)
+	failed, errs := collectNamespaces(t, server, cache)
 	if len(errs) != 1 {
 		t.Fatalf("a failed query produced %d errors, want 1", len(errs))
 	}
 
 	if cached := cache.Len(); cached != 0 {
 		t.Errorf("a failed query was cached, so the namespace is blank until it expires")
+	}
+
+	// No samples, so no age. Published as zero, it read as freshly collected,
+	// which is how a namespace nothing could be read from looked like one read
+	// in full.
+	if got := failed[cachedNamespace+"_value"]; len(got) != 0 {
+		t.Fatalf("a failed query emitted %d samples", len(got))
+	}
+	if ages := failed["pg_exporter_namespace_cache_age_seconds"]; len(ages) != 0 {
+		t.Errorf("failed query with no samples reports cache age %v",
+			ages[0].GetGauge().GetValue())
 	}
 
 	second, errs := collectNamespaces(t, server, cache)

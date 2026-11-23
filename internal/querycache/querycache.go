@@ -81,11 +81,10 @@ func New() *Cache {
 
 // NewWithClock returns an empty cache that reads the time from now.
 //
-// For tests. The engine asks the cache what time it is rather than calling
-// time.Now itself, so a test that moves this clock moves the one reading both
-// of them use. An earlier version put a clock here that only the cache could
-// see, which made the cache and the engine disagree about the present and let
-// a test pass on a disagreement rather than on the behaviour.
+// For tests. The engine reads the time through the cache rather than calling
+// time.Now itself, so moving this clock moves the one reading both of them
+// use. A clock only the cache could see would let them disagree about the
+// present.
 func NewWithClock(now func() time.Time) *Cache {
 	if now == nil {
 		now = time.Now
@@ -137,15 +136,11 @@ func (c *Cache) Get(key Key) ([]prometheus.Metric, time.Time, bool) {
 // behind.
 //
 // Overlapping scrapes both miss and both run the query, and they finish in the
-// order the server answers rather than the order they started. An
-// unconditional store then keeps the older of the two observations and serves
-// it until it expires. Measured through the handler with a function that takes
-// a sequence value and then sleeps: the slow request observed 1, the
-// overlapping fast one observed 2, and the cache held 1.
-//
-// Refusing the older write is preferred to serialising refreshes per key,
-// which would make one scrape wait on another scrape's slow query and spend a
-// request budget on work that request did not ask for.
+// order the server answers rather than the order they started, so an
+// unconditional store keeps whichever observation was written last. Refusing
+// the older write is preferred to serialising refreshes per key, which would
+// make one scrape wait on another scrape's slow query and spend a request
+// budget on work that request did not ask for.
 func (c *Cache) Put(key Key, metrics []prometheus.Metric, collectedAt time.Time, lifetime time.Duration) {
 	if c == nil {
 		return

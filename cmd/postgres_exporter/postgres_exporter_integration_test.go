@@ -2499,6 +2499,14 @@ role_targets:
 	c.Check(labelValues(served, "role_targets_value", "usename"), DeepEquals, roles,
 		Commentf("the second response carried %v, want both roles: one target was served the other's cached result",
 			labelValues(served, "role_targets_value", "usename")))
+
+	// The diagnostic has to say which collection it describes. Labelled by
+	// namespace and database alone, two roles against one database produced
+	// one label set, the registry refused the second, and the two collections
+	// reported one age between them.
+	c.Check(labelValues(served, "pg_exporter_namespace_cache_age_seconds", "usename"), DeepEquals, roles,
+		Commentf("the age series carried %v, want one per role",
+			labelValues(served, "pg_exporter_namespace_cache_age_seconds", "usename")))
 }
 
 // TestASlowCollectionDoesNotReplaceANewerOne covers overlapping refreshes
