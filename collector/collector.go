@@ -561,8 +561,30 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 // are published under the names they were recorded under.
 func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, controlName string, cluster, local map[string]Collector) {
 	target, _ := targetid.ID(dsn)
+
+	// Cluster-wide collectors describe the server. They are selected
+	// independently of the database lists and recorded with no database.
 	p.publishRetained(ch, cluster, target, "")
-	p.publishRetained(ch, local, target, controlName)
+
+	for name := range local {
+		database := controlName
+		if database == "" {
+			// The connection string does not name it and the connection is
+			// not open, so the database this collector last succeeded on is
+			// the only name there is.
+			if recorded, _, ok := p.lastSuccess.Latest(lastsuccess.EngineCollector, target, name); ok {
+				database = recorded
+			}
+		}
+		// Selection as it stands now, not as it stood when the success was
+		// recorded. A database the configuration no longer selects is not part
+		// of this scrape's answer, and its state is kept for a request that
+		// selects it again.
+		if database == "" || !p.controlSelected(database) {
+			continue
+		}
+		p.publishRetainedOne(ch, target, database, name)
+	}
 }
 
 // publishRetained publishes what these collectors last did on this database,
@@ -575,16 +597,21 @@ func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, 
 // already known.
 func (p PostgresCollector) publishRetained(ch chan<- prometheus.Metric, collectors map[string]Collector, target, datname string) {
 	for name := range collectors {
-		key := lastsuccess.Key{
-			Engine:    lastsuccess.EngineCollector,
-			Target:    target,
-			Database:  datname,
-			Collector: name,
-		}
-		if when, ok := p.lastSuccess.At(key); ok {
-			ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
-				float64(when.UnixNano())/1e9, name, datname, target)
-		}
+		p.publishRetainedOne(ch, target, datname, name)
+	}
+}
+
+// publishRetainedOne publishes what one collector last did on one database.
+func (p PostgresCollector) publishRetainedOne(ch chan<- prometheus.Metric, target, datname, name string) {
+	key := lastsuccess.Key{
+		Engine:    lastsuccess.EngineCollector,
+		Target:    target,
+		Database:  datname,
+		Collector: name,
+	}
+	if when, ok := p.lastSuccess.At(key); ok {
+		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
+			float64(when.UnixNano())/1e9, name, datname, target)
 	}
 }
 

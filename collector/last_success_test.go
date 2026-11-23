@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -303,5 +304,114 @@ func TestAFilteredOutCollectorIsAbsentButRemembered(t *testing.T) {
 	}
 	if _, ok := store.At(key); !ok {
 		t.Error("a collector the request did not select lost its remembered success")
+	}
+}
+
+// retainedAfterNoPermit runs one successful collection and then a scrape with
+// no connection permit, and returns the last-success samples of the second.
+func retainedAfterNoPermit(t *testing.T, p PostgresCollector, name, datname, dsn string) []MetricResult {
+	t.Helper()
+
+	if got := runCollector(quietCollector{}, name, datname, dsn, p.lastSuccess); len(got) == 0 {
+		t.Fatal("the first run published nothing, so there is nothing to retain")
+	}
+	if _, ok := runCollector(quietCollector{}, name, datname, dsn, p.lastSuccess)[lastSuccessMetric]; !ok {
+		t.Fatal("the first run recorded no success")
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.ctx = cancelled
+	p.connSema = semaphore.NewWeighted(1)
+
+	ch := make(chan prometheus.Metric, 32)
+	p.Collect(ch)
+	close(ch)
+
+	var out []MetricResult
+	for m := range ch {
+		if familyName(m) == lastSuccessMetric {
+			out = append(out, readMetric(m))
+		}
+	}
+	return out
+}
+
+// TestRetainedDatabaseComesFromTheStoreWhenTheDSNOmitsIt covers ChatGPT's
+// omitted-database case.
+//
+// A connection string need not name a database, and a scrape with no permit
+// never opens the connection to ask. The database this collector last
+// succeeded on is the only name there is, and taking the connection string's
+// empty one looked the series up under a database that does not exist.
+func TestRetainedDatabaseComesFromTheStoreWhenTheDSNOmitsIt(t *testing.T) {
+	withScopedCollector(t, "scope_test_local", scopeDatabase)
+	const dsn = "postgresql://probe@127.0.0.1:1/?sslmode=disable"
+
+	p := PostgresCollector{
+		Collectors:  map[string]Collector{"scope_test_local": quietCollector{}},
+		logger:      log.NewNopLogger(),
+		ctx:         context.Background(),
+		lastSuccess: lastsuccess.New(),
+		instance:    &instance{dsn: dsn, name: "127.0.0.1:1"},
+	}
+
+	// The success is recorded on the database the server reported, which is
+	// not in the connection string.
+	got := retainedAfterNoPermit(t, p, "scope_test_local", "app", dsn)
+	if len(got) != 1 {
+		t.Fatalf("%d freshness samples after a scrape with no permit, want 1", len(got))
+	}
+	if got[0].labels["datname"] != "app" {
+		t.Errorf("the retained series names %q, want the database the success was recorded on", got[0].labels["datname"])
+	}
+}
+
+// TestSelectionAppliesToRetainedSeries covers the three selection cases.
+//
+// A database the configuration no longer selects is not part of this scrape's
+// answer, whatever was recorded before. The state is kept, because a later
+// request that selects it again should still know when it last worked.
+func TestSelectionAppliesToRetainedSeries(t *testing.T) {
+	const dsn = "postgresql://probe@127.0.0.1:1/app?sslmode=disable"
+
+	for _, tc := range []struct {
+		name    string
+		exclude dbselect.List
+		include dbselect.List
+	}{
+		{"an exclude list naming it", dbselect.Of([]string{"app"}), dbselect.Absent()},
+		{"an include list naming another", dbselect.Absent(), dbselect.Of([]string{"other"})},
+		{"an explicitly empty include list", dbselect.Absent(), dbselect.Of(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withScopedCollector(t, "scope_test_local", scopeDatabase)
+			store := lastsuccess.New()
+			p := PostgresCollector{
+				Collectors:       map[string]Collector{"scope_test_local": quietCollector{}},
+				logger:           log.NewNopLogger(),
+				ctx:              context.Background(),
+				lastSuccess:      store,
+				excludeDatabases: tc.exclude,
+				includeDatabases: tc.include,
+				instance:         &instance{dsn: dsn, name: "127.0.0.1:1"},
+			}
+
+			got := retainedAfterNoPermit(t, p, "scope_test_local", "app", dsn)
+			if len(got) != 0 {
+				t.Errorf("%d freshness samples for a database this scrape does not select: %v", len(got), got)
+			}
+
+			// Kept, though: a later request that selects it again has to know.
+			target, _ := targetid.ID(dsn)
+			if _, ok := store.At(lastsuccess.Key{
+				Engine:    lastsuccess.EngineCollector,
+				Target:    target,
+				Database:  "app",
+				Collector: "scope_test_local",
+			}); !ok {
+				t.Error("a database this scrape does not select lost its remembered success")
+			}
+		})
 	}
 }
