@@ -252,29 +252,16 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		registry.MustRegister(lrExporter)
 	}
 
-	// A missing key reads as a nil Collector, and registering one panics
-	// inside a goroutine the registry starts, where nothing recovers it: the
-	// process goes, not the request. main supplies all three, so this is a
-	// guard against a map that does not rather than a case that happens.
-	registerGlobal := func(name string) {
-		c, ok := globalCollectors[name]
-		if !ok || c == nil {
-			level.Error(logger).Log("msg", "A collector was selected and is not present, so it was not registered", "collector", name)
-			return
-		}
-		registry.MustRegister(c)
-	}
-
 	if filters.EnableAllCollectors || filters.EnableGoCollector {
-		registerGlobal("standard.go")
+		registry.MustRegister(globalCollectors["standard.go"])
 	}
 
 	if filters.EnableAllCollectors || filters.EnableProcessCollector {
-		registerGlobal("standard.process")
+		registry.MustRegister(globalCollectors["standard.process"])
 	}
 
 	if filters.EnableAllCollectors || filters.EnableVersionCollector {
-		registerGlobal("version")
+		registry.MustRegister(globalCollectors["version"])
 	}
 
 	if filters.EnableAllCollectors || filters.EnablePostgresCollector {

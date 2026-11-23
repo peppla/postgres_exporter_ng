@@ -49,6 +49,8 @@ import (
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	vc "github.com/prometheus/client_golang/prometheus/collectors/version"
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sync/semaphore"
 	. "gopkg.in/check.v1"
@@ -2685,6 +2687,16 @@ fallback_probe:
 			labelValues(body, "pg_exporter_namespace_cache_age_seconds", "datname"), fromQuery))
 }
 
+// globalCollectorsForTest builds the process-wide collectors main builds, for
+// the tests that ask for every collector.
+func globalCollectorsForTest() map[string]prometheus.Collector {
+	return map[string]prometheus.Collector{
+		"standard.process": collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		"standard.go":      collectors.NewGoCollector(),
+		"version":          vc.NewCollector(exporterName),
+	}
+}
+
 // TestTwoResolutionsSharingANamespaceAreTwoCollections covers the last part of
 // the cache key the diagnostic was missing.
 //
@@ -2724,8 +2736,12 @@ resolution_probe:
 
 	cache := querycache.New()
 	limits := budget.Defaults()
+	// The collectors main supplies, because one of the requests below is a
+	// plain /metrics, which asks for all of them. An empty map here would
+	// make the fixture a test of what happens when a selected collector is
+	// absent, which is not what this is about.
 	h := Handler(log.NewNopLogger(), []string{configured},
-		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		semaphore.NewWeighted(limits.Connections), globalCollectorsForTest(),
 		limits, NewCollectionGate(limits), cache)
 
 	scrape := func(query string) string {
