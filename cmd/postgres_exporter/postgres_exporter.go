@@ -910,7 +910,7 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				}
 				defer e.connSema.Release(1)
 			}
-			if err := e.scrapeDSN(ch, target); err != nil {
+			if err := e.scrapeDSN(ch, &target); err != nil {
 				errorsCount.Add(1)
 
 				level.Error(logger).Log("err", err)

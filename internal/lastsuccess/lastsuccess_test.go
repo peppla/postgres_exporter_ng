@@ -110,3 +110,37 @@ func TestANilStoreIsUsable(t *testing.T) {
 		t.Error("a nil store reported keys")
 	}
 }
+
+// TestLatestAnswersForATargetWhoseDatabaseIsUnknown covers the case a scrape
+// has when its connection has just failed: it knows which connection it is and
+// not which database that connection reaches, because the name comes from the
+// server.
+func TestLatestAnswersForATargetWhoseDatabaseIsUnknown(t *testing.T) {
+	s := New()
+	older := time.Now().Add(-time.Hour)
+	newer := time.Now()
+
+	s.Record(Key{Target: "1", Database: "app", Collector: "exporter"}, older)
+	s.Record(Key{Target: "1", Database: "reporting", Collector: "exporter"}, newer)
+	// Another job and another target, neither of which this may answer with.
+	s.Record(Key{Target: "1", Database: "app", Collector: "custom_query.lr"}, newer)
+	s.Record(Key{Target: "2", Database: "other", Collector: "exporter"}, newer)
+
+	database, when, ok := s.Latest("1", "exporter")
+	if !ok {
+		t.Fatal("a target with recorded successes reports none")
+	}
+	if database != "reporting" {
+		t.Errorf("the latest success is on %q, want reporting", database)
+	}
+	if !when.Equal(newer) {
+		t.Errorf("the latest success is at %s, want %s", when, newer)
+	}
+
+	if _, _, ok := s.Latest("3", "exporter"); ok {
+		t.Error("a target with no successes reported one")
+	}
+	if _, _, ok := s.Latest("1", "custom_query.hr"); ok {
+		t.Error("a job with no successes reported another job's")
+	}
+}

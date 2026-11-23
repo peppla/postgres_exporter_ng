@@ -228,6 +228,15 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 
 	for _, t := range targets {
 		if t.datname == "" {
+			// Not known before the connection is open, and a connection that
+			// fails never opens. What this connection last succeeded on is the
+			// database the freshness diagnostic belongs to, and dropping the
+			// series exactly when the connection breaks drops it when it
+			// matters most.
+			if database, when, ok := c.lastSuccess.Latest(t.identity, c.job); ok {
+				c.databaseLastSuccess.WithLabelValues(t.server, database, t.identity).
+					Set(float64(when.UnixNano()) / 1e9)
+			}
 			continue
 		}
 		c.databaseSelected.WithLabelValues(t.server, t.datname).Set(1)

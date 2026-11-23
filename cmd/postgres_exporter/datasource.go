@@ -235,7 +235,10 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 	return dbNames, nil
 }
 
-func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) error {
+// scrapeDSN collects one target. It writes the database name back into the
+// target once it knows it, so the caller can report that database's outcome:
+// without discovery the name is not known before the connection is open.
+func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target *scrapeTarget) error {
 	dsn := target.dsn
 	server, err := e.GetServer(e.ctx, dsn)
 	if err != nil {
@@ -303,19 +306,30 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 	// that cannot be labelled is not a reason to collect nothing.
 	if server.datname == "" {
 		forSelection := serverNeedsDatabaseName(server)
-		if forSelection || serverCachesANamespace(server) {
+		// The freshness diagnostic needs the name too, and it is published for
+		// every database, not only the ones a query restricts itself to. Asked
+		// once: after the first success the store knows the name, and asking
+		// again would be a round trip per scrape for an answer already held.
+		remembered, _, known := e.lastSuccess.Latest(target.identity, e.collectorName)
+		if forSelection || serverCachesANamespace(server) || !known {
 			var name string
 			if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
 				if forSelection {
 					return fmt.Errorf("could not determine the current database on %s, so queries restricted by database name could not run: %w", server, err)
 				}
-				level.Warn(logger).Log("msg", "Could not determine the current database, so cached namespaces are reported without one",
+				level.Warn(logger).Log("msg", "Could not determine the current database, so this scrape is reported without one",
 					"server", server, "err", err)
+				server.datname = remembered
 			} else {
 				server.datname = name
 			}
+		} else {
+			server.datname = remembered
 		}
 	}
+
+	// What the caller reports this target's outcome against.
+	target.datname = server.datname
 
 	return server.Scrape(e.ctx, ch, e.disableSettingsMetrics, e.queryCache, e.collectorName)
 }

@@ -2587,6 +2587,62 @@ role_targets:
 			labelValues(served, "pg_exporter_namespace_cache_age_seconds", "usename")))
 }
 
+// TestLastSuccessWithoutDiscovery covers the default path, which is the one
+// ChatGPT found publishing nothing.
+//
+// Without discovery a target has no database name until the connection is open
+// and the server is asked, and the freshness diagnostic was skipped for every
+// target in that state. Discovery is not a prerequisite for knowing when a
+// database was last collected.
+func (s *IntegrationSuite) TestLastSuccessWithoutDiscovery(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+
+	// A connection string with no database in it, so nothing short of asking
+	// the server can name what this scrape is collecting.
+	parsed, err := url.Parse(configured)
+	c.Assert(err, IsNil)
+	withoutDatabase := *parsed
+	withoutDatabase.Path = "/"
+	q := withoutDatabase.Query()
+	q.Del("dbname")
+	withoutDatabase.RawQuery = q.Encode()
+
+	dir := writeQueryFile(c, "fresh.yaml", `
+freshness_probe:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  metrics:
+    - datname: {usage: "LABEL", description: "The database this ran on"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{withoutDatabase.String()},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), lastsuccess.New(),
+		dbselect.Absent(), dbselect.Absent())
+
+	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	c.Assert(rec.Code, Equals, 200)
+	body := rec.Body.String()
+
+	// What the server says it is, which is what the diagnostic has to agree
+	// with rather than a name this test wrote down.
+	fromQuery := labelValues(body, "freshness_probe_value", "datname")
+	c.Assert(len(fromQuery), Equals, 1, Commentf("the query produced %v, want one sample", fromQuery))
+	c.Assert(fromQuery[0], Not(Equals), "", Commentf("the query reported no database"))
+
+	published := labelValues(body, "pg_exporter_database_last_success_timestamp_seconds", "datname")
+	c.Check(published, DeepEquals, fromQuery,
+		Commentf("the freshness diagnostic reported %v for a scrape the query says ran on %v, with discovery off",
+			published, fromQuery))
+}
+
 // TestABadLabelNameDoesNotStopTheExporter is the production-path half of the
 // label-error correction.
 //

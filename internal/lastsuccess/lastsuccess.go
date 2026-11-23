@@ -91,6 +91,35 @@ func (s *Store) At(key Key) (time.Time, bool) {
 	return t, ok
 }
 
+// Latest returns the most recent success for a target and job, with the
+// database it was on.
+//
+// For a scrape that cannot name the database it is collecting: without
+// discovery the name comes from the server, and a scrape whose connection
+// failed has no server to ask. The database that last succeeded over this
+// connection is the one the diagnostic belongs to, and losing the series at
+// exactly the moment the connection breaks would lose it when it matters.
+func (s *Store) Latest(target, collector string) (string, time.Time, bool) {
+	if s == nil {
+		return "", time.Time{}, false
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	var database string
+	var newest time.Time
+	var found bool
+	for key, t := range s.seen {
+		if key.Target != target || key.Collector != collector {
+			continue
+		}
+		if !found || t.After(newest) {
+			database, newest, found = key.Database, t, true
+		}
+	}
+	return database, newest, found
+}
+
 // Len reports how many keys are held.
 //
 // One entry per connection, database and job this process has collected. That

@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
@@ -717,5 +718,39 @@ func TestTwoTargetsOnOneDatabaseKeepSeparateLastSuccess(t *testing.T) {
 	}
 	if published != 2 {
 		t.Errorf("two connections to one database published %d last-success series, want 2", published)
+	}
+}
+
+// TestLastSuccessSurvivesANameTheScrapeCannotResolve covers the scrape that
+// cannot say which database it is.
+//
+// Without discovery the name comes from the server, so a connection that fails
+// has nothing to ask. ChatGPT found the series missing entirely on that path.
+// What the connection last succeeded on is the database it belongs to.
+func TestLastSuccessSurvivesANameTheScrapeCannotResolve(t *testing.T) {
+	store := lastsuccess.New()
+	when := time.Now().Add(-time.Minute)
+	store.Record(lastsuccess.Key{Target: "1", Database: "root", Collector: "exporter"}, when)
+
+	// A target the scrape could not name, which is what a failed connection
+	// leaves behind.
+	unnamed := scrapeTarget{
+		dsn:         "postgresql://root:p@h:5432/?sslmode=disable",
+		databaseRef: databaseRef{server: "h:5432", identity: "1"},
+	}
+
+	c := newCoverageMetrics(nil, store, "exporter")
+	c.setSelection(true, true, 1, []scrapeTarget{unnamed}, nil, 0)
+	c.setDatabaseOutcome(unnamed.databaseRef, reasonConnect)
+	c.setOutcome(1, 1, 0)
+
+	got := series(t, c)
+	key := "pg_exporter_database_last_success_timestamp_seconds{datname=root,server=h:5432,target=1}"
+	value, ok := got[key]
+	if !ok {
+		t.Fatalf("a connection that failed lost the last success it had: %v", got)
+	}
+	if want := float64(when.UnixNano()) / 1e9; value != want {
+		t.Errorf("the last success reads %v, want the recorded %v", value, want)
 	}
 }
