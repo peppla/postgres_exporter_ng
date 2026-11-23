@@ -20,21 +20,23 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
 
 // collectNamespaces runs one scrape of the namespace engine and returns what
 // it emitted, keyed by metric name.
-func collectNamespaces(t *testing.T, server *Server) (map[string][]*dto.Metric, map[string]error) {
+func collectNamespaces(t *testing.T, server *Server, cache *querycache.Cache) (map[string][]*dto.Metric, map[string]error) {
 	t.Helper()
 	ch := make(chan prometheus.Metric, 64)
-	errs := queryNamespaceMappings(ch, server)
+	errs := queryNamespaceMappings(context.Background(), ch, server, cache, "custom_query.lr")
 	close(ch)
 
 	out := map[string][]*dto.Metric{}
@@ -97,17 +99,17 @@ func TestCacheServesTheCollectionTimeNotTheScrapeTime(t *testing.T) {
 	mock.ExpectQuery("FROM cached_thing").WillReturnRows(
 		sqlmock.NewRows([]string{"value"}).AddRow(42.0))
 
+	cache := querycache.New()
 	server := &Server{
 		db:             db,
 		labels:         prometheus.Labels{"server": "test"},
 		queryOverrides: map[string]string{cachedNamespace: cachedQuery},
-		metricCache:    map[string]cachedMetrics{},
 		metricMap: map[string]MetricMapNamespace{
 			cachedNamespace: {cacheSeconds: 300},
 		},
 	}
 
-	first, errs := collectNamespaces(t, server)
+	first, errs := collectNamespaces(t, server, cache)
 	if len(errs) != 0 {
 		t.Fatalf("the first scrape failed: %v", errs)
 	}
@@ -126,16 +128,19 @@ func TestCacheServesTheCollectionTimeNotTheScrapeTime(t *testing.T) {
 			sample[0].GetTimestampMs())
 	}
 
-	// Make the cached entry look a minute old, which is well inside the
-	// lifetime, so the second scrape serves it.
-	server.cacheMtx.Lock()
-	entry := server.metricCache[cachedNamespace]
+	// Put the same entry back a minute older, which is well inside its
+	// lifetime, so the second scrape serves it. Ageing the entry rather than
+	// the clock keeps the cache and the engine reading the same now, which a
+	// clock only the cache could see did not.
+	key := cacheKeyFor(server, cachedNamespace)
+	held, _, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("the first scrape cached nothing, so there is nothing for the second to serve")
+	}
 	collectedAt := time.Now().Add(-time.Minute)
-	entry.lastScrape = collectedAt
-	server.metricCache[cachedNamespace] = entry
-	server.cacheMtx.Unlock()
+	cache.Put(key, held, collectedAt, 300*time.Second)
 
-	second, errs := collectNamespaces(t, server)
+	second, errs := collectNamespaces(t, server, cache)
 	if len(errs) != 0 {
 		t.Fatalf("the second scrape failed: %v", errs)
 	}
@@ -181,29 +186,26 @@ func TestAFailedQueryIsNotCached(t *testing.T) {
 	mock.ExpectQuery("FROM cached_thing").WillReturnRows(
 		sqlmock.NewRows([]string{"value"}).AddRow(7.0))
 
+	cache := querycache.New()
 	server := &Server{
 		db:             db,
 		labels:         prometheus.Labels{"server": "test"},
 		queryOverrides: map[string]string{cachedNamespace: cachedQuery},
-		metricCache:    map[string]cachedMetrics{},
 		metricMap: map[string]MetricMapNamespace{
 			cachedNamespace: {cacheSeconds: 300},
 		},
 	}
 
-	_, errs := collectNamespaces(t, server)
+	_, errs := collectNamespaces(t, server, cache)
 	if len(errs) != 1 {
 		t.Fatalf("a failed query produced %d errors, want 1", len(errs))
 	}
 
-	server.cacheMtx.Lock()
-	cached := len(server.metricCache)
-	server.cacheMtx.Unlock()
-	if cached != 0 {
+	if cached := cache.Len(); cached != 0 {
 		t.Errorf("a failed query was cached, so the namespace is blank until it expires")
 	}
 
-	second, errs := collectNamespaces(t, server)
+	second, errs := collectNamespaces(t, server, cache)
 	if len(errs) != 0 {
 		t.Fatalf("the retry failed: %v", errs)
 	}
@@ -232,28 +234,30 @@ func TestAnExpiredEntryIsRecollected(t *testing.T) {
 	mock.ExpectQuery("FROM cached_thing").WillReturnRows(
 		sqlmock.NewRows([]string{"value"}).AddRow(2.0))
 
+	cache := querycache.New()
 	server := &Server{
 		db:             db,
 		labels:         prometheus.Labels{"server": "test"},
 		queryOverrides: map[string]string{cachedNamespace: cachedQuery},
-		metricCache:    map[string]cachedMetrics{},
 		metricMap: map[string]MetricMapNamespace{
 			cachedNamespace: {cacheSeconds: 10},
 		},
 	}
 
-	if _, errs := collectNamespaces(t, server); len(errs) != 0 {
+	if _, errs := collectNamespaces(t, server, cache); len(errs) != 0 {
 		t.Fatalf("the first scrape failed: %v", errs)
 	}
 
-	// Older than the lifetime.
-	server.cacheMtx.Lock()
-	entry := server.metricCache[cachedNamespace]
-	entry.lastScrape = time.Now().Add(-30 * time.Second)
-	server.metricCache[cachedNamespace] = entry
-	server.cacheMtx.Unlock()
+	// Put it back as something collected thirty seconds ago, which is past
+	// the ten-second lifetime it was stored with.
+	key := cacheKeyFor(server, cachedNamespace)
+	held, _, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("the first scrape cached nothing")
+	}
+	cache.Put(key, held, time.Now().Add(-30*time.Second), 10*time.Second)
 
-	second, errs := collectNamespaces(t, server)
+	second, errs := collectNamespaces(t, server, cache)
 	if len(errs) != 0 {
 		t.Fatalf("the second scrape failed: %v", errs)
 	}
@@ -269,5 +273,19 @@ func TestAnExpiredEntryIsRecollected(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
+// cacheKeyFor builds the key the engine builds, so a test can look at what
+// the engine stored.
+func cacheKeyFor(server *Server, namespace string) querycache.Key {
+	return querycache.Key{
+		Target:    server.String(),
+		Database:  server.datname,
+		Collector: "custom_query.lr",
+		Namespace: namespace,
+		// The same fingerprint the engine builds, which folds in the SQL as
+		// well as the mapping.
+		Definition: definitionWithQuery("", server.queryOverrides[namespace]),
 	}
 }

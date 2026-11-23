@@ -20,6 +20,7 @@ import (
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
@@ -54,7 +55,7 @@ var (
 // limits is the budget one scrape may spend. The request gate is built once,
 // here, rather than per request: it is a limit on how many collections run at
 // the same time, so it has to be the same object across them.
-func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted) http.Handler {
+func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Refused before any SQL runs, and not queued. A queue turns an
 		// overloaded exporter into a slow one, and the scrapes waiting in it
@@ -123,7 +124,7 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 			}
 		}
 
-		registry := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits)
+		registry := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache)
 
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
 		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
@@ -149,7 +150,7 @@ type Filters struct {
 }
 
 // makeRegistry creates a new prometheus registry with default and percona exporters.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits) *prometheus.Registry {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache) *prometheus.Registry {
 	registry := prometheus.NewRegistry()
 
 	// Always, whatever was selected. A refused request serves no metrics of
@@ -176,6 +177,10 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		AutoDiscoverDatabases(*autoDiscoverDatabases),
 		WithConnectionsSemaphore(connSema),
 		WithContext(ctx),
+		// The cache belongs to the process. An exporter is built per request,
+		// so one it owned would be empty on arrival and discarded on the way
+		// out, which is what cache_seconds was doing.
+		WithQueryCache(queryCache),
 	}
 
 	if filters.EnableAllCollectors || filters.EnableDefaultCollector {

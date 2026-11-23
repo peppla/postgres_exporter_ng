@@ -28,6 +28,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	vc "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -196,7 +197,10 @@ func main() {
 	connSema := semaphore.NewWeighted(limits.Connections)
 	// One admission gate for every endpoint that collects.
 	collectionGate := NewCollectionGate(limits)
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate))
+	// One cache for the process, so a result a query file asked to keep
+	// survives the request that collected it.
+	queryCache := querycache.New()
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache))
 
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{

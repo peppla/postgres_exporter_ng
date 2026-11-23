@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,7 @@ import (
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -179,7 +181,7 @@ func (s *IntegrationSuite) TestAllNamespacesReturnResults(c *C) {
 		}
 
 		// This should never happen in our test cases.
-		errMap := queryNamespaceMappings(context.Background(), rec.ch, server)
+		errMap := queryNamespaceMappings(context.Background(), rec.ch, server, querycache.New(), "test")
 		if !c.Check(len(errMap), Equals, 0) {
 			fmt.Println("## NAMESPACE ERRORS FOUND")
 			for namespace, err := range errMap {
@@ -1965,7 +1967,7 @@ func scrapeHTTP(dsn string, limits budget.Limits, header string, collect ...stri
 	rec := httptest.NewRecorder()
 
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
-		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits))
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits), querycache.New())
 
 	start := time.Now()
 	h.ServeHTTP(rec, req)
@@ -2125,4 +2127,168 @@ func (s *IntegrationSuite) TestMetadataLookupObeysTheBudget(c *C) {
 	c.Check(code, Equals, 200)
 	c.Check(elapsed < 3*time.Second, Equals, true,
 		Commentf("a quarter-second scrape spent %s in the version lookup", elapsed))
+}
+
+// TestCacheSecondsHoldsAcrossHTTPScrapes is the test the earlier cache work
+// should have had.
+//
+// The unit tests reused one Server object, which is the one arrangement where
+// a per-request cache appears to work. Through the handler nothing was cached
+// at all: a fresh exporter per request builds a fresh server whose cache
+// starts empty, so two consecutive scrapes of a query returning nextval
+// returned 1 and 2 and both reported an age of zero.
+//
+// A sequence is used rather than a clock, because what has to be shown is
+// that the query did not run again, and a sequence says so from the server's
+// side.
+func (s *IntegrationSuite) TestCacheSecondsHoldsAcrossHTTPScrapes(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const seq = "cache_probe_seq"
+	cleanup := func() { _, _ = admin.db.Exec(`DROP SEQUENCE IF EXISTS ` + seq) }
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE SEQUENCE ` + seq)
+	c.Assert(err, IsNil)
+
+	dir := writeQueryFile(c, "cached.yaml", `
+cached_probe:
+  query: "SELECT nextval('`+seq+`')::float8 AS value"
+  cache_seconds: 300
+  metrics:
+    - value: {usage: "GAUGE", description: "a sequence, so a second run is visible"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	// One cache for both requests, which is what main gives the handler.
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200)
+		return rec.Body.String()
+	}
+
+	first := scrape()
+	c.Assert(strings.Contains(first, "cached_probe_value"), Equals, true,
+		Commentf("the query did not run at all, so nothing below is about caching"))
+	firstValue, firstTimestamped := sampleValue(c, first, "cached_probe_value")
+	c.Check(firstTimestamped, Equals, false,
+		Commentf("a freshly collected sample carried a timestamp"))
+
+	second := scrape()
+	secondValue, secondTimestamped := sampleValue(c, second, "cached_probe_value")
+
+	c.Check(secondValue, Equals, firstValue,
+		Commentf("the sequence advanced from %v to %v, so the query ran again instead of being served from the cache",
+			firstValue, secondValue))
+
+	// A cached sample carries the time it was collected, so the timestamp is
+	// a second, independent signal that this came from the cache.
+	c.Check(secondTimestamped, Equals, true,
+		Commentf("the second sample carried no timestamp, so it was collected rather than served"))
+	c.Check(strings.Contains(second, "pg_exporter_namespace_cache_age_seconds"), Equals, true,
+		Commentf("no age was published for a cached namespace"))
+
+	// Emptying the cache makes the query run again, which shows the first two
+	// results came from the cache rather than from a query that happens to
+	// return the same number twice.
+	cache.Clear()
+	third := scrape()
+	thirdValue, _ := sampleValue(c, third, "cached_probe_value")
+	c.Check(thirdValue > firstValue, Equals, true,
+		Commentf("after clearing the cache the sequence did not advance, so the query is not what produces this value"))
+}
+
+// sampleValue reads one sample's value out of an exposition body, and says
+// whether the sample carried an explicit timestamp.
+//
+// The value is the field after the name and labels, not the last field. A
+// cached sample carries its collection time after the value, and reading the
+// last field gave that timestamp instead: the first version of this test
+// compared a sequence number against 1795433380488 and reported it as the
+// query having run twice.
+func sampleValue(c *C, body, family string) (float64, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family+"{") && !strings.HasPrefix(line, family+" ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		c.Assert(len(fields) >= 2, Equals, true, Commentf("malformed sample %q", line))
+		value, err := strconv.ParseFloat(fields[1], 64)
+		c.Assert(err, IsNil)
+		return value, len(fields) > 2
+	}
+	c.Fatalf("%s is not in the response", family)
+	return 0, false
+}
+
+// TestEditingAQueryFileInvalidatesItsCache covers the stale answer an edit
+// would otherwise leave behind.
+//
+// A cached result describes the question that was asked. Change the question
+// and the old answer is not a slow answer, it is the wrong one, and with a
+// long cache_seconds it would be served for as long as the file said.
+func (s *IntegrationSuite) TestEditingAQueryFileInvalidatesItsCache(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	dir := c.MkDir()
+	path := filepath.Join(dir, "edited.yaml")
+	write := func(value string) {
+		c.Assert(os.WriteFile(path, []byte(`
+edited_probe:
+  query: "SELECT `+value+`::float8 AS value"
+  cache_seconds: 300
+  metrics:
+    - value: {usage: "GAUGE", description: "a value the file decides"}
+`), 0o600), IsNil)
+	}
+	write("11")
+
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200)
+		return rec.Body.String()
+	}
+
+	value, _ := sampleValue(c, scrape(), "edited_probe_value")
+	c.Assert(value, Equals, float64(11),
+		Commentf("the query did not run, so this test cannot show an edit taking effect"))
+
+	// Served from the cache, unchanged, while the file is unchanged.
+	cached, timestamped := sampleValue(c, scrape(), "edited_probe_value")
+	c.Assert(cached, Equals, float64(11))
+	c.Assert(timestamped, Equals, true,
+		Commentf("the second scrape collected rather than serving, so the cache is not in play"))
+
+	// Now the question changes.
+	write("22")
+
+	edited, _ := sampleValue(c, scrape(), "edited_probe_value")
+	c.Check(edited, Equals, float64(22),
+		Commentf("the edited query returned %v, so a result from before the edit was served", edited))
 }

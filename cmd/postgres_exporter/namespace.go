@@ -15,13 +15,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/go-kit/log/level"
 	"github.com/lib/pq"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -190,7 +193,7 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 
 // Iterate through all the namespace mappings in the exporter and run their
 // queries.
-func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, server *Server) map[string]error {
+func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, server *Server, cache *querycache.Cache, collector string) map[string]error {
 	// Return a map of namespace -> errors
 	namespaceErrors := make(map[string]error)
 
@@ -222,29 +225,35 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 			continue
 		}
 
-		scrapeMetric := false
-		// Check if the metric is cached
-		server.cacheMtx.Lock()
-		cachedMetric, found := server.metricCache[namespace]
-		server.cacheMtx.Unlock()
-		// If found, check if needs refresh from cache
-		if found {
-			if scrapeStart.Sub(cachedMetric.lastScrape).Seconds() > float64(mapping.cacheSeconds) {
-				scrapeMetric = true
-			}
-		} else {
-			scrapeMetric = true
+		// The cache is the process's, not this request's. A per-request one
+		// cannot hold anything: the handler builds a fresh exporter, which
+		// builds a fresh server, so every scrape found an empty cache and ran
+		// the query again however long cache_seconds was.
+		key := querycache.Key{
+			Target:    server.String(),
+			Database:  server.datname,
+			Collector: collector,
+			Namespace: namespace,
+			// The SQL as well as the mapping. The query text is not part of
+			// the mapping, it lives in the overrides, and leaving it out
+			// meant editing a query file changed nothing: the old answer was
+			// served for as long as cache_seconds said, and it answers a
+			// question nobody is asking any more.
+			Definition: definitionWithQuery(mapping.definition, server.queryOverrides[namespace]),
 		}
 
 		var metrics []prometheus.Metric
 		var nonFatalErrors []error
 		var err error
 		collectedAt := scrapeStart
-		if scrapeMetric {
-			metrics, nonFatalErrors, err = queryNamespaceMapping(ctx, server, namespace, mapping)
+
+		cached, cachedAt, found := cache.Get(key)
+		scrapeMetric := !found
+		if found {
+			metrics = cached
+			collectedAt = cachedAt
 		} else {
-			metrics = cachedMetric.metrics
-			collectedAt = cachedMetric.lastScrape
+			metrics, nonFatalErrors, err = queryNamespaceMapping(ctx, server, namespace, mapping)
 		}
 
 		// Serious error - a namespace disappeared
@@ -285,22 +294,17 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 		// collected every scrape, which is every namespace that does not set
 		// cache_seconds.
 		ch <- prometheus.MustNewConstMetric(
-			cacheAgeDesc(server), prometheus.GaugeValue, age.Seconds(), namespace)
+			cacheAgeDesc(server), prometheus.GaugeValue, age.Seconds(),
+			namespace, server.datname)
 
-		if scrapeMetric {
-			// A failed query is not an answer, so it is not cached. Caching it
-			// would publish the failure as an empty namespace for the whole
-			// cache lifetime, and the retry would not happen until it expired:
-			// one slow moment on the server blanked a namespace for a minute
-			// and reported no error after the first scrape.
-			if mapping.cacheSeconds > 0 && err == nil {
-				server.cacheMtx.Lock()
-				server.metricCache[namespace] = cachedMetrics{
-					metrics:    metrics,
-					lastScrape: scrapeStart,
-				}
-				server.cacheMtx.Unlock()
-			}
+		// A failed query is not an answer, so it is not cached. Caching it
+		// would publish the failure as an empty namespace for the whole cache
+		// lifetime, and the retry would not happen until it expired: one slow
+		// moment on the server blanked a namespace for a minute and reported
+		// no error after the first scrape.
+		if scrapeMetric && err == nil {
+			cache.Put(key, metrics, scrapeStart,
+				time.Duration(mapping.cacheSeconds)*time.Second)
 		}
 	}
 
@@ -315,8 +319,22 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 func cacheAgeDesc(server *Server) *prometheus.Desc {
 	return prometheus.NewDesc(
 		"pg_exporter_namespace_cache_age_seconds",
-		"Age in seconds of the samples this namespace served. Zero means they were collected during this scrape. A positive value means they came from the cache that cache_seconds configures, and those samples carry the time they were collected rather than the time of this scrape.",
-		[]string{"namespace"},
+		"Age in seconds of the samples this namespace served, per database. Zero means they were collected during this scrape. A positive value means they came from the cache that cache_seconds configures, and those samples carry the time they were collected rather than the time of this scrape.",
+		// datname as well as namespace, because a query runs once per
+		// database it selects. Without it, two databases produced the same
+		// label set and the registry rejected the second as a duplicate,
+		// which is the same mistake the collectors made before they carried
+		// a database name. It is empty when the name is not known, which
+		// Prometheus reads as absent.
+		[]string{"namespace", "datname"},
 		server.labels,
 	)
+}
+
+// definitionWithQuery combines a namespace's mapping fingerprint with the SQL
+// it runs, so either changing makes a cached result a different result.
+func definitionWithQuery(definition, query string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "mapping=%s\nquery=%s", definition, query)
+	return hex.EncodeToString(h.Sum(nil))
 }

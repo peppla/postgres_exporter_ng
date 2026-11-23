@@ -32,6 +32,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sync/semaphore"
@@ -253,7 +254,7 @@ func TestConcurrentRequestsAreRefusedNotQueued(t *testing.T) {
 	limits.RequestTimeout = 2 * time.Second
 
 	h := Handler(log.NewNopLogger(), []string{dsn},
-		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits))
+		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits), querycache.New())
 
 	first := make(chan int, 1)
 	go func() {
@@ -316,7 +317,7 @@ func TestRequestBudgetBoundsACollection(t *testing.T) {
 
 	dsn := fmt.Sprintf("postgresql://u:p@%s/d?sslmode=disable", listener.Addr().String())
 	h := Handler(log.NewNopLogger(), []string{dsn},
-		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, budget.Defaults(), NewCollectionGate(budget.Defaults()))
+		semaphore.NewWeighted(5), map[string]prometheus.Collector{}, budget.Defaults(), NewCollectionGate(budget.Defaults()), querycache.New())
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=postgres", nil)
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", "1")

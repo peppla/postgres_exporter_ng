@@ -24,6 +24,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/distribution"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -51,8 +52,6 @@ type Server struct {
 	queryOverrides map[string]string
 	mappingMtx     sync.RWMutex
 	// Currently cached metrics
-	metricCache map[string]cachedMetrics
-	cacheMtx    sync.Mutex
 }
 
 // ServerOpt configures a server.
@@ -90,7 +89,6 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 		labels: prometheus.Labels{
 			serverLabelName: fingerprint,
 		},
-		metricCache: make(map[string]cachedMetrics),
 	}
 	// The distribution is detected on first use rather than here, because
 	// detecting it is a query and NewServer has no budget to run one under.
@@ -150,7 +148,7 @@ func (s *Server) String() string {
 // or the budget bounds only the parts of a scrape that happen to consult it:
 // a slow statement reached through a context-free Query runs to completion
 // whatever the scrape was allowed.
-func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
+func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disableSettingsMetrics bool, cache *querycache.Cache, collector string) error {
 	s.mappingMtx.RLock()
 	defer s.mappingMtx.RUnlock()
 
@@ -162,7 +160,7 @@ func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disabl
 		}
 	}
 
-	errMap := queryNamespaceMappings(ctx, ch, s)
+	errMap := queryNamespaceMappings(ctx, ch, s, cache, collector)
 	if len(errMap) > 0 {
 		err = fmt.Errorf("queryNamespaceMappings returned %d errors", len(errMap))
 		level.Error(logger).Log("msg", "NAMESPACE ERRORS FOUND")
