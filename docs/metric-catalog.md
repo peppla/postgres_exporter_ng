@@ -284,7 +284,7 @@ Replication slot positions.
 | metric | type | unit | versions | what it measures |
 | --- | --- | --- | --- | --- |
 | `pg_replication_slot_slot_current_wal_lsn` | gauge | bytes of WAL | 15-19 | The server's current write-ahead log position, as a number. |
-| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds: `restart_lsn` is the oldest position the slot may still need, and it is what retention is measured from. `restart_lsn` is not published today, and the gap is in the correction queue. Physical slots and slots that have never been used report NULL here. |
+| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds: `restart_lsn` is the oldest position the slot may still need, and it is what retention is measured from. `restart_lsn` is not published today, and the gap is in the correction queue. A slot with no confirmed position at all, which is every physical slot and any logical slot nothing has consumed from, is published as zero rather than omitted, and zero is a real position: the start of the log. That is in the correction queue too. |
 | `pg_replication_slot_slot_is_active` | gauge | boolean | 15-19 | Whether anything is connected to the slot. An inactive slot still holds WAL. |
 
 ## stat_activity_autovacuum

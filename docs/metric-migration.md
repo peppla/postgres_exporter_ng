@@ -107,11 +107,33 @@ them, because what matters about them is what replaces them.
 | --- | --- | --- | --- |
 | `pg_stat_database_conflicts` | recovery conflicts per database, by cause: tablespace, lock, snapshot, bufferpin, deadlock | none | not covered. The `stat_database` collector reads `pg_stat_database`, which carries only the `conflicts` total, not the breakdown by cause |
 | `pg_lock_conflicts` | count of locks per blocking backend | none | not covered. The `locks` collector counts locks by mode, not by who is blocking whom |
-| `pg_stat_replication` | a primary's view of each standby: positions sent, written, flushed and replayed, the three lag intervals, sync state and priority | the collector written for PR #20 | implemented, not merged. Until it is, this is the only producer |
-| `pg_replication_slots` | per slot: active, and the distance from the current position | the `replication_slot` collector | covered for those columns, and that collector also publishes the confirmed flush position. Neither publishes `restart_lsn` |
-| `pg_stat_archiver` | archived and failed WAL counts, the last archived and failed files and times, and the age of the last archive | none | not covered. No Go collector reads `pg_stat_archiver` |
+| `pg_stat_replication` | two numbers per standby: the server's current WAL position in bytes, and the byte distance from it to that standby's replay position. The positions, the three lag intervals, the sync state and the priority are all read and discarded by the mapping, and reach no metric. `application_name`, `client_addr`, `state` and `pid` are labels | none | not covered. No Go collector reads `pg_stat_replication` |
+| `pg_replication_slots` | per slot: the byte distance from the current position to `restart_lsn`. `active` is read and discarded, so it reaches no metric, and `slot_name` and `database` are labels | the `replication_slot` collector | partly covered. That collector publishes the current and confirmed-flush positions, and neither producer publishes `restart_lsn`, which is the position this distance is measured from. The `database` label has no equivalent |
+| `pg_stat_archiver` | three numbers: archived and failed counts, and the seconds since the last successful archive. The file names, the three timestamps and the reset time are read and discarded by the mapping, and reach no metric | none | not covered. No Go collector reads `pg_stat_archiver` |
 | `pg_stat_activity` | connection counts and the longest transaction and state durations, by database, state, user and application | none | not covered. The `long_running_transactions` and `process_idle` collectors read the same view for different things, and neither reports connection counts by state |
 | `querySettings` | every `pg_settings` row of type bool, integer or real, as `pg_settings_<name>` | none | not covered, and nothing proposes to cover it. It is one series per setting per server, a few hundred of them |
+
+A column the mapping does not mention at all is not discarded: the engine
+publishes it as an untyped metric named after the namespace and the column,
+whenever its value converts to a float, and a timestamp converts to its unix
+seconds. Only two of these namespaces query with `SELECT *`, so only two can
+produce one: `pg_stat_database_conflicts`, which has no query override, and
+`pg_stat_replication`. The rest name their columns.
+
+These are published today, on supported versions, and were measured rather
+than predicted:
+
+| family | versions | what it is | replacement |
+| --- | --- | --- | --- |
+| `pg_stat_database_conflicts_confl_active_logicalslot` | 16-19 | Recovery conflicts with active logical slots, per database, labelled `datid` and `datname` | none. No Go collector reads `pg_stat_database_conflicts` at all |
+| `pg_stat_database_conflicts_stats_reset` | 19 | When those conflict counters were last reset, as unix seconds | none |
+| `pg_stat_replication_reply_time` | 15-19 | When the standby last replied, as unix seconds | none |
+
+They arrived by accident, because nobody mapped the column, and they are
+untyped and named after a view's column rather than after a measurement. None
+of that makes them unpublished. Retiring the fixed maps removes them, so each
+one is either replaced first or removed as a documented break with a reason,
+and neither has been decided.
 
 Four of the seven have no replacement written. Retiring the built-in path
 means writing collectors for the recovery-conflict breakdown, lock blocking,
