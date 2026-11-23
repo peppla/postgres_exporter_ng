@@ -108,10 +108,10 @@ them, because what matters about them is what replaces them.
 | `pg_stat_database_conflicts` | recovery conflicts per database, by cause: tablespace, lock, snapshot, bufferpin, deadlock | none | not covered. The `stat_database` collector reads `pg_stat_database`, which carries only the `conflicts` total, not the breakdown by cause |
 | `pg_lock_conflicts` | count of locks per blocking backend | none | not covered. The `locks` collector counts locks by mode, not by who is blocking whom |
 | `pg_stat_replication` | two numbers per standby: the server's current WAL position in bytes, and the byte distance from it to that standby's replay position. The positions, the three lag intervals, the sync state and the priority are all read and discarded by the mapping, and reach no metric. `application_name`, `client_addr`, `state` and `pid` are labels | none | not covered. No Go collector reads `pg_stat_replication` |
-| `pg_replication_slots` | per slot: the byte distance from the current position to `restart_lsn`. `active` is read and discarded, so it reaches no metric, and `slot_name` and `database` are labels | the `replication_slot` collector | partly covered. That collector publishes the current and confirmed-flush positions, and neither producer publishes `restart_lsn`, which is the position this distance is measured from. The `database` label has no equivalent |
+| `pg_replication_slots` | two numbers per slot: whether it is active, and the byte distance from the current position to `restart_lsn`. `slot_name` and `database` are labels | the `replication_slot` collector | partly covered. That collector publishes whether a slot is active and the current and confirmed-flush positions, and neither producer publishes `restart_lsn`, which is the position this distance is measured from. The `database` label has no equivalent |
 | `pg_stat_archiver` | three numbers: archived and failed counts, and the seconds since the last successful archive. The file names, the three timestamps and the reset time are read and discarded by the mapping, and reach no metric | none | not covered. No Go collector reads `pg_stat_archiver` |
 | `pg_stat_activity` | connection counts and the longest transaction and state durations, by database, state, user and application | none | not covered. The `long_running_transactions` and `process_idle` collectors read the same view for different things, and neither reports connection counts by state |
-| `querySettings` | every `pg_settings` row of type bool, integer or real, as `pg_settings_<name>` | none | not covered, and nothing proposes to cover it. It is one series per setting per server, a few hundred of them |
+| `querySettings` | every `pg_settings` row of type bool, integer or real, as `pg_settings_<name>` | a collector, to be written | not covered yet. The direction is settled: this output and its enable and disable behaviour are preserved and moved to a collector, with no period where both publish it. It is one series per setting per server, a few hundred of them, and what it reports is the monitored connection's effective settings, including anything a role or session override changes, rather than the server's configured defaults |
 
 A column the mapping does not mention at all is not discarded: the engine
 publishes it as an untyped metric named after the namespace and the column,
@@ -140,11 +140,16 @@ means writing collectors for the recovery-conflict breakdown, lock blocking,
 the archiver and connection counts by state, and deciding what happens to the
 settings metrics, which are a different kind of thing from the rest.
 
-The settings metrics deserve their own decision rather than a collector by
-default. They describe configuration, not activity, they do not change between
-scrapes, and there are hundreds of them per server. Publishing the whole of
-`pg_settings` every scrape is the kind of cost the operational budget work
-exists to bound.
+The settings metrics are preserved, which is settled: existing monitoring is
+kept until its removal is agreed, and a collector can carry this output and its
+enable and disable behaviour unchanged. What they report is worth stating
+precisely, because the name invites the wrong reading: `pg_settings` is the
+effective configuration of the connection the exporter is using, so a role or
+session override is what gets published, not the server's configured default.
+
+Whether hundreds of series per server for values that do not change between
+scrapes is worth its cost is a separate question, and a proposal to reduce it
+can be considered on its own.
 
 ## What retirement requires
 

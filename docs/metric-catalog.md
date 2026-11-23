@@ -284,7 +284,7 @@ Replication slot positions.
 | metric | type | unit | versions | what it measures |
 | --- | --- | --- | --- | --- |
 | `pg_replication_slot_slot_current_wal_lsn` | gauge | bytes of WAL | 15-19 | The server's current write-ahead log position, as a number. |
-| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds: `restart_lsn` is the oldest position the slot may still need, and it is what retention is measured from. `restart_lsn` is not published today, and the gap is in the correction queue. A slot with no confirmed position at all, which is every physical slot and any logical slot nothing has consumed from, is published as zero rather than omitted, and zero is a real position: the start of the log. That is in the correction queue too. |
+| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds: `restart_lsn` is the oldest position the slot may still need, and it is what retention is measured from. Published only while the slot is active, so an inactive slot has no sample at all, and an active slot whose position the server reports as NULL is published as zero, which is a real position: the start of the log. Both of those are in the correction queue, and so is the absent `restart_lsn`. |
 | `pg_replication_slot_slot_is_active` | gauge | boolean | 15-19 | Whether anything is connected to the slot. An inactive slot still holds WAL. |
 
 ## stat_activity_autovacuum
@@ -665,9 +665,10 @@ open, and its second column is `MAX(EXTRACT(EPOCH FROM clock_timestamp()))`,
 which is the time the query ran. Measured on PostgreSQL 18 against a
 transaction about half a second old: the metrics reported 10 and
 1795247634.153131, while the age of the oldest transaction was 0.476791
-seconds. A correct version needs a threshold the operator sets and an age
-taken from `xact_start`, which changes both the value and the meaning, so it
-is a compatibility decision rather than a fix.
+seconds. The timestamp is correctable on its own: an oldest start taken from
+`xact_start`, in the same unit, which is what the name already promises. The
+count is the part that needs a threshold the operator sets, and that is a
+compatibility decision, so the two are not waiting on each other.
 
 Two bgwriter metrics are published as zero where the server does not have
 them. `buffers_backend` and `buffers_backend_fsync`, with their `_total`
@@ -680,10 +681,16 @@ availability column says 15-19 for metrics that are only measured below 17.
 PostgreSQL moved that accounting into `pg_stat_io`, which this exporter
 already collects.
 
-`pg_replication_slot_slot_confirmed_flush_lsn` is the only slot position
-published, and retention is measured from `restart_lsn`, which is not. The
-difference between them is the WAL a slot holds beyond what its consumer has
-acknowledged, which is the number an operator watching disk usage needs.
-Adding `restart_lsn` is a new metric rather than a correction, and summing
-per-slot distances is not a disk figure in any case, because slots that
-overlap hold the same segments once.
+`restart_lsn` is not published, and it is the position retention is measured
+from. The slot section publishes the server's current position and the
+consumer's confirmed flush, and the distance between those two is how far
+behind the consumer is rather than how much log the slot is holding. Adding
+`restart_lsn` is a new metric rather than a correction, and summing per-slot
+distances is not a disk figure in any case, because slots that overlap hold the
+same segments once.
+
+The confirmed flush position is also published only while a slot is active,
+which leaves out the case an operator cares about: an inactive slot is the one
+holding log that nothing will confirm. An active slot whose position is NULL
+publishes zero, which reads as a consumer that has confirmed nothing rather
+than as a position that does not apply.
