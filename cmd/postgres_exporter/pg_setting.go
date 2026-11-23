@@ -51,6 +51,10 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 	}
 	defer rows.Close() // nolint: errcheck
 
+	// Settings this scrape could not turn into a metric, reported after the
+	// iteration so that one of them costs the others nothing.
+	var unpublished []error
+
 	for rows.Next() {
 		s := &pgSetting{}
 		err = rows.Scan(&s.name, &s.setting, &s.unit, &s.shortDesc, &s.vartype)
@@ -60,10 +64,16 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 
 		metric, err := s.metric(server.labels)
 		if err != nil {
-			// One setting, not the whole view. The rest of pg_settings is
-			// readable and an operator losing all of it over one row would
-			// learn less, not more.
-			level.Warn(logger).Log("msg", "Skipping a setting that cannot be published", "err", err)
+			// Collected around, not stopped at. The rest of pg_settings is
+			// readable, and an operator who loses all of it over one row
+			// learns less rather than more.
+			//
+			// Kept, though, and reported below. A warning alone leaves the
+			// scrape reporting success while a setting is missing from it,
+			// which is the shape of claim these diagnostics exist to prevent:
+			// the operator sees a complete-looking exposition with a hole in
+			// it.
+			unpublished = append(unpublished, err)
 			continue
 		}
 		ch <- metric
@@ -73,6 +83,14 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 	// without this a settings query that failed partway reports success.
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("Error retrieving rows on %q: %s %v", server, namespace, err)
+	}
+
+	if len(unpublished) > 0 {
+		for _, err := range unpublished {
+			level.Warn(logger).Log("msg", "A setting could not be published", "err", err)
+		}
+		return fmt.Errorf("%d of the settings on %q could not be published, the first being: %w",
+			len(unpublished), server, unpublished[0])
 	}
 
 	return nil
