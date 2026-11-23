@@ -18,10 +18,11 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
-	"strings"
 
 	"github.com/blang/semver/v4"
 	"github.com/lib/pq"
+	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 )
 
@@ -39,7 +40,7 @@ func newInstance(dsn string) (*instance, error) {
 
 	// "Create" a database handle to verify the DSN provided is valid.
 	// Open is not guaranteed to create a connection.
-	db, err := sql.Open("postgres", dsn)
+	db, err := pgclamp.OpenDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +72,7 @@ func (i *instance) copy() *instance {
 // The handle is closed on every failure. Leaving it open on the error path
 // leaks a handle per failed database per scrape.
 func (i *instance) setup(ctx context.Context) error {
-	db, err := sql.Open("postgres", i.dsn)
+	db, err := pgclamp.OpenDSN(i.dsn)
 	if err != nil {
 		return err
 	}
@@ -99,7 +100,18 @@ func (i *instance) getDB() *sql.DB {
 	return i.db
 }
 
+// Close releases the connection, if there is one.
+//
+// setup clears db when it fails, so an instance that never connected has
+// nothing to close. Closing it anyway dereferenced a nil handle and panicked
+// the handler: a probe against a target that refused the connection lost its
+// response and the client saw the connection drop. net/http recovers a
+// handler panic, so the process stayed up and later scrapes worked, but a
+// failure to connect is an ordinary outcome and has to be reported as one.
 func (i *instance) Close() error {
+	if i.db == nil {
+		return nil
+	}
 	return i.db.Close()
 }
 
@@ -140,17 +152,9 @@ func parseServerName(url string) (string, error) {
 		dsn = url
 	}
 
-	pairs := strings.Split(dsn, " ")
-	kv := make(map[string]string, len(pairs))
-	for _, pair := range pairs {
-		splitted := strings.SplitN(pair, "=", 2)
-		if len(splitted) != 2 {
-			return "", fmt.Errorf("malformed dsn %q", dsn)
-		}
-		// Newer versions of pq.ParseURL quote values so trim them off if they exist
-		key := strings.Trim(splitted[0], "'\"")
-		value := strings.Trim(splitted[1], "'\"")
-		kv[key] = value
+	kv, err := config.ParseKeyValue(dsn)
+	if err != nil {
+		return "", fmt.Errorf("malformed dsn %q: %w", dsn, err)
 	}
 
 	var fingerprint string

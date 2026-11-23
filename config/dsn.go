@@ -218,7 +218,11 @@ func parseKeyValue(in string) (map[string]string, error) {
 				part = []rune{}
 				// Do something with the value
 			}
-		case c == '=':
+		case c == '=' && !inQuote:
+			// Only outside quotes. libpq's options value is itself a list of
+			// settings written as -c name=value, so a quoted value can hold
+			// equals signs of its own, and treating one of those as the
+			// separator splits the pair in the wrong place and loses the rest.
 			if inPart {
 				inPart = false
 				key = string(part)
@@ -232,7 +236,14 @@ func parseKeyValue(in string) (map[string]string, error) {
 		}
 	}
 
-	if key != "" && len(part) > 0 {
+	if len(part) > 0 {
+		// Text left over that never became a key=value pair. The old
+		// per-engine parsers rejected this, and silently returning an empty
+		// map instead would turn a malformed connection string into a
+		// connection to localhost on the default port.
+		if key == "" {
+			return out, fmt.Errorf("invalid input")
+		}
 		out[key] = string(part)
 	}
 
@@ -357,4 +368,16 @@ func DSNWithConnectTimeout(in string, d time.Duration) (string, error) {
 	}
 	parsed.query.Set("connect_timeout", strconv.Itoa(seconds))
 	return parsed.GetConnectionString(), nil
+}
+
+// ParseKeyValue splits a libpq key=value connection string, honouring quoted
+// values.
+//
+// Exported because both engines had their own copy of this, each splitting on
+// plain spaces and on the first equals sign. That rejects any connection
+// string with a quoted value containing a space, which includes a password
+// with a space in it, an application_name with one, and the options string the
+// session timeouts are written into.
+func ParseKeyValue(in string) (map[string]string, error) {
+	return parseKeyValue(in)
 }

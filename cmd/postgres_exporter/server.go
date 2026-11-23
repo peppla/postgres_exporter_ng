@@ -23,6 +23,7 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/distribution"
+	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -74,7 +75,7 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("postgres", dsn)
+	db, err := pgclamp.OpenDSN(dsn)
 	if err != nil {
 		return nil, err
 	}

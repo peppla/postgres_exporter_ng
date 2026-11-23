@@ -104,14 +104,9 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 			WithConnectionsSemaphore(connSema),
 		}
 
-		remaining := time.Duration(0)
-		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
-			remaining = time.Until(deadline)
-		}
-		// Both engines on this endpoint get the bounded string. Giving it to
-		// one and the original to the other leaves half the probe able to
-		// hang on a server that accepts a connection and never answers.
-		dsns := withConnectTimeout([]string{dsn.GetConnectionString()}, limits.ConnectTimeoutFor(remaining))
+		// Both engines on this endpoint open through the same clamping
+		// connector, which bounds the attempt by this request's context.
+		dsns := []string{dsn.GetConnectionString()}
 		exporter := NewExporter(dsns, opts...)
 
 		// defer func() {
