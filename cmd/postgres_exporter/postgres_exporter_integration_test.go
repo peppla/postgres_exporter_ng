@@ -3086,6 +3086,71 @@ func (s *IntegrationSuite) TestCollectSelectsCollectorsByScope(c *C) {
 	}
 }
 
+// TestClusterOnlyScrapeCoversNoDatabases covers what the coverage counts mean
+// when a scrape asks for cluster-scoped collectors and nothing else.
+//
+// pg_collector_databases_selected says how many databases the namespaced
+// collectors meant to run database-local collectors against. A scrape that
+// selected no database-scoped collector meant none, and reporting the whole
+// catalogue there reads as a shortfall for work the request never asked for:
+// the fan-out does not run, so every database is selected and none is
+// reached.
+func (s *IntegrationSuite) TestClusterOnlyScrapeCoversNoDatabases(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	catalog, err := queryDatabases(context.Background(), server)
+	c.Assert(err, IsNil)
+	c.Assert(len(catalog) > 1, Equals, true,
+		Commentf("the fixture server has one database, so a count of zero cannot be told from a count of one"))
+
+	const selected = "pg_collector_databases_selected"
+	const discovered = "pg_collector_databases_discovered"
+
+	// The database group first, which is the premise: the count is the
+	// catalogue when database-local collectors were asked for.
+	code, body := scrapeWith(dsn, "postgres.database")
+	c.Assert(code, Equals, 200)
+	c.Assert(sampleValueOf(c, body, discovered), Equals, float64(len(catalog)),
+		Commentf("discovery did not read the catalogue, so nothing below is about selection"))
+	c.Assert(sampleValueOf(c, body, selected), Equals, float64(len(catalog)),
+		Commentf("the database group selected %v of %d databases", sampleValueOf(c, body, selected), len(catalog)))
+
+	// Cluster-scoped collectors only. Discovery still ran and still reports
+	// what it found, because that is the server's inventory and not this
+	// request's intent.
+	code, body = scrapeWith(dsn, "postgres.cluster")
+	c.Assert(code, Equals, 200)
+	c.Check(sampleValueOf(c, body, discovered), Equals, float64(len(catalog)),
+		Commentf("the cluster group stopped reporting the databases the server has"))
+	c.Check(sampleValueOf(c, body, selected), Equals, float64(0),
+		Commentf("a scrape that selected no database-scoped collector reported %v databases selected",
+			sampleValueOf(c, body, selected)))
+}
+
+// sampleValueOf reads the value of a family's one sample, and fails when the
+// family is absent rather than reporting a zero that nothing published.
+//
+// The value is the field after the name and labels, not the last field: a
+// sample can carry an explicit timestamp after its value.
+func sampleValueOf(c *C, body, family string) float64 {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family+"{") && !strings.HasPrefix(line, family+" ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		c.Assert(len(fields) >= 2, Equals, true, Commentf("malformed sample %q", line))
+		value, err := strconv.ParseFloat(fields[1], 64)
+		c.Assert(err, IsNil)
+		return value
+	}
+	c.Fatalf("%s is not in the response", family)
+	return 0
+}
+
 // TestCollectRejectsAnUnusableSelection covers the failure that used to look
 // like a success.
 //

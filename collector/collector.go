@@ -378,7 +378,11 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
 	}
-	p.reportSelection(ch, inst.name, sel)
+	// len(local) says whether there is database-local work for a set of
+	// databases to be the set of. A request that selected only cluster-scoped
+	// collectors has none, and reporting a set it never meant to cover reads
+	// as a shortfall when the fan-out does not happen.
+	p.reportSelection(ch, inst.name, sel, len(local) > 0)
 
 	// The control connection is held for the cluster-wide work and released
 	// before the fan-out, so the per-database connections are bounded by the
@@ -505,11 +509,17 @@ func (p PostgresCollector) release() {
 }
 
 // reportSelection publishes what this engine meant to cover, before it tries.
-func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server string, sel dbSelection) {
+//
+// databaseLocal says whether any database-scoped collector is enabled for this
+// request. None means no database was meant to be covered, whatever the
+// catalog holds, which is what collect[]=postgres.cluster asks for.
+func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server string, sel dbSelection, databaseLocal bool) {
 	selected := 0
-	for _, t := range sel.targets {
-		if !t.skipDatabaseLocal {
-			selected++
+	if databaseLocal {
+		for _, t := range sel.targets {
+			if !t.skipDatabaseLocal {
+				selected++
+			}
 		}
 	}
 	gauge := func(d *prometheus.Desc, v float64) {
