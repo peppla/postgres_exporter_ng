@@ -534,7 +534,7 @@ PostgreSQL 18 rather than read off the code.
 | --- | --- |
 | Scope | cluster |
 | Labels | `subid`, `subname`, `pid` |
-| Cardinality | one series per subscription per metric. `pid` is empty when the worker is not running, which is a state worth seeing |
+| Cardinality | one series per subscription per metric, for the subscriptions that have something to report. `pid` is empty when the worker is not running, and a subscription with no worker has no positions or times either, so it has no series at all: there is no state indicator here saying that a subscription exists and is idle |
 | Reset | none |
 | Availability | all versions. Empty where nothing subscribes, which is no series rather than zero |
 | Partial failure | the collector fails as a unit. A NULL position or time is omitted rather than published as zero |
@@ -784,16 +784,14 @@ availability column says 15-19 for metrics that are only measured below 17.
 PostgreSQL moved that accounting into `pg_stat_io`, which this exporter
 already collects.
 
-`restart_lsn` is not published, and it is the position retention is measured
-from. The slot section publishes the server's current position and the
-consumer's confirmed flush, and the distance between those two is how far
-behind the consumer is rather than how much log the slot is holding. Adding
-`restart_lsn` is a new metric rather than a correction, and summing per-slot
-distances is not a disk figure in any case, because slots that overlap hold the
-same segments once.
+`pg_replication_slot_slot_restart_lsn` was added rather than corrected, and it
+is the position retention is measured from. Before it, the positions published
+were the server's current one and the consumer's confirmed flush, and the
+distance between those two is how far behind the consumer is rather than how
+much log the slot is holding. Summing restart distances across slots is still
+not a disk figure, because slots that overlap hold the same segments once.
 
-The confirmed flush position is also published only while a slot is active,
-which leaves out the case an operator cares about: an inactive slot is the one
-holding log that nothing will confirm. An active slot whose position is NULL
-publishes zero, which reads as a consumer that has confirmed nothing rather
-than as a position that does not apply.
+The confirmed flush position is published for an inactive slot now, which is
+the case an operator cares about: an inactive slot is the one holding log that
+nothing will confirm. It is omitted where the server reports no position at
+all rather than published as zero.

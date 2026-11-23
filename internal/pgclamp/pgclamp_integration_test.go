@@ -28,6 +28,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -70,7 +71,26 @@ func withRole(t *testing.T, settings map[string]string) string {
 	}
 
 	// Same server, same database, different login.
-	return strings.Replace(strings.Split(dsn, ",")[0], "//root:root@", "//"+role+":secret@", 1)
+	//
+	// Parsed rather than string-replaced. The first version substituted the
+	// literal "//root:root@", so a fixture whose administrator is anyone else
+	// kept the administrator's own credentials and every test below silently
+	// measured the administrator's session instead of the role's. ChatGPT hit
+	// exactly that with a different password. A connection string this cannot
+	// rewrite fails the test rather than being handed back unchanged.
+	u, err := url.Parse(strings.Split(dsn, ",")[0])
+	if err != nil {
+		t.Fatalf("DATA_SOURCE_NAME is not a URL, so this test cannot change its login: %s", err)
+	}
+	if u.User == nil || u.User.Username() == "" {
+		t.Fatal("DATA_SOURCE_NAME names no user, so there is nothing to change")
+	}
+	u.User = url.UserPassword(role, "secret")
+	rewritten := u.String()
+	if rewritten == strings.Split(dsn, ",")[0] {
+		t.Fatal("the connection string was not changed, so this test would run as the administrator")
+	}
+	return rewritten
 }
 
 // effective reads what a session actually has, in milliseconds.

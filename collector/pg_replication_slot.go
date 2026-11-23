@@ -136,9 +136,10 @@ func (PGReplicationSlotCollector) Update(ctx context.Context, instance *instance
 			prometheus.GaugeValue, walLSNMetric, slotNameLabel, pluginLabel, slotTypeLabel,
 		)
 
-		// Published whether or not the slot is active, unlike the flush
-		// position below. An inactive slot is exactly the case where this
-		// matters, because it is still holding log that nothing will confirm.
+		// Published whether or not the slot is active. An inactive slot is
+		// exactly the case where this matters, because it is still holding log
+		// that nothing will confirm, and this is the position that log is held
+		// from.
 		if restartLSN.Valid {
 			ch <- prometheus.MustNewConstMetric(
 				pgReplicationSlotRestartLsnDesc,
