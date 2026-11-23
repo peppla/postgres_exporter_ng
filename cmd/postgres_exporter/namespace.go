@@ -33,13 +33,9 @@ import (
 // Query within a namespace mapping and emit metrics. Returns fatal errors if
 // the scrape fails, and a slice of errors if they were non-fatal.
 //
-// Every metric here is built with a constructor that returns an error rather
-// than one that panics. A query file decides these names and labels, so the
-// exporter is handed invalid ones by ordinary editing: a label the registry
-// reserves, or one that collides with a constant label the exporter adds. The
-// panicking constructors turned both into an exit, from a scrape worker where
-// nothing recovers it, so one bad line in a query file stopped the process
-// rather than failing its namespace.
+// Metrics are built with constructors that return an error. A query file
+// decides these names and labels, so an invalid one fails its namespace rather
+// than the process.
 func queryNamespaceMapping(ctx context.Context, server *Server, namespace string, mapping MetricMapNamespace) ([]prometheus.Metric, []error, error) {
 	// Check for a query override for this namespace
 	query, found := server.queryOverrides[namespace]

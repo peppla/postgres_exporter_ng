@@ -51,8 +51,6 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 	}
 	defer rows.Close() // nolint: errcheck
 
-	// Settings this scrape could not turn into a metric, reported after the
-	// iteration so that one of them costs the others nothing.
 	var unpublished []error
 
 	for rows.Next() {
@@ -64,15 +62,8 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 
 		metric, err := s.metric(server.labels)
 		if err != nil {
-			// Collected around, not stopped at. The rest of pg_settings is
-			// readable, and an operator who loses all of it over one row
-			// learns less rather than more.
-			//
-			// Kept, though, and reported below. A warning alone leaves the
-			// scrape reporting success while a setting is missing from it,
-			// which is the shape of claim these diagnostics exist to prevent:
-			// the operator sees a complete-looking exposition with a hole in
-			// it.
+			// Keep valid settings and report conversion failures after
+			// iteration.
 			unpublished = append(unpublished, err)
 			continue
 		}
@@ -102,13 +93,9 @@ type pgSetting struct {
 	name, setting, unit, shortDesc, vartype string
 }
 
-// metric turns one pg_settings row into a metric, or says why it cannot.
-//
-// It used to panic on three things: a unit it did not recognise, a vartype the
-// query does not ask for, and a descriptor the registry refuses. All three come
-// from the server rather than from this exporter, and a panic here is a panic
-// in a scrape worker, where nothing recovers it. A setting the exporter cannot
-// read is one missing metric, not a reason to stop the process.
+// metric turns one pg_settings row into a metric, and returns an error for a
+// row it cannot publish: an unrecognised unit, an unexpected vartype, or a
+// descriptor the registry refuses.
 func (s *pgSetting) metric(labels prometheus.Labels) (prometheus.Metric, error) {
 	var (
 		err       error
