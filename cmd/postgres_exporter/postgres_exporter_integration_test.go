@@ -1631,6 +1631,12 @@ app_elsewhere:
 // EXECUTE on pg_catalog.current_database() is revoked for the role, which is a
 // per-database privilege, so the connection, version detection and ordinary
 // queries all keep working and only the name lookup fails.
+//
+// The connection string names no database, which is what leaves the name to be
+// asked for. A string that names one is read instead of the server being
+// asked, so the revoked privilege would never be reached. libpq then falls
+// back to the role name, and a database of that name is created here so the
+// fallback reaches a real one.
 func (s *IntegrationSuite) TestApplicationQueryNameLookupFailureIsNotSuccess(c *C) {
 	dsn := os.Getenv("DATA_SOURCE_NAME")
 	c.Assert(dsn, Not(Equals), "")
@@ -1639,12 +1645,11 @@ func (s *IntegrationSuite) TestApplicationQueryNameLookupFailureIsNotSuccess(c *
 	c.Assert(err, IsNil)
 	defer admin.Close()
 
+	// The role and the database it reaches by fallback share this name.
 	const role = "noname"
-	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
-	c.Assert(hasControl, Equals, true)
 
 	cleanup := func() {
-		_, _ = admin.db.Exec(`GRANT EXECUTE ON FUNCTION pg_catalog.current_database() TO PUBLIC`)
+		_, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + role + ` WITH (FORCE)`)
 		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
 	}
 	cleanup()
@@ -1654,11 +1659,25 @@ func (s *IntegrationSuite) TestApplicationQueryNameLookupFailureIsNotSuccess(c *
 	c.Assert(err, IsNil)
 	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
 	c.Assert(err, IsNil)
-	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM PUBLIC`)
-	c.Assert(err, IsNil)
-	_, err = admin.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM ` + role)
+	_, err = admin.db.Exec(`CREATE DATABASE ` + role)
 	c.Assert(err, IsNil)
 
+	// Revoked in the database the role connects to, which is the database
+	// being created here and not the one this suite is configured with.
+	// EXECUTE is a per-database privilege, so revoking it anywhere else
+	// leaves the lookup working and the test proving nothing.
+	targetDSN, err := config.DSNWithDatabase(strings.Split(dsn, ",")[0], role)
+	c.Assert(err, IsNil)
+	onTarget, err := NewServer(targetDSN)
+	c.Assert(err, IsNil)
+	defer onTarget.Close()
+	_, err = onTarget.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM PUBLIC`)
+	c.Assert(err, IsNil)
+	_, err = onTarget.db.Exec(`REVOKE EXECUTE ON FUNCTION pg_catalog.current_database() FROM ` + role)
+	c.Assert(err, IsNil)
+
+	// The query names the database it is pointed at, so it would run if the
+	// name could be resolved.
 	fixture := fmt.Sprintf(`
 app_lookup:
   query: "SELECT 1::float8 AS value"
@@ -1666,13 +1685,13 @@ app_lookup:
     - %s
   metrics:
     - value: {usage: "GAUGE", description: "Constant one"}
-`, control)
+`, role)
 	dir := writeQueryFile(c, "app.yaml", fixture)
 
 	// Discovery off, so the name is not supplied by the catalog and has to be
 	// asked for.
 	exporter := NewExporter(
-		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + control + "?sslmode=disable"},
+		[]string{"postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/?sslmode=disable"},
 		WithUserQueriesEnabled(LR),
 		WithUserQueriesPath(map[MetricResolution]string{LR: dir}),
 		DisableDefaultMetrics(true),
@@ -2156,12 +2175,26 @@ func (s *IntegrationSuite) TestCacheSecondsHoldsAcrossHTTPScrapes(c *C) {
 	_, err = admin.db.Exec(`CREATE SEQUENCE ` + seq)
 	c.Assert(err, IsNil)
 
+	const uncachedSeq = "uncached_probe_seq"
+	cleanupUncached := func() { _, _ = admin.db.Exec(`DROP SEQUENCE IF EXISTS ` + uncachedSeq) }
+	cleanupUncached()
+	defer cleanupUncached()
+	_, err = admin.db.Exec(`CREATE SEQUENCE ` + uncachedSeq)
+	c.Assert(err, IsNil)
+
+	// Two namespaces in one file: one cached, one not. The second is here to
+	// hold the treatment of everything that does not ask to be cached, which
+	// is every built-in namespace and most application queries.
 	dir := writeQueryFile(c, "cached.yaml", `
 cached_probe:
   query: "SELECT nextval('`+seq+`')::float8 AS value"
   cache_seconds: 300
   metrics:
     - value: {usage: "GAUGE", description: "a sequence, so a second run is visible"}
+uncached_probe:
+  query: "SELECT nextval('`+uncachedSeq+`')::float8 AS value"
+  metrics:
+    - value: {usage: "GAUGE", description: "a sequence, collected every scrape"}
 `)
 	restore := withQueryDirectory(c, LR, dir)
 	defer restore()
@@ -2185,11 +2218,29 @@ cached_probe:
 	c.Assert(strings.Contains(first, "cached_probe_value"), Equals, true,
 		Commentf("the query did not run at all, so nothing below is about caching"))
 	firstValue, firstTimestamped := sampleValue(c, first, "cached_probe_value")
-	c.Check(firstTimestamped, Equals, false,
-		Commentf("a freshly collected sample carried a timestamp"))
+	// Stamped on the response that collected it as well as on the ones that
+	// serve it. Left unstamped, this sample is recorded at the moment the
+	// scraper read it and the next response carries the collection time, which
+	// are two instants for one measurement.
+	c.Check(firstTimestamped, Equals, true,
+		Commentf("the response that collected a cacheable namespace carried no timestamp"))
 
 	second := scrape()
 	secondValue, secondTimestamped := sampleValue(c, second, "cached_probe_value")
+
+	c.Check(sampleTimestamp(c, second, "cached_probe_value"),
+		Equals, sampleTimestamp(c, first, "cached_probe_value"),
+		Commentf("the two responses stamped one collection with different times, so it is stored as two points"))
+
+	// What a namespace without cache_seconds does, which is what it did
+	// before any of this: run every scrape, and carry no timestamp, so the
+	// scraper records it when it reads it.
+	firstUncached, uncachedTimestamped := sampleValue(c, first, "uncached_probe_value")
+	c.Check(uncachedTimestamped, Equals, false,
+		Commentf("a namespace that does not ask to be cached carried an explicit timestamp"))
+	secondUncached, _ := sampleValue(c, second, "uncached_probe_value")
+	c.Check(secondUncached > firstUncached, Equals, true,
+		Commentf("a namespace without cache_seconds served %v twice, so it was cached anyway", firstUncached))
 
 	c.Check(secondValue, Equals, firstValue,
 		Commentf("the sequence advanced from %v to %v, so the query ran again instead of being served from the cache",
@@ -2233,6 +2284,390 @@ func sampleValue(c *C, body, family string) (float64, bool) {
 	}
 	c.Fatalf("%s is not in the response", family)
 	return 0, false
+}
+
+// sampleTimestamp reads the explicit timestamp a sample carries, in
+// milliseconds, and returns zero when it carries none.
+func sampleTimestamp(c *C, body, family string) int64 {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family+"{") && !strings.HasPrefix(line, family+" ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			return 0
+		}
+		ts, err := strconv.ParseInt(fields[2], 10, 64)
+		c.Assert(err, IsNil)
+		return ts
+	}
+	c.Fatalf("%s is not in the response", family)
+	return 0
+}
+
+// labelValues reads one label from every sample of a family, sorted.
+func labelValues(body, family, label string) []string {
+	re := regexp.MustCompile(label + `="([^"]*)"`)
+	var found []string
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family+"{") {
+			continue
+		}
+		if m := re.FindStringSubmatch(line); m != nil {
+			found = append(found, m[1])
+		}
+	}
+	sort.Strings(found)
+	return found
+}
+
+// TestTwoDatabasesOnOneHostKeepSeparateCacheEntries covers what identifies a
+// cached result.
+//
+// Two targets on one host and port are two measurements, and keyed by the host
+// and port they were one. Measured before the fix: the first response carried
+// both databases, and the second served one target's result for both, so the
+// other database left exposition and the value published under its name was
+// another database's.
+//
+// Discovery is off and no query restricts itself by database, which is the
+// arrangement where nothing else supplies a name. An operator should not have
+// to add a databases list to make this correct.
+func (s *IntegrationSuite) TestTwoDatabasesOnOneHostKeepSeparateCacheEntries(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+
+	admin, err := NewServer(configured)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+	catalog, err := queryDatabases(context.Background(), admin)
+	c.Assert(err, IsNil)
+	control, found := currentName(catalog)
+	c.Assert(found, Equals, true)
+	others := otherThanCurrent(catalog)
+	c.Assert(len(others) > 0, Equals, true,
+		Commentf("the fixture server has one database, so two targets on one host cannot be configured"))
+	other := others[0]
+	secondTarget, err := config.DSNWithDatabase(configured, other)
+	c.Assert(err, IsNil)
+
+	dir := writeQueryFile(c, "two.yaml", `
+two_targets:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  cache_seconds: 300
+  metrics:
+    - datname: {usage: "LABEL", description: "The database this ran on"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{configured, secondTarget},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200)
+		return rec.Body.String()
+	}
+
+	want := []string{control, other}
+	sort.Strings(want)
+
+	first := scrape()
+	c.Assert(labelValues(first, "two_targets_value", "datname"), DeepEquals, want,
+		Commentf("the first response carried %v, want both databases, so nothing below is about the cache",
+			labelValues(first, "two_targets_value", "datname")))
+	c.Assert(cache.Len(), Equals, 2,
+		Commentf("two targets left %d cache entries, want one each", cache.Len()))
+
+	served := scrape()
+	c.Check(labelValues(served, "two_targets_value", "datname"), DeepEquals, want,
+		Commentf("the second response carried %v, want both databases: one target was served the other's cached result",
+			labelValues(served, "two_targets_value", "datname")))
+
+	// The age series names the database it belongs to, so two targets do not
+	// report one collection between them.
+	c.Check(labelValues(served, "pg_exporter_namespace_cache_age_seconds", "datname"), DeepEquals, want,
+		Commentf("the age series did not identify both databases"))
+
+	// Both were served rather than collected again, which is what makes the
+	// check above a check about the cache.
+	ages := 0
+	for _, line := range strings.Split(served, "\n") {
+		if !strings.HasPrefix(line, "pg_exporter_namespace_cache_age_seconds{") {
+			continue
+		}
+		ages++
+		fields := strings.Fields(line)
+		c.Assert(len(fields) >= 2, Equals, true, Commentf("malformed sample %q", line))
+		age, err := strconv.ParseFloat(fields[1], 64)
+		c.Assert(err, IsNil)
+		c.Check(age > 0, Equals, true,
+			Commentf("a namespace reported an age of %v on the second response, so it collected again rather than being served: %s", age, line))
+	}
+	c.Check(ages, Equals, 2, Commentf("%d age series were published for two targets", ages))
+}
+
+// TestTwoRolesOnOneDatabaseKeepSeparateCacheEntries covers the half of target
+// identity that a database name cannot carry.
+//
+// Two connections to the same database as different roles are two targets, and
+// everything the key held before identified neither of them apart: the host
+// and port are the same and so is the database. Measured before the fix: the
+// second response carried one role twice, so one target published the other's
+// result under its own name.
+//
+// A monitoring role sees different rows from an application role, and an
+// exporter configured with both is how an operator separates what each can
+// read. Serving one's result for the other is not a stale answer, it is
+// another target's answer.
+func (s *IntegrationSuite) TestTwoRolesOnOneDatabaseKeepSeparateCacheEntries(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+	parsed, err := url.Parse(configured)
+	c.Assert(err, IsNil)
+	c.Assert(parsed.Host, Not(Equals), "",
+		Commentf("DATA_SOURCE_NAME is not a URL, so two roles cannot be pointed at one database here"))
+
+	admin, err := NewServer(configured)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const password = "cache_identity_probe"
+	roles := []string{"cache_identity_a", "cache_identity_b"}
+	cleanup := func() {
+		for _, role := range roles {
+			_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+		}
+	}
+	cleanup()
+	defer cleanup()
+	for _, role := range roles {
+		_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD '` + password + `'`)
+		c.Assert(err, IsNil)
+		_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+		c.Assert(err, IsNil)
+	}
+
+	asRole := func(role string) string {
+		u := *parsed
+		u.User = url.UserPassword(role, password)
+		return u.String()
+	}
+
+	dir := writeQueryFile(c, "roles.yaml", `
+role_targets:
+  query: "SELECT current_user AS usename, 1::float8 AS value"
+  cache_seconds: 300
+  metrics:
+    - usename: {usage: "LABEL", description: "The role this ran as"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{asRole(roles[0]), asRole(roles[1])},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200)
+		return rec.Body.String()
+	}
+
+	first := scrape()
+	c.Assert(labelValues(first, "role_targets_value", "usename"), DeepEquals, roles,
+		Commentf("the first response carried %v, want both roles, so nothing below is about the cache",
+			labelValues(first, "role_targets_value", "usename")))
+	c.Assert(cache.Len(), Equals, 2,
+		Commentf("two roles left %d cache entries, want one each", cache.Len()))
+
+	served := scrape()
+	c.Check(labelValues(served, "role_targets_value", "usename"), DeepEquals, roles,
+		Commentf("the second response carried %v, want both roles: one target was served the other's cached result",
+			labelValues(served, "role_targets_value", "usename")))
+}
+
+// TestASlowCollectionDoesNotReplaceANewerOne covers overlapping refreshes
+// through the handler, which is where they happen: two scrapes of one endpoint
+// overlap, and a mutex or the race detector says nothing about which
+// observation is kept.
+//
+// The query takes a sequence value and then sleeps on its first call, so the
+// request that started first finishes last holding the older observation.
+// Measured before the fix: the fast request observed 2, the slow one observed
+// 1, and every scrape for the next five minutes served 1.
+func (s *IntegrationSuite) TestASlowCollectionDoesNotReplaceANewerOne(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+
+	admin, err := NewServer(configured)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const seq = "cache_overlap_seq"
+	const fn = "cache_overlap_probe"
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP FUNCTION IF EXISTS ` + fn + `()`)
+		_, _ = admin.db.Exec(`DROP SEQUENCE IF EXISTS ` + seq)
+	}
+	cleanup()
+	defer cleanup()
+	_, err = admin.db.Exec(`CREATE SEQUENCE ` + seq)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE FUNCTION ` + fn + `() RETURNS double precision AS $$
+DECLARE taken bigint;
+BEGIN
+	taken := nextval('` + seq + `');
+	IF taken = 1 THEN PERFORM pg_sleep(1.5); END IF;
+	RETURN taken;
+END $$ LANGUAGE plpgsql`)
+	c.Assert(err, IsNil)
+
+	dir := writeQueryFile(c, "overlap.yaml", `
+overlap_probe:
+  query: "SELECT `+fn+`() AS value"
+  cache_seconds: 300
+  metrics:
+    - value: {usage: "GAUGE", description: "a sequence, so each collection is distinguishable"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{configured},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200)
+		return rec.Body.String()
+	}
+
+	type finished struct {
+		body string
+		at   time.Time
+	}
+	slow := make(chan finished, 1)
+	go func() {
+		body := scrape()
+		slow <- finished{body, time.Now()}
+	}()
+
+	// Wait until the slow query has taken its sequence value. Starting the
+	// second request on a timer instead would make the overlap a guess.
+	taken := func() int64 {
+		var last int64
+		var called bool
+		c.Assert(admin.db.QueryRow(`SELECT last_value, is_called FROM `+seq).Scan(&last, &called), IsNil)
+		if !called {
+			return 0
+		}
+		return last
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for taken() < 1 {
+		c.Assert(time.Now().Before(deadline), Equals, true,
+			Commentf("the first request never reached the query, so there is no overlap to test"))
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	fastBody := scrape()
+	fastAt := time.Now()
+	slowResult := <-slow
+
+	fastValue, _ := sampleValue(c, fastBody, "overlap_probe_value")
+	slowValue, _ := sampleValue(c, slowResult.body, "overlap_probe_value")
+
+	// The run has to have the shape the test is about, or what follows proves
+	// nothing: two collections, the older one written second.
+	c.Assert(slowValue, Equals, float64(1),
+		Commentf("the first request observed %v, want the first sequence value", slowValue))
+	c.Assert(fastValue, Equals, float64(2),
+		Commentf("the second request observed %v, want the second sequence value: it was served from the cache instead of collecting", fastValue))
+	c.Assert(slowResult.at.After(fastAt), Equals, true,
+		Commentf("the first request finished before the second, so this run did not write the older observation last"))
+
+	served := scrape()
+	servedValue, _ := sampleValue(c, served, "overlap_probe_value")
+	c.Check(servedValue, Equals, fastValue,
+		Commentf("the cache holds %v, want the newer %v: a collection that started earlier replaced a later one when it finished",
+			servedValue, fastValue))
+	c.Check(sampleTimestamp(c, served, "overlap_probe_value"),
+		Equals, sampleTimestamp(c, fastBody, "overlap_probe_value"),
+		Commentf("the served sample is dated differently from the collection it came from"))
+}
+
+// TestEachNamespaceIsDatedWhenItWasCollected covers what a collection time
+// means when a scrape collects more than one namespace.
+//
+// The engine runs them one after another on one connection, so the second
+// finishes a query's worth of time after the first starts. Dated from a single
+// time taken before the scrape, every namespace in it carried the same
+// timestamp, and the later ones were dated to before the work that preceded
+// them. Two namespaces that each take about a second make that visible
+// whichever order the map yields them in.
+func (s *IntegrationSuite) TestEachNamespaceIsDatedWhenItWasCollected(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+
+	dir := writeQueryFile(c, "slow.yaml", `
+slow_one:
+  query: "SELECT 1::float8 AS value FROM pg_sleep(0.6)"
+  cache_seconds: 300
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant one, slowly"}
+slow_two:
+  query: "SELECT 2::float8 AS value FROM pg_sleep(0.6)"
+  cache_seconds: 300
+  metrics:
+    - value: {usage: "GAUGE", description: "Constant two, slowly"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{configured},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	c.Assert(rec.Code, Equals, 200)
+	body := rec.Body.String()
+
+	one := sampleTimestamp(c, body, "slow_one_value")
+	two := sampleTimestamp(c, body, "slow_two_value")
+	c.Assert(one > 0, Equals, true, Commentf("slow_one carried no timestamp"))
+	c.Assert(two > 0, Equals, true, Commentf("slow_two carried no timestamp"))
+
+	gap := one - two
+	if gap < 0 {
+		gap = -gap
+	}
+	c.Check(gap >= 400, Equals, true,
+		Commentf("two collections about 600ms apart are dated %d ms apart, so both were dated from one time taken before the scrape", gap))
 }
 
 // TestEditingAQueryFileInvalidatesItsCache covers the stale answer an edit

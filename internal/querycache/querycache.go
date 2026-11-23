@@ -79,6 +79,33 @@ func New() *Cache {
 	return &Cache{entries: make(map[Key]entry), now: time.Now}
 }
 
+// NewWithClock returns an empty cache that reads the time from now.
+//
+// For tests. The engine asks the cache what time it is rather than calling
+// time.Now itself, so a test that moves this clock moves the one reading both
+// of them use. An earlier version put a clock here that only the cache could
+// see, which made the cache and the engine disagree about the present and let
+// a test pass on a disagreement rather than on the behaviour.
+func NewWithClock(now func() time.Time) *Cache {
+	if now == nil {
+		now = time.Now
+	}
+	return &Cache{entries: make(map[Key]entry), now: now}
+}
+
+// Now reports the time the cache is reading, which is what the engine stamps
+// collections with and measures ages against. A nil cache reads the wall
+// clock, so a caller holding no cache still gets a usable answer.
+// now is assigned once, at construction, so it is read without the lock. A
+// clock that a test moves has to do its own synchronising, which it needs
+// anyway to move it from one goroutine and read it from another.
+func (c *Cache) Now() time.Time {
+	if c == nil {
+		return time.Now()
+	}
+	return c.now()
+}
+
 // Get returns a cached result and when it was collected.
 //
 // An entry past its expiry is not returned and is removed, so a namespace
@@ -102,11 +129,23 @@ func (c *Cache) Get(key Key) ([]prometheus.Metric, time.Time, bool) {
 	return found.metrics, found.collectedAt, true
 }
 
-// Put stores a result for the given lifetime.
+// Put stores a result for the given lifetime, unless a newer one is already
+// held.
 //
 // A lifetime of zero or less stores nothing and clears whatever was there,
 // which is what a namespace that no longer asks to be cached should leave
 // behind.
+//
+// Overlapping scrapes both miss and both run the query, and they finish in the
+// order the server answers rather than the order they started. An
+// unconditional store then keeps the older of the two observations and serves
+// it until it expires. Measured through the handler with a function that takes
+// a sequence value and then sleeps: the slow request observed 1, the
+// overlapping fast one observed 2, and the cache held 1.
+//
+// Refusing the older write is preferred to serialising refreshes per key,
+// which would make one scrape wait on another scrape's slow query and spend a
+// request budget on work that request did not ask for.
 func (c *Cache) Put(key Key, metrics []prometheus.Metric, collectedAt time.Time, lifetime time.Duration) {
 	if c == nil {
 		return
@@ -116,6 +155,9 @@ func (c *Cache) Put(key Key, metrics []prometheus.Metric, collectedAt time.Time,
 
 	if lifetime <= 0 {
 		delete(c.entries, key)
+		return
+	}
+	if held, ok := c.entries[key]; ok && !collectedAt.After(held.collectedAt) {
 		return
 	}
 	c.entries[key] = entry{

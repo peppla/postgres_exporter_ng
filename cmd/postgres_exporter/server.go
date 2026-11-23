@@ -15,7 +15,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -140,6 +142,25 @@ func (s *Server) Ping(ctx context.Context) error {
 // String returns server's fingerprint.
 func (s *Server) String() string {
 	return s.labels[serverLabelName]
+}
+
+// cacheIdentity returns an opaque identity for the connection this server
+// holds, for keying cached results by where they came from.
+//
+// Not the fingerprint. That is host and port, and targets share a host and
+// port: one per database when discovery runs, and as many as DATA_SOURCE_NAME
+// configures, which can differ by database, by role, or by anything else a
+// connection string carries. Measured with two URLs on one host and port, at
+// postgres and at root: keyed by the fingerprint they shared an entry, so the
+// second response served one target's metrics for both and dropped the other
+// database from exposition. Two login roles against one database collided the
+// same way.
+//
+// Hashed rather than keyed by the connection string itself, which carries a
+// password: a map key reaches a panic message or a dump eventually.
+func (s *Server) cacheIdentity() string {
+	sum := sha256.Sum256([]byte(s.dsn))
+	return hex.EncodeToString(sum[:])
 }
 
 // Scrape loads metrics.

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -231,6 +232,23 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 	}
 
 	server.datname = target.datname
+
+	// Discovery names every database it finds. Without discovery nothing has,
+	// and the connection string usually does: a URL carries the database in
+	// its path and a key=value string in dbname. Reading it costs no round
+	// trip and is what stops a per-database series from being published with
+	// no database on it, which Prometheus reads as absent and which two
+	// targets on one host then share.
+	//
+	// It returns nothing when the string names no database, because libpq then
+	// falls back to the role name, and when it names two different ones. The
+	// server is asked below, where a query needs the name to decide where it
+	// runs.
+	if server.datname == "" {
+		if name, ok := config.DatabaseFromDSN(dsn); ok {
+			server.datname = name
+		}
+	}
 
 	// Check if map versions need to be updated
 	if err := e.checkMapVersions(e.ctx, ch, server); err != nil {

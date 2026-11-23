@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func sample(value float64) []prometheus.Metric {
@@ -85,6 +86,58 @@ func TestAnExpiredEntryIsNotServedAndIsRemoved(t *testing.T) {
 	if c.Len() != 0 {
 		t.Errorf("an expired entry was left behind, %d entries remain", c.Len())
 	}
+}
+
+// TestAnOlderObservationDoesNotReplaceANewer covers overlapping refreshes.
+//
+// Two scrapes that both miss run the query at the same time and finish in the
+// order the server answers. The one that started first can finish last while
+// holding a value it read before the other one started, and storing it then
+// serves a superseded measurement until it expires.
+func TestAnOlderObservationDoesNotReplaceANewer(t *testing.T) {
+	c := New()
+	key := Key{Namespace: "a_namespace"}
+
+	newer := time.Now()
+	older := newer.Add(-time.Second)
+
+	// The slow scrape started first and finishes last, so it writes second.
+	c.Put(key, sample(2), newer, time.Minute)
+	c.Put(key, sample(1), older, time.Minute)
+
+	metrics, collectedAt, ok := c.Get(key)
+	if !ok {
+		t.Fatal("the entry went missing")
+	}
+	if got := metricValue(t, metrics); got != 2 {
+		t.Errorf("the cache holds %v, want the newer 2", got)
+	}
+	if !collectedAt.Equal(newer) {
+		t.Errorf("the entry is dated %s, want %s, which is when the value it holds was collected", collectedAt, newer)
+	}
+
+	// A newer one still replaces it, or nothing would ever be refreshed.
+	c.Put(key, sample(3), newer.Add(time.Second), time.Minute)
+	metrics, _, ok = c.Get(key)
+	if !ok {
+		t.Fatal("the entry went missing")
+	}
+	if got := metricValue(t, metrics); got != 3 {
+		t.Errorf("the cache holds %v after a newer observation, want 3", got)
+	}
+}
+
+// metricValue reads the one value a sample carries.
+func metricValue(t *testing.T, metrics []prometheus.Metric) float64 {
+	t.Helper()
+	if len(metrics) != 1 {
+		t.Fatalf("the entry holds %d metrics, want 1", len(metrics))
+	}
+	pb := &dto.Metric{}
+	if err := metrics[0].Write(pb); err != nil {
+		t.Fatalf("writing a metric: %s", err)
+	}
+	return pb.GetGauge().GetValue()
 }
 
 // TestAZeroLifetimeStoresNothing covers a namespace whose query file stopped
