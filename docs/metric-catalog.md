@@ -104,8 +104,8 @@ not any collector succeeded.
 | | |
 | --- | --- |
 | Scope | cluster, with per-database rows where named |
-| Labels | `server`, with `collector`, `datname` and `reason` where listed |
-| Cardinality | a handful per server, plus one per selected database for the per-database families |
+| Labels | `server`, with `collector`, `datname`, `usename`, `target` and `reason` where listed |
+| Cardinality | a handful per server, plus one per selected database for the per-database families, and one per cacheable namespace per collection context for the cache age |
 | Reset | none, these describe the last scrape |
 | Availability | always |
 | Partial failure | this is the report of partial failure |
@@ -119,6 +119,8 @@ not any collector succeeded.
 | `pg_collector_database_up` | gauge | boolean | 15-19 | Whether this database could be connected to. Present for every selected database and for the connected one even when selection left it out, so it can carry one more database than `databases_selected` counts. |
 | `pg_collector_database_error` | gauge | boolean | 15-19 | One per database that was not reached, labelled `reason` with `connect` or `not_attempted`. A closed set, never an error message. |
 | `pg_collector_database_excluded` | gauge | boolean | 15-19 | One per database an exclude list named. Databases left out by an include list are counted, not named, because that set can be the whole server. |
+| `pg_collector_databases_deferred` | gauge | databases | 15-19 | Selected databases this scrape did not start work on, for want of room within its budget. Not covered and not failed: nothing was tried, so nothing is known to be wrong with them. |
+| `pg_collector_database_deferred` | gauge | boolean | 15-19 | One per database this scrape did not start work on, labelled `reason` with `no_connection_permit`. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it, so it can name one more database than `databases_deferred` counts, in the same way `database_up` can. A deferral is not an error and is never counted in `database_error`. |
 | `pg_scrape_collector_success` | gauge | boolean | 15-19 | Whether one collector finished on one database. `datname` is empty for a cluster collector, which Prometheus treats as absent. |
 | `pg_scrape_collector_duration_seconds` | gauge | seconds | 15-19 | How long one collector took on one database. |
 
