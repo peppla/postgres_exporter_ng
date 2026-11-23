@@ -2306,12 +2306,21 @@ func sampleTimestamp(c *C, body, family string) int64 {
 }
 
 // labelValues reads one label from every sample of a family, sorted.
-func labelValues(body, family, label string) []string {
+//
+// Each where argument is text the sample's line has to contain, so a test can
+// read one namespace's series out of a response that carries others.
+func labelValues(body, family, label string, where ...string) []string {
 	re := regexp.MustCompile(label + `="([^"]*)"`)
 	var found []string
+line:
 	for _, line := range strings.Split(body, "\n") {
 		if !strings.HasPrefix(line, family+"{") {
 			continue
+		}
+		for _, want := range where {
+			if !strings.Contains(line, want) {
+				continue line
+			}
 		}
 		if m := re.FindStringSubmatch(line); m != nil {
 			found = append(found, m[1])
@@ -2674,6 +2683,82 @@ fallback_probe:
 		DeepEquals, fromQuery,
 		Commentf("the age series reported %v for a collection the query says ran on %v",
 			labelValues(body, "pg_exporter_namespace_cache_age_seconds", "datname"), fromQuery))
+}
+
+// TestTwoResolutionsSharingANamespaceAreTwoCollections covers the last part of
+// the cache key the diagnostic was missing.
+//
+// The resolutions are separate engines with separate query directories and
+// separate intervals, and each can define the same namespace with its own
+// columns. The cache has always kept them apart, because the resolution is
+// part of the key. The age series did not, so two collections published one
+// diagnostic and the registry refused the other.
+//
+// Both the selected form and plain /metrics are checked, because they build
+// the engine set by different paths.
+func (s *IntegrationSuite) TestTwoResolutionsSharingANamespaceAreTwoCollections(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+
+	// One namespace, defined twice, with a different column each time so the
+	// application samples are two families rather than one duplicated series.
+	hrDir := writeQueryFile(c, "hr.yaml", `
+resolution_probe:
+  query: "SELECT 11::float8 AS high"
+  cache_seconds: 60
+  metrics:
+    - high: {usage: "GAUGE", description: "The high resolution's own column"}
+`)
+	lrDir := writeQueryFile(c, "lr.yaml", `
+resolution_probe:
+  query: "SELECT 22::float8 AS low"
+  cache_seconds: 60
+  metrics:
+    - low: {usage: "GAUGE", description: "The low resolution's own column"}
+`)
+	restoreHR := withQueryDirectory(c, HR, hrDir)
+	defer restoreHR()
+	restoreLR := withQueryDirectory(c, LR, lrDir)
+	defer restoreLR()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{configured},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func(query string) string {
+		req := httptest.NewRequest("GET", "/metrics"+query, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200, Commentf("GET /metrics%s", query))
+		return rec.Body.String()
+	}
+
+	want := []string{"custom_query.hr", "custom_query.lr"}
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"both resolutions selected", "?collect[]=custom_query.hr&collect[]=custom_query.lr"},
+		{"plain /metrics", ""},
+	} {
+		body := scrape(tc.query)
+
+		// The premise: both engines ran and each published its own column.
+		// sampleValue fails when the family is absent, so this is presence as
+		// well as value.
+		high, _ := sampleValue(c, body, "resolution_probe_high")
+		c.Assert(high, Equals, float64(11), Commentf("%s: the high resolution served %v", tc.name, high))
+		low, _ := sampleValue(c, body, "resolution_probe_low")
+		c.Assert(low, Equals, float64(22), Commentf("%s: the low resolution served %v", tc.name, low))
+
+		got := labelValues(body, "pg_exporter_namespace_cache_age_seconds", "collector",
+			`namespace="resolution_probe"`)
+		c.Check(got, DeepEquals, want,
+			Commentf("%s: the age series for one namespace carried %v, want one per resolution", tc.name, got))
+	}
 }
 
 // TestASlowCollectionDoesNotReplaceANewerOne covers overlapping refreshes

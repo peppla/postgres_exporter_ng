@@ -301,7 +301,7 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 		if cacheable && err == nil {
 			ch <- prometheus.MustNewConstMetric(
 				cacheAgeDesc(server), prometheus.GaugeValue, age.Seconds(),
-				namespace, server.datname, server.role, server.cacheIdentity())
+				namespace, server.datname, server.role, server.cacheIdentity(), collector)
 		}
 
 		// A failed query is not an answer, so it is not cached. Caching it
@@ -328,17 +328,20 @@ func cacheAgeDesc(server *Server) *prometheus.Desc {
 		"pg_exporter_namespace_cache_age_seconds",
 		"Age in seconds of the samples this namespace served. Published for the namespaces that set cache_seconds, and not for a collection that failed. Zero means they were collected during this scrape. A positive value means they came from the cache, and those samples carry the time they were collected rather than the time of this scrape. The target label is this process's identity for the connection the samples were collected over, and it is not stable across restarts.",
 		// One series per collection, so the labels have to say which
-		// collection, and the host and port in the constant labels cannot:
+		// collection, and they are the parts of the cache key that a reader
+		// can act on. The host and port in the constant labels cannot do it:
 		// targets share those. datname and usename name what an operator
-		// recognises, and target is what separates two collections that agree
-		// on all of it, such as two connections to one database as one role
-		// with different search_path values. It is the same identity the
-		// cached result is keyed by.
+		// recognises. target separates collections that agree on all of it,
+		// such as two connections to one database as one role with different
+		// search_path values. collector separates the resolutions, which can
+		// each define the same namespace with their own interval and their own
+		// columns.
 		//
 		// datname and usename are empty when the connection string does not
 		// name them and nothing has resolved them, which Prometheus reads as
-		// absent.
-		[]string{"namespace", "datname", "usename", "target"},
+		// absent. The engine must not also carry collector as a constant
+		// label, which would make this descriptor invalid.
+		[]string{"namespace", "datname", "usename", "target", "collector"},
 		server.labels,
 	)
 }
