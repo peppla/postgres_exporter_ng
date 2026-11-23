@@ -383,3 +383,92 @@ func TestUnrelatedOptionsSurvive(t *testing.T) {
 		t.Errorf("statement_timeout is %dms, want 5000ms", got)
 	}
 }
+
+// TestEnvironmentOptionsCannotWeakenTheRole is the last precedence path.
+//
+// The driver merges PGOPTIONS into its configuration after the connection
+// string has been parsed, so cleaning the string left the environment
+// untouched: a role limited to 100ms with PGOPTIONS asking for no limit ended
+// up at the exporter's 5s. The cleaning happens on the driver's effective
+// configuration now, which is where every source has been merged.
+func TestEnvironmentOptionsCannotWeakenTheRole(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		pgoptions     string
+		wantStatement int64
+		wantLock      int64
+	}{
+		{
+			name:          "asking for no limit",
+			pgoptions:     "-c statement_timeout=0 -c lock_timeout=0",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "asking for more",
+			pgoptions:     "-c statement_timeout=60s -c lock_timeout=30s",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "asking for less",
+			pgoptions:     "-c statement_timeout=50ms -c lock_timeout=10ms",
+			wantStatement: 50, wantLock: 10,
+		},
+		{
+			name:          "in upper case",
+			pgoptions:     "-c STATEMENT_TIMEOUT=0 -c LOCK_TIMEOUT=0",
+			wantStatement: 100, wantLock: 20,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := withRole(t, map[string]string{
+				"statement_timeout": "100ms",
+				"lock_timeout":      "20ms",
+			})
+
+			t.Setenv("PGOPTIONS", tc.pgoptions)
+			SetDefaults(5*time.Second, 500*time.Millisecond, 3*time.Second)
+			defer SetDefaults(0, 0, 0)
+
+			db, err := OpenDSN(dsn)
+			if err != nil {
+				t.Fatalf("opening: %s", err)
+			}
+			defer db.Close()
+
+			if got := effective(t, db, "statement_timeout"); got != tc.wantStatement {
+				t.Errorf("statement_timeout is %dms, want %dms", got, tc.wantStatement)
+			}
+			if got := effective(t, db, "lock_timeout"); got != tc.wantLock {
+				t.Errorf("lock_timeout is %dms, want %dms", got, tc.wantLock)
+			}
+		})
+	}
+}
+
+// TestEnvironmentOptionsKeepUnrelatedSettings checks that cleaning PGOPTIONS
+// leaves the rest of it working, the same as cleaning a connection string.
+func TestEnvironmentOptionsKeepUnrelatedSettings(t *testing.T) {
+	dsn := withRole(t, nil)
+	t.Setenv("PGOPTIONS", "-c work_mem=65536 -c statement_timeout=0")
+
+	SetDefaults(5*time.Second, 500*time.Millisecond, 3*time.Second)
+	defer SetDefaults(0, 0, 0)
+
+	db, err := OpenDSN(dsn)
+	if err != nil {
+		t.Fatalf("opening: %s", err)
+	}
+	defer db.Close()
+
+	var workMem string
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT setting FROM pg_catalog.pg_settings WHERE name = 'work_mem'`).Scan(&workMem); err != nil {
+		t.Fatalf("reading work_mem: %s", err)
+	}
+	if workMem != "65536" {
+		t.Errorf("work_mem is %q, want 65536: cleaning PGOPTIONS took something else with it", workMem)
+	}
+	if got := effective(t, db, "statement_timeout"); got != 5000 {
+		t.Errorf("statement_timeout is %dms, want 5000ms", got)
+	}
+}

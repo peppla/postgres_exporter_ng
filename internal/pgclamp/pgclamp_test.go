@@ -133,9 +133,9 @@ func TestConnectRefusesAnAlreadyExpiredContext(t *testing.T) {
 	}
 }
 
-// TestStripTimeoutOverridesLeavesTheRestAlone pins the string surgery without
-// needing a server.
-func TestStripTimeoutOverridesLeavesTheRestAlone(t *testing.T) {
+// TestStripOptionsOverridesLeavesTheRestAlone pins the options surgery
+// without needing a server.
+func TestStripOptionsOverridesLeavesTheRestAlone(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		in            string
@@ -146,35 +146,33 @@ func TestStripTimeoutOverridesLeavesTheRestAlone(t *testing.T) {
 	}{
 		{
 			name:     "nothing to strip",
-			in:       "postgresql://u@h/db?sslmode=disable",
-			wantKept: []string{"sslmode=disable"},
+			in:       "-c work_mem=65536",
+			wantKept: []string{"work_mem"},
 		},
 		{
-			name:          "startup parameters",
-			in:            "postgresql://u@h/db?statement_timeout=0&lock_timeout=20ms&sslmode=disable",
-			wantStatement: 0, wantLock: 20,
+			name:          "both settings, with an unrelated one kept",
+			in:            "-c work_mem=65536 -c statement_timeout=60s -c lock_timeout=20ms",
+			wantStatement: 60000, wantLock: 20,
 			wantGone: []string{"statement_timeout", "lock_timeout"},
-			wantKept: []string{"sslmode=disable"},
+			wantKept: []string{"work_mem"},
 		},
 		{
-			name:          "options entries, with an unrelated one kept",
-			in:            "postgresql://u@h/db?options=-c%20work_mem%3D65536%20-c%20statement_timeout%3D60s",
-			wantStatement: 60000,
-			wantGone:      []string{"statement_timeout"},
+			// The server normalises the name, so this package has to as well.
+			name:          "upper case and dashes",
+			in:            "--STATEMENT-TIMEOUT=0 -c work_mem=65536",
+			wantStatement: 0,
+			wantGone:      []string{"TIMEOUT"},
 			wantKept:      []string{"work_mem"},
 		},
 		{
 			name:          "a bare number is milliseconds",
-			in:            "postgresql://u@h/db?statement_timeout=250",
+			in:            "-c statement_timeout=250",
 			wantStatement: 250,
 			wantGone:      []string{"statement_timeout"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, asked, err := config.StripTimeoutOverrides(tc.in)
-			if err != nil {
-				t.Fatalf("StripTimeoutOverrides(%q): %s", tc.in, err)
-			}
+			out, asked := config.StripOptionsOverrides(tc.in)
 			if asked.StatementMS != tc.wantStatement {
 				t.Errorf("statement asked for %d, want %d", asked.StatementMS, tc.wantStatement)
 			}
@@ -190,6 +188,56 @@ func TestStripTimeoutOverridesLeavesTheRestAlone(t *testing.T) {
 				if !contains(out, kept) {
 					t.Errorf("%q was lost from %q", kept, out)
 				}
+			}
+		})
+	}
+}
+
+// TestStripRuntimeOverridesTakesUnrecognisedParameters covers the other half:
+// a timeout written as a connection parameter the driver does not recognise
+// ends up in its runtime parameters rather than its options.
+func TestStripRuntimeOverridesTakesUnrecognisedParameters(t *testing.T) {
+	runtime := map[string]string{
+		"STATEMENT_TIMEOUT": "0",
+		"lock_timeout":      "20ms",
+		"work_mem":          "65536",
+	}
+	asked := config.StripRuntimeOverrides(runtime)
+
+	if asked.StatementMS != 0 {
+		t.Errorf("statement asked for %d, want 0", asked.StatementMS)
+	}
+	if asked.LockMS != 20 {
+		t.Errorf("lock asked for %d, want 20", asked.LockMS)
+	}
+	if _, present := runtime["STATEMENT_TIMEOUT"]; present {
+		t.Error("the statement timeout was left in the runtime parameters")
+	}
+	if _, present := runtime["lock_timeout"]; present {
+		t.Error("the lock timeout was left in the runtime parameters")
+	}
+	if runtime["work_mem"] != "65536" {
+		t.Error("an unrelated runtime parameter was removed")
+	}
+}
+
+// TestTightenKeepsTheStricterRequest pins how two sources of the same request
+// combine, with zero meaning no request rather than the shortest one.
+func TestTightenKeepsTheStricterRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		a, b     config.TimeoutOverrides
+		wantStmt int64
+	}{
+		{"neither asks", config.TimeoutOverrides{}, config.TimeoutOverrides{}, 0},
+		{"only the first", config.TimeoutOverrides{StatementMS: 100}, config.TimeoutOverrides{}, 100},
+		{"only the second", config.TimeoutOverrides{}, config.TimeoutOverrides{StatementMS: 100}, 100},
+		{"the stricter wins", config.TimeoutOverrides{StatementMS: 100}, config.TimeoutOverrides{StatementMS: 50}, 50},
+		{"order does not matter", config.TimeoutOverrides{StatementMS: 50}, config.TimeoutOverrides{StatementMS: 100}, 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.a.Tighten(tc.b).StatementMS; got != tc.wantStmt {
+				t.Errorf("got %d, want %d", got, tc.wantStmt)
 			}
 		})
 	}

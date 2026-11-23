@@ -302,18 +302,21 @@ func Defaults() (statement, lock, connect time.Duration) {
 // a handle opened before SetDefaults keeps whatever was set then, which is
 // why main sets them before serving.
 func OpenDSN(dsn string) (*sql.DB, error) {
-	cleaned, asked, err := config.StripTimeoutOverrides(dsn)
+	// The driver's effective configuration, not the string. It merges the
+	// connection string with the environment, so PGOPTIONS asking for no
+	// limit reached startup unchecked while the string was clean. Cleaning
+	// what the driver will actually use is the only place every source has
+	// been merged.
+	cfg, err := pq.NewConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	// The typed configuration rather than the string, because connect_timeout
-	// in a connection string is a whole number of seconds and a scrape can be
-	// given less than one.
-	cfg, err := pq.NewConfig(cleaned)
-	if err != nil {
-		return nil, err
-	}
+	cleanedOptions, fromOptions := config.StripOptionsOverrides(cfg.Options)
+	cfg.Options = cleanedOptions
+	fromRuntime := config.StripRuntimeOverrides(cfg.Runtime)
+	asked := fromOptions.Tighten(fromRuntime)
+
 	statement, lock, connect := Defaults()
 	return sql.OpenDB(Wrap(cfg, statement, lock, connect, asked)), nil
 }
