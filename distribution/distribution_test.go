@@ -1,6 +1,7 @@
 package distribution
 
 import (
+	"context"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -62,8 +63,8 @@ func TestGetCachesByFingerprint(t *testing.T) {
 	mock.ExpectQuery(`SELECT to_regproc\('aurora_version'\) IS NOT NULL;`).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 
-	first := Get("postgres://user:pass@127.0.0.1:5432/postgres?sslmode=disable", db)
-	second := Get("postgres://user:pass@127.0.0.1:5432/app_1?sslmode=disable", db)
+	first := Get(context.Background(), "postgres://user:pass@127.0.0.1:5432/postgres?sslmode=disable", db)
+	second := Get(context.Background(), "postgres://user:pass@127.0.0.1:5432/app_1?sslmode=disable", db)
 
 	require.Equal(t, Standard, first)
 	require.Equal(t, Standard, second)

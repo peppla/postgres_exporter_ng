@@ -137,7 +137,7 @@ var (
 func (c *PGStatWalReceiverCollector) Update(ctx context.Context, instance *instance, ch chan<- prometheus.Metric) error {
 	db := instance.getDB()
 	// Skip Aurora instances (not supported pg_stat_get_wal_receiver)
-	if distribution.IsAurora(instance.dsn, db) {
+	if distribution.IsAurora(ctx, instance.dsn, db) {
 		return nil
 	}
 

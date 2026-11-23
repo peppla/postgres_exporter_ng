@@ -287,8 +287,8 @@ func parseUserQueries(content []byte, dist string) (map[string]intermediateMetri
 // queries.
 // TODO: test code for all cu.
 // TODO: the YAML this supports is "non-standard" - we should move away from it.
-func addQueries(content []byte, pgVersion semver.Version, server *Server) error {
-	metricMaps, newQueryOverrides, err := parseUserQueries(content, server.distribution)
+func addQueries(ctx context.Context, content []byte, pgVersion semver.Version, server *Server) error {
+	metricMaps, newQueryOverrides, err := parseUserQueries(content, server.distributionOf(ctx))
 	if err != nil {
 		return err
 	}

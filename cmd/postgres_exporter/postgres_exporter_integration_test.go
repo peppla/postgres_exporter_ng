@@ -167,7 +167,7 @@ func (s *IntegrationSuite) TestAllNamespacesReturnResults(c *C) {
 		server.master = true
 
 		// Do a version update
-		err = s.e.checkMapVersions(rec.ch, server)
+		err = s.e.checkMapVersions(context.Background(), rec.ch, server)
 		c.Assert(err, IsNil)
 		c.Assert(len(server.metricMap) > 0, Equals, true,
 			Commentf("checkMapVersions produced no namespaces to query"))
@@ -2054,4 +2054,75 @@ func (s *IntegrationSuite) TestInvalidTimeoutHeaderIsRefused(c *C) {
 	// configured fallback exists for them.
 	code, _, _ := scrapeHTTP(dsn, budget.Defaults(), "", "exporter")
 	c.Check(code, Equals, 200, Commentf("a scrape with no timeout header was refused"))
+}
+
+// TestMetadataLookupObeysTheBudget covers the phase that ran before any
+// collector and outside every deadline.
+//
+// Cancelling the statements a scrape issues does not help if the scrape has
+// already spent its budget working out which version it is talking to. The
+// version lookup, the distribution detection and the ping all ran without a
+// context, so a slow answer at that phase held the request open however short
+// its budget was.
+//
+// The version function is made slow by fault injection, the same way ChatGPT
+// reproduced it: a public.version() that sleeps and then returns the real one,
+// with the role's search_path putting public first. The lookup is unqualified,
+// so it finds the slow one. This is not a claim that pg_catalog.version() is
+// ever slow.
+func (s *IntegrationSuite) TestMetadataLookupObeysTheBudget(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const role = "slow_version_role"
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP FUNCTION IF EXISTS public.version()`)
+		_, _ = admin.db.Exec(`REASSIGN OWNED BY ` + role + ` TO CURRENT_USER`)
+		_, _ = admin.db.Exec(`DROP OWNED BY ` + role)
+		_, _ = admin.db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD 'secret'`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`GRANT pg_monitor TO ` + role)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE FUNCTION public.version() RETURNS text AS $$
+		SELECT pg_sleep(5); SELECT pg_catalog.version();
+	$$ LANGUAGE sql`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`ALTER ROLE ` + role + ` SET search_path = public, pg_catalog`)
+	c.Assert(err, IsNil)
+
+	// Nothing may be cached from an earlier test, or the slow phase is
+	// skipped and this measures the wrong thing.
+	versioncache.Clear()
+	defer versioncache.Clear()
+
+	slowDSN := "postgresql://" + role + ":secret@" + hostPort(c, dsn) + "/" + control + "?sslmode=disable"
+	limits := budget.Defaults()
+	limits.RequestTimeout = 30 * time.Second
+
+	// The premise: with a long budget the slow version function is reached
+	// and the scrape does take five seconds. Without this the assertions
+	// below would pass against a fixture where nothing was slow.
+	code, _, elapsed := scrapeHTTP(slowDSN, limits, "", "exporter")
+	c.Assert(code, Equals, 200)
+	c.Assert(elapsed > 4*time.Second, Equals, true,
+		Commentf("the injected slow version function was not reached: the scrape took %s", elapsed))
+
+	versioncache.Clear()
+
+	code, _, elapsed = scrapeHTTP(slowDSN, limits, "0.25", "exporter")
+	c.Check(code, Equals, 200)
+	c.Check(elapsed < 3*time.Second, Equals, true,
+		Commentf("a quarter-second scrape spent %s in the version lookup", elapsed))
 }

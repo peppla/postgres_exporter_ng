@@ -16,6 +16,7 @@
 package distribution
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -35,7 +36,13 @@ var (
 	mtx   sync.Mutex
 )
 
-func Get(dsn string, db *sql.DB) string {
+// Get reports which PostgreSQL distribution a server is, caching the answer
+// per host and port.
+//
+// ctx bounds the detection query. It runs inside a scrape's budget, before any
+// collector does its work, so without one a slow server held the whole request
+// open past its deadline at a phase nothing was watching.
+func Get(ctx context.Context, dsn string, db *sql.DB) string {
 	fingerprint, err := parseFingerprint(dsn)
 	if err != nil {
 		fingerprint = dsn
@@ -49,7 +56,7 @@ func Get(dsn string, db *sql.DB) string {
 	}
 
 	// Detect Aurora by checking if aurora_version function exists.
-	row := db.QueryRow("SELECT to_regproc('aurora_version') IS NOT NULL;")
+	row := db.QueryRowContext(ctx, "SELECT to_regproc('aurora_version') IS NOT NULL;")
 	var detected bool
 	if err := row.Scan(&detected); err == nil && detected {
 		cache[fingerprint] = Aurora
@@ -60,8 +67,8 @@ func Get(dsn string, db *sql.DB) string {
 	return Standard
 }
 
-func IsAurora(dsn string, db *sql.DB) bool {
-	return Get(dsn, db) == Aurora
+func IsAurora(ctx context.Context, dsn string, db *sql.DB) bool {
+	return Get(ctx, dsn, db) == Aurora
 }
 
 func parseFingerprint(dsn string) (string, error) {

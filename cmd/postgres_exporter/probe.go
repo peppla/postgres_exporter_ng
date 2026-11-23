@@ -108,6 +108,9 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
 			remaining = time.Until(deadline)
 		}
+		// Both engines on this endpoint get the bounded string. Giving it to
+		// one and the original to the other leaves half the probe able to
+		// hang on a server that accepts a connection and never answers.
 		dsns := withConnectTimeout([]string{dsn.GetConnectionString()}, limits.ConnectTimeoutFor(remaining))
 		exporter := NewExporter(dsns, opts...)
 
@@ -117,7 +120,7 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		registry.MustRegister(exporter)
 
 		// Run the probe
-		pc, err := collector.NewProbeCollector(ctx, tl, excludeDatabases, registry, dsn, connSema)
+		pc, err := collector.NewProbeCollector(ctx, tl, excludeDatabases, registry, dsns[0], connSema)
 		if err != nil {
 			level.Error(logger).Log("msg", "Error creating probe collector", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)

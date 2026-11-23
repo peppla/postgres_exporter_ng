@@ -608,7 +608,7 @@ func NewExporter(dsn []string, opts ...ExporterOpt) *Exporter {
 }
 
 // GetServer returns a new Server instance for the provided DSN.
-func (e *Exporter) GetServer(dsn string, opts ...ServerOpt) (*Server, error) {
+func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt) (*Server, error) {
 	var err error
 	errCount := 0 // start at zero because we increment before doing work
 	retries := 1
@@ -620,13 +620,17 @@ func (e *Exporter) GetServer(dsn string, opts ...ServerOpt) (*Server, error) {
 
 		server, err = NewServer(dsn, opts...)
 		if err != nil {
-			time.Sleep(time.Duration(errCount) * time.Second)
+			if werr := waitBeforeRetry(ctx, errCount); werr != nil {
+				return nil, err
+			}
 			continue
 		}
 
-		if err = server.Ping(); err != nil {
+		if err = server.Ping(ctx); err != nil {
 			server.Close()
-			time.Sleep(time.Duration(errCount) * time.Second)
+			if werr := waitBeforeRetry(ctx, errCount); werr != nil {
+				return nil, err
+			}
 			continue
 		}
 		break
@@ -698,9 +702,9 @@ func newDesc(subsystem, name, help string, labels prometheus.Labels) *prometheus
 	)
 }
 
-func checkPostgresVersion(db *sql.DB, server string) (semver.Version, string, error) {
+func checkPostgresVersion(ctx context.Context, db *sql.DB, server string) (semver.Version, string, error) {
 	level.Debug(logger).Log("msg", "Querying PostgreSQL version", "server", server)
-	versionRow := db.QueryRow("SELECT version();")
+	versionRow := db.QueryRowContext(ctx, "SELECT version();")
 	var versionString string
 	err := versionRow.Scan(&versionString)
 	if err != nil {
@@ -715,8 +719,8 @@ func checkPostgresVersion(db *sql.DB, server string) (semver.Version, string, er
 }
 
 // Check and update the exporters query maps if the version has changed.
-func (e *Exporter) checkMapVersions(ch chan<- prometheus.Metric, server *Server) error {
-	semanticVersion, versionString, err := versioncache.GetVersion(server.db, server.String(), checkPostgresVersion)
+func (e *Exporter) checkMapVersions(ctx context.Context, ch chan<- prometheus.Metric, server *Server) error {
+	semanticVersion, versionString, err := versioncache.GetVersion(ctx, server.db, server.String(), checkPostgresVersion)
 	if err != nil {
 		return fmt.Errorf("Error fetching version string on %q: %v", server, err)
 	}
@@ -749,7 +753,7 @@ func (e *Exporter) checkMapVersions(ch chan<- prometheus.Metric, server *Server)
 		e.userQueriesError.Reset()
 	}
 
-	e.loadCustomQueries(e.resolutionEnabled, semanticVersion, server)
+	e.loadCustomQueries(ctx, e.resolutionEnabled, semanticVersion, server)
 
 	server.mappingMtx.Unlock()
 

@@ -305,7 +305,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 	return registry
 }
 
-func (e *Exporter) loadCustomQueries(res MetricResolution, version semver.Version, server *Server) {
+func (e *Exporter) loadCustomQueries(ctx context.Context, res MetricResolution, version semver.Version, server *Server) {
 	if e.userQueriesPath[res] != "" {
 		fi, err := os.ReadDir(e.userQueriesPath[res])
 		if err != nil {
@@ -322,13 +322,13 @@ func (e *Exporter) loadCustomQueries(res MetricResolution, version semver.Versio
 
 			if filepath.Ext(v.Name()) == ".yml" || filepath.Ext(v.Name()) == ".yaml" {
 				path := filepath.Join(e.userQueriesPath[res], v.Name())
-				e.addCustomQueriesFromFile(path, version, server)
+				e.addCustomQueriesFromFile(ctx, path, version, server)
 			}
 		}
 	}
 }
 
-func (e *Exporter) addCustomQueriesFromFile(path string, version semver.Version, server *Server) {
+func (e *Exporter) addCustomQueriesFromFile(ctx context.Context, path string, version semver.Version, server *Server) {
 	// Calculate the hashsum of the useQueries
 	userQueriesData, err := os.ReadFile(path)
 	if err != nil {
@@ -339,7 +339,7 @@ func (e *Exporter) addCustomQueriesFromFile(path string, version semver.Version,
 
 	hashsumStr := fmt.Sprintf("%x", sha256.Sum256(userQueriesData))
 
-	if err := addQueries(userQueriesData, version, server); err != nil {
+	if err := addQueries(ctx, userQueriesData, version, server); err != nil {
 		level.Error(logger).Log("msg", "Failed to reload user queries:"+path, "err", err)
 		e.userQueriesError.WithLabelValues(path, hashsumStr).Set(1)
 		return
