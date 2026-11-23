@@ -406,6 +406,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		// scrape that collected nothing was indistinguishable from one that
 		// was never configured to collect.
 		p.reportControlDeferral(ch, inst.name, controlName, databaseLocal)
+		p.retainedForControl(ch, inst.dsn, controlName, cluster, local)
 		return
 	}
 	// Set up the database connection for the collector.
@@ -414,6 +415,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "err", err)
 		p.release()
 		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonConnect, databaseLocal)
+		p.retainedForControl(ch, inst.dsn, controlName, cluster, local)
 		return
 	}
 
@@ -507,9 +509,11 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 // database that was never selected.
 // It returns whether the database was deferred rather than attempted.
 func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) (deferred bool) {
+	target, _ := targetid.ID(t.dsn)
 	fail := func(reason string) {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, t.datname, reason)
+		p.publishRetained(ch, local, target, t.datname)
 	}
 	if !p.acquire() {
 		// Deferred, not failed. Nothing was connected to and nothing was
@@ -520,6 +524,7 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
 			server, t.datname, dbselect.ReasonNoPermit)
+		p.publishRetained(ch, local, target, t.datname)
 		return true
 	}
 	defer p.release()
@@ -546,6 +551,41 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 	}
 	wg.Wait()
 	return false
+}
+
+// retainedForControl publishes what the control connection's collectors last
+// did, for a scrape that never opened it.
+//
+// The cluster-wide collectors describe the server and carry no database, and
+// the database-local ones would have run on the control database, so the two
+// are published under the names they were recorded under.
+func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, controlName string, cluster, local map[string]Collector) {
+	target, _ := targetid.ID(dsn)
+	p.publishRetained(ch, cluster, target, "")
+	p.publishRetained(ch, local, target, controlName)
+}
+
+// publishRetained publishes what these collectors last did on this database,
+// for a path that never reached them.
+//
+// A connection that fails, or work with no permit, runs no collector, and a
+// series that disappears then disappears exactly when an operator wants to
+// know how long this has been going on. Nothing is published for a collector
+// that has never succeeded here, and nothing is recorded: this says what was
+// already known.
+func (p PostgresCollector) publishRetained(ch chan<- prometheus.Metric, collectors map[string]Collector, target, datname string) {
+	for name := range collectors {
+		key := lastsuccess.Key{
+			Engine:    lastsuccess.EngineCollector,
+			Target:    target,
+			Database:  datname,
+			Collector: name,
+		}
+		if when, ok := p.lastSuccess.At(key); ok {
+			ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
+				float64(when.UnixNano())/1e9, name, datname, target)
+		}
+	}
 }
 
 // byScope splits the enabled collectors by where they run.
