@@ -26,9 +26,11 @@ import (
 // failure path.
 //
 // setup clears db when it cannot connect, and the deferred cleanup then closed
-// it regardless. A probe against a target refusing connections answered the
-// client and panicked the process on the way out, which turns one unreachable
-// target into an outage of the exporter.
+// it regardless. A probe against a target refusing connections panicked its
+// handler, so that request lost its response and the client saw the connection
+// drop. net/http recovers the panic and later scrapes work, so this is a lost
+// response rather than an outage, and it is still the wrong answer to an
+// ordinary failure.
 func TestClosingAnInstanceThatNeverConnected(t *testing.T) {
 	// A port nothing is listening on, so setup fails and clears the handle.
 	i, err := newInstance("postgresql://u:p@127.0.0.1:1/db?sslmode=disable&connect_timeout=1")
