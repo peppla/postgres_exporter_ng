@@ -111,9 +111,11 @@
   `pg_stat_replication_pg_wal_lsn_diff` and any untyped series this namespace
   publishes for columns the mapping does not name. A query or dashboard that
   selects on `slot_name` for these metrics matches nothing after the upgrade,
-  and what it matched before was a process id. The slot name for a standby is
-  in `pg_replication_slots`, which is a different namespace, and is correlated
-  through `active_pid`.
+  and what it matched before was a process id. Those metrics carry `pid` now,
+  which is that process id under its own name, so a consumer that was using
+  `slot_name` to tell one standby from another should use `pid`. The slot name
+  itself is in `pg_replication_slots`, which is a different namespace, and is
+  correlated through `active_pid`.
 
 ## 0.15.0 / 2023-10-27
 

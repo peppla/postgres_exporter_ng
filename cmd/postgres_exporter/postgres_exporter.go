@@ -211,8 +211,10 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 	},
 	"pg_stat_replication": {
 		columnMappings: map[string]ColumnMapping{
-			"procpid":          {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange("<9.2.0")},
-			"pid":              {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange(">=9.2.0")},
+			"procpid": {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange("<9.2.0")},
+			// The only label that identifies one sender. Two standbys can
+			// share application_name, client_addr and state.
+			"pid":              {LABEL, "Process ID of a WAL sender process", nil, semver.MustParseRange(">=9.2.0")},
 			"usesysid":         {DISCARD, "OID of the user logged into this WAL sender process", nil, nil},
 			"usename":          {DISCARD, "Name of the user logged into this WAL sender process", nil, nil},
 			"application_name": {LABEL, "Name of the application that is connected to this WAL sender", nil, nil},
