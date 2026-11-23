@@ -211,8 +211,18 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 	},
 	"pg_stat_replication": {
 		columnMappings: map[string]ColumnMapping{
-			"procpid":          {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange("<9.2.0")},
-			"pid":              {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange(">=9.2.0")},
+			"procpid": {DISCARD, "Process ID of a WAL sender process", nil, semver.MustParseRange("<9.2.0")},
+			// A label, because nothing else in this namespace identifies one
+			// sender. application_name, client_addr and state are the others,
+			// and two standbys can share all three: the same tool, behind the
+			// same address, both streaming. They then produce one label set
+			// for two senders and the registry keeps one of them.
+			//
+			// This used to be covered by accident. slot_name was declared as a
+			// label and is not a column of this view, so it carried the first
+			// column's value, which is this one. Removing that false label
+			// removed the separation with it.
+			"pid":              {LABEL, "Process ID of a WAL sender process", nil, semver.MustParseRange(">=9.2.0")},
 			"usesysid":         {DISCARD, "OID of the user logged into this WAL sender process", nil, nil},
 			"usename":          {DISCARD, "Name of the user logged into this WAL sender process", nil, nil},
 			"application_name": {LABEL, "Name of the application that is connected to this WAL sender", nil, nil},
