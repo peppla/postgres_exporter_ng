@@ -133,9 +133,11 @@ func main() {
 	// Load the config file if specified, otherwise use default/DSN settings.
 	//
 	// A file that was named and could not be read is fatal. It used to be a
-	// warning, after which the exporter ran on defaults: with limits in the
-	// file, that means an operator who tightened a budget and mistyped a key
-	// gets the default budget, with one warning line to say so.
+	// warning, after which the exporter ran on defaults. With limits in the
+	// file, an operator who tightened a budget and mistyped a key would get
+	// the default budget, and with monitoring.databases in it, one who asked
+	// for two databases would get every database on the server, each with one
+	// warning line to say so.
 	if *configFile != "" {
 		if err := c.ReloadConfig(*configFile, logger); err != nil {
 			level.Error(logger).Log("msg", "Error loading config", "err", err)
@@ -194,13 +196,30 @@ func main() {
 	// setting on the role or the server is never raised.
 	pgclamp.SetDefaults(limits.StatementTimeout, limits.LockTimeout, limits.ConnectTimeout)
 
+	// Which databases built-in monitoring runs its database-local collectors
+	// against, from the configuration file where it is written there and from
+	// the deprecated flags otherwise. Resolved once, here, so that the one
+	// thing that can go wrong with it stops the exporter starting.
+	//
+	// Resolved per scrape, a set configured in both places logged a line and
+	// served a response with no metrics in it: HTTP 200 and a zero-length
+	// body, which Prometheus records as a healthy target with nothing to say.
+	// The README has always said this is refused at startup.
+	excludeSelection, includeSelection, err := builtinDatabaseSelection(
+		c.GetConfig(), excludedDatabases, strings.Split(*includeDatabases, ","))
+	if err != nil {
+		level.Error(logger).Log("msg", "Invalid database selection", "err", err.Error())
+		os.Exit(1)
+	}
+
 	connSema := semaphore.NewWeighted(limits.Connections)
 	// One admission gate for every endpoint that collects.
 	collectionGate := NewCollectionGate(limits)
 	// One cache for the process, so a result a query file asked to keep
 	// survives the request that collected it.
 	queryCache := querycache.New()
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache))
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache,
+		excludeSelection, includeSelection))
 
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{

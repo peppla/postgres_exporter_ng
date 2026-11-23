@@ -55,7 +55,12 @@ var (
 // limits is the budget one scrape may spend. The request gate is built once,
 // here, rather than per request: it is a limit on how many collections run at
 // the same time, so it has to be the same object across them.
-func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache) http.Handler {
+// excludeSelection and includeSelection are built-in monitoring's database set,
+// resolved at startup. They are passed in rather than read from the
+// configuration here because resolving them can fail, and a scrape is the wrong
+// place to discover that: it has no way to report a configuration error except
+// by serving no metrics.
+func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, excludeSelection, includeSelection dbselect.List) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Refused before any SQL runs, and not queued. A queue turns an
 		// overloaded exporter into a slow one, and the scrapes waiting in it
@@ -107,7 +112,8 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 			return
 		}
 
-		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache)
+		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache,
+			excludeSelection, includeSelection)
 		if err != nil {
 			// Only a request that named collectors turns a build failure into
 			// a client error, because then the names came from the request.
@@ -255,7 +261,7 @@ func (f Filters) postgresCollectors() []string {
 // names came from the request. Everything else is logged and the registry is
 // returned with whatever could be built, which is the behaviour a scrape has
 // always had.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache) (*prometheus.Registry, error) {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, error) {
 	registry := prometheus.NewRegistry()
 
 	// Always, whatever was selected. A refused request serves no metrics of
@@ -384,15 +390,10 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			filters.postgresCollectors(),
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema),
-			// This engine selects its own databases and its set is never
-			// intersected with the legacy engine's. The two are fed the same
-			// values here because these flags are the only database selection
-			// configuration that exists today. Separate keys wait on the
-			// naming decision in contract §4.0b; the mechanism does not.
-			collector.WithDatabaseSelection(
-				dbselect.FromFlag(excludedDatabases),
-				dbselect.FromFlag(strings.Split(*includeDatabases, ",")),
-			),
+			// Built-in monitoring's own set, resolved at startup. Never
+			// intersected with the legacy engine's, which builds its own from
+			// its own configuration.
+			collector.WithDatabaseSelection(excludeSelection, includeSelection),
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())
