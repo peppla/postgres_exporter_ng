@@ -443,3 +443,74 @@ func TestCancellationEndsAnAttemptWithoutADeadline(t *testing.T) {
 		t.Errorf("%d sockets are still open after cancellation, so the attempt kept its connection", open)
 	}
 }
+
+// TestInvalidDurationsAreLeftForTheServer covers a configuration error that
+// was turning into a working connection with a different limit.
+//
+// ParseFloat accepts NaN and infinity, so "NaNs" and "Infms" parse as
+// durations. Because this parser is what decides whether a value is taken out
+// of the connection string, accepting one removed it and PostgreSQL never got
+// the chance to refuse it, so an operator who mistyped a timeout got the
+// exporter's ceiling and no error.
+//
+// A value this cannot read is left in place for the server to reject, which
+// is the only honest answer: this package does not know every spelling
+// PostgreSQL accepts, and guessing wrong in the permissive direction is how
+// the limit went missing.
+func TestInvalidDurationsAreLeftForTheServer(t *testing.T) {
+	for _, name := range []string{"statement_timeout", "lock_timeout"} {
+		for _, value := range []string{"NaNs", "Infms", "-Infs", "nans", "1e400s", "abcms",
+			// Finite, and still longer than a duration can hold, so it takes
+			// the range check rather than the finiteness one.
+			"1e18s"} {
+			t.Run(name+"="+value, func(t *testing.T) {
+				// Written as an option.
+				out, asked := config.StripOptionsOverrides("-c " + name + "=" + value)
+				if !contains(out, name) {
+					t.Errorf("%s=%s was removed from the options string, so the server cannot reject it", name, value)
+				}
+				if asked.StatementMS != 0 || asked.LockMS != 0 {
+					t.Errorf("%s=%s was read as a request of %+v", name, value, asked)
+				}
+
+				// And as a runtime parameter.
+				runtime := map[string]string{name: value}
+				asked = config.StripRuntimeOverrides(runtime)
+				if _, present := runtime[name]; !present {
+					t.Errorf("%s=%s was removed from the runtime parameters", name, value)
+				}
+				if asked.StatementMS != 0 || asked.LockMS != 0 {
+					t.Errorf("%s=%s was read as a request of %+v", name, value, asked)
+				}
+			})
+		}
+	}
+}
+
+// TestValidDurationsAreStillRead is the other side of the test above. A
+// parser that rejected everything would pass it.
+func TestValidDurationsAreStillRead(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int64
+	}{
+		{"0", 0},
+		{"250", 250},
+		{"100ms", 100},
+		{"5s", 5000},
+		{"2min", 120000},
+		{"1h", 3600000},
+		{"500us", 1},
+		{"0.5s", 500},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			out, asked := config.StripOptionsOverrides("-c statement_timeout=" + tc.value)
+			if contains(out, "statement_timeout") {
+				t.Errorf("a readable value %q was left in the options string", tc.value)
+			}
+			if asked.StatementMS != tc.want {
+				t.Errorf("%q was read as %dms, want %dms", tc.value, asked.StatementMS, tc.want)
+			}
+		})
+	}
+}
