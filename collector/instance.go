@@ -100,7 +100,17 @@ func (i *instance) getDB() *sql.DB {
 	return i.db
 }
 
+// Close releases the connection, if there is one.
+//
+// setup clears db when it fails, so an instance that never connected has
+// nothing to close. Closing it anyway dereferenced a nil handle and crashed
+// the process: a probe against a target that refused the connection returned
+// RemoteDisconnected to the client and panicked the server on the way out.
+// A failure to connect is an ordinary outcome and has to be reported as one.
 func (i *instance) Close() error {
+	if i.db == nil {
+		return nil
+	}
 	return i.db.Close()
 }
 

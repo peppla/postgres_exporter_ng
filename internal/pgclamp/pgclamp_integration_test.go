@@ -131,8 +131,8 @@ func TestClampOnlyLowers(t *testing.T) {
 				"lock_timeout":      tc.roleLock,
 			})
 
-			SetDefaults(tc.limit, tc.lockLimit)
-			defer SetDefaults(0, 0)
+			SetDefaults(tc.limit, tc.lockLimit, 3*time.Second)
+			defer SetDefaults(0, 0, 3*time.Second)
 
 			db, err := OpenDSN(dsn)
 			if err != nil {
@@ -160,8 +160,8 @@ func TestClampOnlyLowers(t *testing.T) {
 func TestClampCannotBeBypassedByTheConnectionString(t *testing.T) {
 	dsn := withRole(t, nil) + "&options=-c%20statement_timeout%3D0%20-c%20lock_timeout%3D0"
 
-	SetDefaults(5*time.Second, 500*time.Millisecond)
-	defer SetDefaults(0, 0)
+	SetDefaults(5*time.Second, 500*time.Millisecond, 3*time.Second)
+	defer SetDefaults(0, 0, 3*time.Second)
 
 	db, err := OpenDSN(dsn)
 	if err != nil {
@@ -186,8 +186,8 @@ func TestClampCannotBeBypassedByTheConnectionString(t *testing.T) {
 func TestClampAppliesToEveryPooledConnection(t *testing.T) {
 	dsn := withRole(t, map[string]string{"statement_timeout": "0"})
 
-	SetDefaults(5*time.Second, 500*time.Millisecond)
-	defer SetDefaults(0, 0)
+	SetDefaults(5*time.Second, 500*time.Millisecond, 3*time.Second)
+	defer SetDefaults(0, 0, 3*time.Second)
 
 	db, err := OpenDSN(dsn)
 	if err != nil {
@@ -226,8 +226,8 @@ func TestClampAppliesToEveryPooledConnection(t *testing.T) {
 func TestClampBoundsARealStatement(t *testing.T) {
 	dsn := withRole(t, nil)
 
-	SetDefaults(300*time.Millisecond, 100*time.Millisecond)
-	defer SetDefaults(0, 0)
+	SetDefaults(300*time.Millisecond, 100*time.Millisecond, 3*time.Second)
+	defer SetDefaults(0, 0, 3*time.Second)
 
 	db, err := OpenDSN(dsn)
 	if err != nil {
@@ -247,5 +247,121 @@ func TestClampBoundsARealStatement(t *testing.T) {
 	}
 	if elapsed > 10*time.Second {
 		t.Errorf("the statement took %s, so the ceiling was not what stopped it", elapsed)
+	}
+}
+
+// TestStrictRoleSurvivesALooserConnectionString is the combination the
+// earlier cases missed.
+//
+// They tested a strict role with no client override, and a client override
+// with no strict role. Neither established which wins when both are present,
+// and both were present in the case that mattered: the client's value is
+// applied at startup, before the ceiling is compared against the session, so
+// a looser client value had already erased the administrator's stricter one
+// by the time anything looked.
+//
+// Both forms are covered, because lib/pq forwards either.
+func TestStrictRoleSurvivesALooserConnectionString(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		suffix        string
+		wantStatement int64
+		wantLock      int64
+	}{
+		{
+			name:          "no override at all",
+			suffix:        "",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "options asking for no limit",
+			suffix:        "&options=-c%20statement_timeout%3D0%20-c%20lock_timeout%3D0",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "options asking for more",
+			suffix:        "&options=-c%20statement_timeout%3D60s%20-c%20lock_timeout%3D30s",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "startup parameters asking for no limit",
+			suffix:        "&statement_timeout=0&lock_timeout=0",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			// A client asking for less than everything else gets it. The
+			// ceiling only ever tightens, and so does the client.
+			name:          "options asking for less than the role",
+			suffix:        "&options=-c%20statement_timeout%3D50ms%20-c%20lock_timeout%3D10ms",
+			wantStatement: 50, wantLock: 10,
+		},
+		{
+			name:          "startup parameters asking for less than the role",
+			suffix:        "&statement_timeout=50ms&lock_timeout=10ms",
+			wantStatement: 50, wantLock: 10,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := withRole(t, map[string]string{
+				"statement_timeout": "100ms",
+				"lock_timeout":      "20ms",
+			}) + tc.suffix
+
+			SetDefaults(5*time.Second, 500*time.Millisecond, 3*time.Second)
+			defer SetDefaults(0, 0, 0)
+
+			db, err := OpenDSN(dsn)
+			if err != nil {
+				t.Fatalf("opening: %s", err)
+			}
+			defer db.Close()
+
+			if got := effective(t, db, "statement_timeout"); got != tc.wantStatement {
+				t.Errorf("statement_timeout is %dms, want %dms", got, tc.wantStatement)
+			}
+			if got := effective(t, db, "lock_timeout"); got != tc.wantLock {
+				t.Errorf("lock_timeout is %dms, want %dms", got, tc.wantLock)
+			}
+		})
+	}
+}
+
+// TestUnrelatedOptionsSurvive checks that taking the two timeouts out of the
+// options string leaves the rest of it working.
+//
+// An operator who put work_mem there meant it, and losing it would be a
+// different setting silently changing because of how this package reads the
+// string.
+func TestUnrelatedOptionsSurvive(t *testing.T) {
+	dsn := withRole(t, nil) +
+		"&options=-c%20work_mem%3D65536%20-c%20statement_timeout%3D0%20-c%20application_name%3Dclamp_check"
+
+	SetDefaults(5*time.Second, 500*time.Millisecond, 3*time.Second)
+	defer SetDefaults(0, 0, 0)
+
+	db, err := OpenDSN(dsn)
+	if err != nil {
+		t.Fatalf("opening: %s", err)
+	}
+	defer db.Close()
+
+	var workMem, appName string
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT setting FROM pg_catalog.pg_settings WHERE name = 'work_mem'`).Scan(&workMem); err != nil {
+		t.Fatalf("reading work_mem: %s", err)
+	}
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT setting FROM pg_catalog.pg_settings WHERE name = 'application_name'`).Scan(&appName); err != nil {
+		t.Fatalf("reading application_name: %s", err)
+	}
+
+	if workMem != "65536" {
+		t.Errorf("work_mem is %q, want 65536: removing the timeouts took something else with it", workMem)
+	}
+	if appName != "clamp_check" {
+		t.Errorf("application_name is %q, want clamp_check", appName)
+	}
+	if got := effective(t, db, "statement_timeout"); got != 5000 {
+		t.Errorf("statement_timeout is %dms, want 5000ms", got)
 	}
 }

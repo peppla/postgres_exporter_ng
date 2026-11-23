@@ -191,7 +191,7 @@ func main() {
 	// Before anything opens a connection. Every connection this process
 	// makes carries these ceilings, applied downwards only, so a stricter
 	// setting on the role or the server is never raised.
-	pgclamp.SetDefaults(limits.StatementTimeout, limits.LockTimeout)
+	pgclamp.SetDefaults(limits.StatementTimeout, limits.LockTimeout, limits.ConnectTimeout)
 
 	connSema := semaphore.NewWeighted(limits.Connections)
 	// One admission gate for every endpoint that collects.

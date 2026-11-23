@@ -18,7 +18,6 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/collector"
-	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
@@ -158,16 +157,6 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 	// were not refused, and the counter is package-level so it survives the
 	// registry being rebuilt per request.
 	registry.MustRegister(collectionRejected)
-
-	// Every connection this scrape opens gets a bound on how long it may take
-	// to establish, shortened by whatever is left of the collection budget.
-	// Done once here, for both engines, because the per-database connection
-	// strings are derived from these and keep their parameters.
-	remaining := time.Duration(0)
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining = time.Until(deadline)
-	}
-	dsns = withConnectTimeout(dsns, limits.ConnectTimeoutFor(remaining))
 
 	excludedDatabases := strings.Split(*excludeDatabases, ",")
 	logger.Log("msg", "Excluded databases", "databases", fmt.Sprintf("%v", excludedDatabases))
@@ -347,26 +336,6 @@ func (e *Exporter) addCustomQueriesFromFile(ctx context.Context, path string, ve
 
 	// Mark user queries as successfully loaded
 	e.userQueriesError.WithLabelValues(path, hashsumStr).Set(0)
-}
-
-// withConnectTimeout bounds how long each connection string may spend being
-// established.
-//
-// A string that cannot be parsed is passed through unchanged. Refusing it here
-// would turn a connection error, which the scrape reports per target, into a
-// scrape that produces nothing, and the parse failure will be reported by
-// whichever engine tries to use it.
-func withConnectTimeout(dsns []string, timeout time.Duration) []string {
-	out := make([]string, len(dsns))
-	for i, dsn := range dsns {
-		bounded, err := config.DSNWithConnectTimeout(dsn, timeout)
-		if err != nil {
-			out[i] = dsn
-			continue
-		}
-		out[i] = bounded
-	}
-	return out
 }
 
 // requestedTimeout reads the scrape timeout header.
