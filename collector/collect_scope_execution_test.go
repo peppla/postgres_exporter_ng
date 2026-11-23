@@ -36,6 +36,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/sync/semaphore"
 )
 
 // quietCollector is a collector that reports nothing and reads nothing, so a
@@ -248,6 +249,51 @@ func TestAClusterOnlyScrapeThatCannotConnectSelectsNoDatabase(t *testing.T) {
 		t.Errorf("a connection that failed published %d error series, want 1",
 			len(out["pg_collector_database_error"]))
 	}
+	// Not asked for stays not asked for on this path too. A zero here says
+	// the set of databases has collapsed to the configured one, and this
+	// request never wanted a set.
+	if _, ok := out["pg_collector_database_discovery_success"]; ok {
+		t.Error("cluster-only failure reports discovery status despite no discovery requested")
+	}
+}
+
+// TestAClusterOnlyScrapeWithNoPermitSelectsNoDatabase covers the other early
+// exit, where the request never got a connection permit and nothing was
+// opened at all.
+//
+// Same rule as the connection failure above: the scope decides what is
+// reported, and it is decided before either exit.
+func TestAClusterOnlyScrapeWithNoPermitSelectsNoDatabase(t *testing.T) {
+	mock := stubConnection(t)
+	withScopedCollector(t, "scope_exec_cluster", scopeCluster)
+
+	// Nothing is expected, because nothing should be run: without a permit
+	// the engine does not open the connection, so even the version lookup
+	// must not happen.
+	engine := engineWith(map[string]Collector{"scope_exec_cluster": quietCollector{}})
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	engine.ctx = cancelled
+	engine.connSema = semaphore.NewWeighted(1)
+
+	out := collectEngine(t, engine)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a scrape with no connection permit ran a query: %s", err)
+	}
+	if got := gaugeValue(t, out["pg_collector_databases_selected"]); got != 0 {
+		t.Errorf("a cluster-only scrape with no permit reported %v databases selected", got)
+	}
+	if _, ok := out["pg_collector_database_discovery_success"]; ok {
+		t.Error("a scrape with no permit reports discovery status despite no discovery requested")
+	}
+	if got := gaugeValue(t, out["pg_collector_database_up"]); got != 0 {
+		t.Errorf("database_up is %v when nothing was opened", got)
+	}
+	if len(out["pg_collector_database_error"]) != 1 {
+		t.Errorf("a scrape with no permit published %d error series, want 1",
+			len(out["pg_collector_database_error"]))
+	}
 }
 
 // TestADatabaseScopedScrapeThatCannotConnectSelectsItsDatabase is the other
@@ -266,5 +312,29 @@ func TestADatabaseScopedScrapeThatCannotConnectSelectsItsDatabase(t *testing.T) 
 	}
 	if got := gaugeValue(t, out["pg_collector_database_discovery_success"]); got != 0 {
 		t.Errorf("discovery_success is %v after a connection that never worked", got)
+	}
+}
+
+// TestADatabaseScopedScrapeWithNoPermitReportsUnknownDiscovery is the same
+// half of the rule on the admission path: database-local work was selected, so
+// the set of databases was wanted and could not be determined.
+func TestADatabaseScopedScrapeWithNoPermitReportsUnknownDiscovery(t *testing.T) {
+	stubConnection(t)
+	withScopedCollector(t, "scope_exec_local", scopeDatabase)
+
+	engine := engineWith(map[string]Collector{"scope_exec_local": quietCollector{}})
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	engine.ctx = cancelled
+	engine.connSema = semaphore.NewWeighted(1)
+
+	out := collectEngine(t, engine)
+
+	got, ok := out["pg_collector_database_discovery_success"]
+	if !ok {
+		t.Fatal("a scrape that wanted the set of databases and could not get it reported nothing about discovery")
+	}
+	if gaugeValue(t, got) != 0 {
+		t.Errorf("discovery_success is %v when no connection was available to read the catalogue", gaugeValue(t, got))
 	}
 }

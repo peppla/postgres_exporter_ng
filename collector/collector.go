@@ -580,7 +580,15 @@ func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, ser
 		selected = 1
 	}
 	ch <- prometheus.MustNewConstMetric(collectorSelectedDesc, prometheus.GaugeValue, float64(selected), server)
-	ch <- prometheus.MustNewConstMetric(collectorDiscoverySuccessDesc, prometheus.GaugeValue, 0, server)
+	// Only where the set of databases was wanted. A request that selected no
+	// database-scoped collector never needed one, and a zero here says the
+	// set has collapsed to the configured database, which is a claim about
+	// something nobody asked about. Where database-local work was selected
+	// the zero stands: its discovery could not happen, and that is exactly
+	// what the series is for.
+	if databaseLocal {
+		ch <- prometheus.MustNewConstMetric(collectorDiscoverySuccessDesc, prometheus.GaugeValue, 0, server)
+	}
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, datname)
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, datname, reason)
 }
