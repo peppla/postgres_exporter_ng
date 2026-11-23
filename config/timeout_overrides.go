@@ -36,7 +36,6 @@ package config
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -68,63 +67,6 @@ var optionSetting = regexp.MustCompile(`(?:^|\s)(?:-c\s*|--)([a-zA-Z_-]+)=(\S+)`
 // spellings it accepts are all recognised here.
 func settingName(name string) string {
 	return strings.ToLower(strings.ReplaceAll(name, "-", "_"))
-}
-
-// StripTimeoutOverrides removes the statement and lock timeouts from a
-// connection string and reports what it had asked for.
-//
-// Everything else in the string is left alone, including other settings in
-// options, because an operator setting work_mem there means it.
-func StripTimeoutOverrides(in string) (string, TimeoutOverrides, error) {
-	var asked TimeoutOverrides
-	parsed, err := dsnFromString(in)
-	if err != nil {
-		return "", asked, err
-	}
-	if parsed.query == nil {
-		parsed.query = url.Values{}
-	}
-
-	// As connection parameters of their own, in whatever spelling. The query
-	// is walked rather than asked for each name, because Get matches exactly
-	// and the server does not.
-	for key, values := range parsed.query {
-		name := settingName(key)
-		if !isOverrideSetting(name) || len(values) == 0 || values[0] == "" {
-			continue
-		}
-		ms, perr := durationSettingMS(values[0])
-		if perr != nil {
-			return "", asked, fmt.Errorf("%s=%q in the connection string: %w", key, values[0], perr)
-		}
-		asked.set(name, ms)
-		parsed.query.Del(key)
-	}
-
-	// And inside options, where what is left has to keep working.
-	if options := parsed.query.Get("options"); options != "" {
-		kept := options
-		for _, m := range optionSetting.FindAllStringSubmatch(options, -1) {
-			whole, name, value := m[0], settingName(m[1]), m[2]
-			if !isOverrideSetting(name) {
-				continue
-			}
-			ms, perr := durationSettingMS(value)
-			if perr != nil {
-				return "", asked, fmt.Errorf("%s=%q in the options string: %w", name, value, perr)
-			}
-			asked.set(name, ms)
-			kept = strings.Replace(kept, whole, "", 1)
-		}
-		kept = strings.Join(strings.Fields(kept), " ")
-		if kept == "" {
-			parsed.query.Del("options")
-		} else {
-			parsed.query.Set("options", kept)
-		}
-	}
-
-	return parsed.GetConnectionString(), asked, nil
 }
 
 func (o *TimeoutOverrides) set(name string, ms int64) {
@@ -197,4 +139,82 @@ func durationSettingMS(value string) (int64, error) {
 		return 0, fmt.Errorf("is negative")
 	}
 	return n, nil
+}
+
+// StripOptionsOverrides removes the statement and lock timeouts from an
+// options string and reports what it had asked for.
+//
+// Separate from StripTimeoutOverrides because the driver resolves its options
+// from more than the connection string: PGOPTIONS in the environment is added
+// after the string has been parsed. Cleaning the string alone left that path
+// untouched, so an environment variable asking for no limit still erased a
+// role's stricter one. This is applied to the driver's effective
+// configuration instead, where every source has already been merged.
+//
+// Unrelated settings are preserved, because an operator who set work_mem in
+// PGOPTIONS meant it.
+func StripOptionsOverrides(options string) (string, TimeoutOverrides) {
+	var asked TimeoutOverrides
+	if options == "" {
+		return options, asked
+	}
+	kept := options
+	for _, m := range optionSetting.FindAllStringSubmatch(options, -1) {
+		whole, name, value := m[0], settingName(m[1]), m[2]
+		if !isOverrideSetting(name) {
+			continue
+		}
+		ms, err := durationSettingMS(value)
+		if err != nil {
+			// Unreadable to this package is unreadable to the server too, so
+			// it is left in place for the server to reject rather than
+			// silently removed.
+			continue
+		}
+		asked.set(name, ms)
+		kept = strings.Replace(kept, whole, "", 1)
+	}
+	return strings.Join(strings.Fields(kept), " "), asked
+}
+
+// StripRuntimeOverrides removes the statement and lock timeouts from the
+// driver's runtime parameters, which is where a connection parameter the
+// driver does not recognise ends up, and reports what they asked for.
+func StripRuntimeOverrides(runtime map[string]string) TimeoutOverrides {
+	var asked TimeoutOverrides
+	for key, value := range runtime {
+		name := settingName(key)
+		if !isOverrideSetting(name) || value == "" {
+			continue
+		}
+		ms, err := durationSettingMS(value)
+		if err != nil {
+			continue
+		}
+		asked.set(name, ms)
+		delete(runtime, key)
+	}
+	return asked
+}
+
+// Tighten keeps the stricter of two sets of requests, treating zero as no
+// request rather than as the shortest possible timeout.
+func (o TimeoutOverrides) Tighten(other TimeoutOverrides) TimeoutOverrides {
+	return TimeoutOverrides{
+		StatementMS: tighter(o.StatementMS, other.StatementMS),
+		LockMS:      tighter(o.LockMS, other.LockMS),
+	}
+}
+
+func tighter(a, b int64) int64 {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	case b < a:
+		return b
+	default:
+		return a
+	}
 }
