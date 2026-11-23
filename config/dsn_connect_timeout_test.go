@@ -134,3 +134,61 @@ func TestDSNWithConnectTimeoutKeepsTheDatabase(t *testing.T) {
 		}
 	}
 }
+
+// TestParseKeyValueHandlesQuotedValues covers the parser both engines use to
+// read a libpq keyword string.
+//
+// Each had its own copy that split on plain spaces and on the first equals
+// sign. That rejects any connection string with a quoted value containing a
+// space, and reads one containing an equals sign in the wrong place. The
+// options string the session timeouts are written into has both.
+func TestParseKeyValueHandlesQuotedValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want map[string]string
+	}{
+		{
+			name: "plain pairs",
+			in:   "host=localhost port=5432 dbname=postgres",
+			want: map[string]string{"host": "localhost", "port": "5432", "dbname": "postgres"},
+		},
+		{
+			name: "quoted pairs, as pq.ParseURL emits them",
+			in:   "dbname='postgres' host='127.0.0.1' port='5432'",
+			want: map[string]string{"dbname": "postgres", "host": "127.0.0.1", "port": "5432"},
+		},
+		{
+			// The case the session timeouts need: spaces and equals signs
+			// inside one quoted value.
+			name: "an options value with spaces and equals signs",
+			in:   "host='127.0.0.1' options='-c statement_timeout=5000 -c lock_timeout=500' user='root'",
+			want: map[string]string{
+				"host":    "127.0.0.1",
+				"options": "-c statement_timeout=5000 -c lock_timeout=500",
+				"user":    "root",
+			},
+		},
+		{
+			// The same fault reached anyone whose password had a space in it.
+			name: "a password with a space",
+			in:   "host='h' password='two words' user='u'",
+			want: map[string]string{"host": "h", "password": "two words", "user": "u"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseKeyValue(tc.in)
+			if err != nil {
+				t.Fatalf("ParseKeyValue(%q): %s", tc.in, err)
+			}
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Errorf("%s = %q, want %q", k, got[k], want)
+				}
+			}
+			if len(got) != len(tc.want) {
+				t.Errorf("parsed %d keys, want %d: %v", len(got), len(tc.want), got)
+			}
+		})
+	}
+}

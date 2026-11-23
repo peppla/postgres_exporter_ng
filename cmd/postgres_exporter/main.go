@@ -27,6 +27,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	vc "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -186,6 +187,11 @@ func main() {
 		"max_request_timeout", limits.MaxRequestTimeout,
 		"response_reserve_max", limits.ResponseReserveMax,
 		"response_reserve_fraction", limits.ResponseReserveFraction)
+
+	// Before anything opens a connection. Every connection this process
+	// makes carries these ceilings, applied downwards only, so a stricter
+	// setting on the role or the server is never raised.
+	pgclamp.SetDefaults(limits.StatementTimeout, limits.LockTimeout)
 
 	connSema := semaphore.NewWeighted(limits.Connections)
 	// One admission gate for every endpoint that collects.

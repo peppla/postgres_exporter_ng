@@ -112,6 +112,8 @@ limits:
   request_timeout: 10s
   max_request_timeout: 60s
   connect_timeout: 3s
+  statement_timeout: 5s
+  lock_timeout: 500ms
   response_reserve:
     max: 1s
     fraction: 0.1
@@ -124,6 +126,8 @@ limits:
 | `request_timeout` | 10s | the budget for a scrape that sends no timeout header | restart |
 | `max_request_timeout` | 60s | the cap, however long a scraper asks for | restart |
 | `connect_timeout` | 3s | one attempt to establish a connection, shortened by what is left of the scrape's budget | restart |
+| `statement_timeout` | 5s | one statement on the server, as a session setting | restart |
+| `lock_timeout` | 500ms | how long a statement waits for a lock, capped by the statement timeout | restart |
 | `response_reserve.max` | 1s | the most of a budget kept back for producing the response | restart |
 | `response_reserve.fraction` | 0.1 | the share of a budget kept back, when that is less than the cap | restart |
 
@@ -137,6 +141,17 @@ request. Nothing lengthens it. Collection then stops a reserve before the end,
 so a scrape that collected everything still has time to send it. The reserve is
 the smaller of `response_reserve.max` and `response_reserve.fraction` of the
 budget, which keeps a short scrape from reserving most of itself.
+
+`statement_timeout` and `lock_timeout` are set on each connection the exporter
+opens, so the server enforces them whether or not the exporter is still there
+to cancel. They are backstops: a collector query that takes seconds is already
+a problem, and these stop it being an unbounded one. The scrape's own deadline
+cancels earlier when less time is left.
+
+They only ever tighten. The exporter reads what the connection already has,
+from the role or the server, and keeps the smaller of that and the limit, so a
+`statement_timeout` an administrator set to 100ms is not raised to 5s by
+monitoring. A connection string that asks for no limit at all still gets one.
 
 `connect_timeout` is not a convenience. The driver waits indefinitely without
 one, and the deadline on a scrape does not reach its dial or its startup

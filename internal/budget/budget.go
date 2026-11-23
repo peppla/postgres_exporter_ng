@@ -73,6 +73,20 @@ type Limits struct {
 	// its startup handshake, so a server that accepts a connection and then
 	// says nothing holds a scrape open past every other limit here.
 	ConnectTimeout time.Duration
+
+	// StatementTimeout bounds one statement on the server. It is a backstop
+	// rather than a target: a collector query that takes seconds is already a
+	// problem, and this is what stops it being an unbounded one.
+	//
+	// Applied downwards only. A stricter setting on the role or the server is
+	// kept, because monitoring raising a limit an administrator lowered is
+	// the wrong direction for a backstop.
+	StatementTimeout time.Duration
+
+	// LockTimeout bounds how long a statement waits for a lock. Monitoring
+	// should give way to work rather than queue behind it, so this is much
+	// shorter than the statement timeout and capped by it.
+	LockTimeout time.Duration
 }
 
 // Defaults are the values approved in contract §6.0.
@@ -85,6 +99,8 @@ func Defaults() Limits {
 		ResponseReserveMax:      time.Second,
 		ResponseReserveFraction: 0.10,
 		ConnectTimeout:          3 * time.Second,
+		StatementTimeout:        5 * time.Second,
+		LockTimeout:             500 * time.Millisecond,
 	}
 }
 
@@ -128,6 +144,20 @@ func (l Limits) Validate() error {
 	if l.ConnectTimeout > l.MaxRequestTimeout {
 		return fmt.Errorf("connect_timeout %s is longer than max_request_timeout %s, so connecting could use the whole budget",
 			l.ConnectTimeout, l.MaxRequestTimeout)
+	}
+	if l.StatementTimeout <= 0 {
+		return fmt.Errorf("statement_timeout must be positive, got %s", l.StatementTimeout)
+	}
+	if l.StatementTimeout > l.MaxRequestTimeout {
+		return fmt.Errorf("statement_timeout %s is longer than max_request_timeout %s, so one statement could use the whole budget",
+			l.StatementTimeout, l.MaxRequestTimeout)
+	}
+	if l.LockTimeout <= 0 {
+		return fmt.Errorf("lock_timeout must be positive, got %s", l.LockTimeout)
+	}
+	if l.LockTimeout > l.StatementTimeout {
+		return fmt.Errorf("lock_timeout %s is longer than statement_timeout %s, so the statement would be cut off first and the lock wait would never be reached",
+			l.LockTimeout, l.StatementTimeout)
 	}
 	return nil
 }

@@ -23,6 +23,8 @@
 //	  request_timeout: 10s
 //	  max_request_timeout: 60s
 //	  connect_timeout: 3s
+//	  statement_timeout: 5s
+//	  lock_timeout: 500ms
 //	  response_reserve:
 //	    max: 1s
 //	    fraction: 0.1
@@ -54,6 +56,8 @@ type Limits struct {
 	MaxRequestTimeout  *model.Duration  `yaml:"max_request_timeout"`
 	ResponseReserve    *ResponseReserve `yaml:"response_reserve"`
 	ConnectTimeout     *model.Duration  `yaml:"connect_timeout"`
+	StatementTimeout   *model.Duration  `yaml:"statement_timeout"`
+	LockTimeout        *model.Duration  `yaml:"lock_timeout"`
 }
 
 // ResponseReserve is the part of a request budget kept back for producing the
@@ -84,6 +88,12 @@ func (l Limits) Budget() budget.Limits {
 	if l.ConnectTimeout != nil {
 		out.ConnectTimeout = time.Duration(*l.ConnectTimeout)
 	}
+	if l.StatementTimeout != nil {
+		out.StatementTimeout = time.Duration(*l.StatementTimeout)
+	}
+	if l.LockTimeout != nil {
+		out.LockTimeout = time.Duration(*l.LockTimeout)
+	}
 	if l.ResponseReserve != nil {
 		if l.ResponseReserve.Max != nil {
 			out.ResponseReserveMax = time.Duration(*l.ResponseReserve.Max)
@@ -108,5 +118,7 @@ func limitKeyPaths() [][]string {
 		{"limits", "response_reserve", "max"},
 		{"limits", "response_reserve", "fraction"},
 		{"limits", "connect_timeout"},
+		{"limits", "statement_timeout"},
+		{"limits", "lock_timeout"},
 	}
 }
