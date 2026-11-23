@@ -33,6 +33,13 @@ type instance struct {
 	version semver.Version
 }
 
+// openDB opens a handle for a connection string.
+//
+// A variable so a test can drive the engine against a stub and see which
+// queries it ran, which is the only way to show that a query was not run. A
+// count of series proves what was published, not what was executed.
+var openDB = pgclamp.OpenDSN
+
 func newInstance(dsn string) (*instance, error) {
 	i := &instance{
 		dsn: dsn,
@@ -40,7 +47,7 @@ func newInstance(dsn string) (*instance, error) {
 
 	// "Create" a database handle to verify the DSN provided is valid.
 	// Open is not guaranteed to create a connection.
-	db, err := pgclamp.OpenDSN(dsn)
+	db, err := openDB(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +79,7 @@ func (i *instance) copy() *instance {
 // The handle is closed on every failure. Leaving it open on the error path
 // leaks a handle per failed database per scrape.
 func (i *instance) setup(ctx context.Context) error {
-	db, err := pgclamp.OpenDSN(i.dsn)
+	db, err := openDB(i.dsn)
 	if err != nil {
 		return err
 	}

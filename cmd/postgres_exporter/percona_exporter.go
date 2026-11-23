@@ -98,33 +98,24 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		filters := r.URL.Query()["collect[]"]
 		level.Debug(logger).Log("msg", "Collect query", "filters", filters)
 
-		var f Filters
-		if len(filters) == 0 {
-			f.EnableAllCollectors = true
-		} else {
-			for _, filter := range filters {
-				switch filter {
-				case "standard.process":
-					f.EnableProcessCollector = true
-				case "standard.go":
-					f.EnableGoCollector = true
-				case "version":
-					f.EnableVersionCollector = true
-				case "exporter":
-					f.EnableDefaultCollector = true
-				case "custom_query.hr":
-					f.EnableHRCollector = true
-				case "custom_query.mr":
-					f.EnableMRCollector = true
-				case "custom_query.lr":
-					f.EnableLRCollector = true
-				case "postgres":
-					f.EnablePostgresCollector = true
-				}
-			}
+		f, err := parseCollectFilters(filters)
+		if err != nil {
+			// A name that selects nothing is worth a 400. Served as a success
+			// it becomes a target that scrapes cleanly and reports no metrics,
+			// which reads as a healthy database with nothing to say.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 
-		registry := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache)
+		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache)
+		if err != nil {
+			// Only a request that named collectors turns a build failure into
+			// a client error, because then the names came from the request.
+			// Every other failure keeps the old behaviour of logging it and
+			// serving whatever could be built.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
 		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
@@ -134,6 +125,74 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 
 		h.ServeHTTP(w, r)
 	})
+}
+
+// parseCollectFilters turns the collect[] query parameters into a Filters.
+//
+// Four selections reach the namespaced collectors:
+//
+//	postgres                     all of them, as before
+//	postgres.cluster             those whose answer describes the whole server
+//	postgres.database            those that read one database's catalogs
+//	postgres.collector.<name>    one collector
+//
+// A collector is named at the third level rather than the second. At the
+// second level the name of the collector that reads pg_database, which is
+// "database", is also the name of the database-scoped group, and no rule about
+// which wins is worth having: one reading selects fourteen collectors and the
+// other selects one, and a scrape configuration cannot say which it meant. The
+// extra level costs a word and removes the ambiguity for every collector name
+// that will ever be registered.
+//
+// An empty selection means everything, which is what a scrape passing no
+// collect[] at all gets.
+func parseCollectFilters(filters []string) (Filters, error) {
+	var f Filters
+	if len(filters) == 0 {
+		f.EnableAllCollectors = true
+		return f, nil
+	}
+	for _, filter := range filters {
+		switch filter {
+		case "standard.process":
+			f.EnableProcessCollector = true
+		case "standard.go":
+			f.EnableGoCollector = true
+		case "version":
+			f.EnableVersionCollector = true
+		case "exporter":
+			f.EnableDefaultCollector = true
+		case "custom_query.hr":
+			f.EnableHRCollector = true
+		case "custom_query.mr":
+			f.EnableMRCollector = true
+		case "custom_query.lr":
+			f.EnableLRCollector = true
+		case "postgres":
+			f.EnablePostgresCollector = true
+			f.AllPostgresCollectors = true
+		case "postgres.cluster":
+			f.addPostgresCollectors(collector.ClusterScopedCollectors())
+		case "postgres.database":
+			f.addPostgresCollectors(collector.DatabaseScopedCollectors())
+		default:
+			name, ok := strings.CutPrefix(filter, "postgres.collector.")
+			if ok && name != "" {
+				// Not checked here. NewPostgresCollector owns the list of
+				// collectors and says whether a name is unknown or turned off,
+				// and the handler turns that into the 400.
+				f.addPostgresCollectors([]string{name})
+				continue
+			}
+			if strings.HasPrefix(filter, "postgres.") {
+				return Filters{}, fmt.Errorf("unknown collect[] value %q: expected postgres, postgres.cluster, postgres.database or postgres.collector.<name>", filter)
+			}
+			// Anything outside the postgres namespace is ignored, as it has
+			// always been: a PMM agent may send group names this exporter does
+			// not implement.
+		}
+	}
+	return f, nil
 }
 
 // Filters is a struct to enable or disable collectors.
@@ -147,10 +206,56 @@ type Filters struct {
 	EnableVersionCollector  bool
 	EnableProcessCollector  bool
 	EnablePostgresCollector bool
+
+	// AllPostgresCollectors records a bare collect[]=postgres, which asks for
+	// every enabled collector and so overrides any narrower selection sent
+	// alongside it.
+	AllPostgresCollectors bool
+
+	// PostgresCollectors narrows the namespaced framework to these collectors.
+	// Empty means every enabled one.
+	//
+	// What this buys is one exporter serving several Prometheus jobs at
+	// different intervals. The registry assembles a whole response before
+	// writing any of it, so a scrape's peak memory follows how many series it
+	// builds at once, and the per-database collectors are the expensive ones.
+	// Putting them on their own slower job makes every response smaller and
+	// tightens the sample timestamps on the rest, since Prometheus stamps a
+	// whole scrape with one time however long collection took.
+	PostgresCollectors []string
+}
+
+// addPostgresCollectors records a selection.
+//
+// A group that expands to nothing has to leave the framework switched off. An
+// empty list means "every enabled collector" to NewPostgresCollector, so a
+// group whose members are all disabled would otherwise select all of them,
+// which is the opposite of what was asked.
+func (f *Filters) addPostgresCollectors(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	f.EnablePostgresCollector = true
+	f.PostgresCollectors = append(f.PostgresCollectors, names...)
+}
+
+// postgresCollectors is the list handed to NewPostgresCollector: the narrowed
+// selection, or nothing at all when the request asked for everything.
+func (f Filters) postgresCollectors() []string {
+	if f.EnableAllCollectors || f.AllPostgresCollectors {
+		return nil
+	}
+	return f.PostgresCollectors
 }
 
 // makeRegistry creates a new prometheus registry with default and percona exporters.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache) *prometheus.Registry {
+//
+// It returns an error only when the namespaced collectors could not be built
+// for a request that named them. The caller turns that into a 400, because the
+// names came from the request. Everything else is logged and the registry is
+// returned with whatever could be built, which is the behaviour a scrape has
+// always had.
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache) (*prometheus.Registry, error) {
 	registry := prometheus.NewRegistry()
 
 	// Always, whatever was selected. A refused request serves no metrics of
@@ -276,7 +381,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			logger,
 			excludedDatabases,
 			dsn,
-			[]string{},
+			filters.postgresCollectors(),
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema),
 			// This engine selects its own databases and its set is never
@@ -291,12 +396,15 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())
+			if len(filters.postgresCollectors()) > 0 {
+				return nil, err
+			}
 		} else {
 			registry.MustRegister(pe)
 		}
 	}
 
-	return registry
+	return registry, nil
 }
 
 func (e *Exporter) loadCustomQueries(ctx context.Context, res MetricResolution, version semver.Version, server *Server) {

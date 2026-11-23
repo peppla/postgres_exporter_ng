@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -199,6 +200,43 @@ type PostgresCollector struct {
 
 type Option func(*PostgresCollector) error
 
+// scopedCollectors returns the enabled collectors that registered with the
+// given scope.
+//
+// The classification is read from the registration, not from a second list of
+// names kept beside it. A list like that is only correct while someone
+// maintains it: a collector renamed, or added without a thought for it, falls
+// to whichever side the lookup happens to miss and nothing says so. The scope
+// is already a required argument to registerCollector, so there is one answer
+// and it is the one the fan-out uses.
+//
+// Disabled collectors are left out rather than reported as an error. A group
+// asks for whatever of its kind the exporter has, which is a different request
+// from naming a collector, where being turned off is worth saying.
+func scopedCollectors(scope collectorScope) []string {
+	var names []string
+	for name, enabled := range collectorState {
+		if enabled == nil || !*enabled {
+			continue
+		}
+		if collectorScopes[name] == scope {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ClusterScopedCollectors returns the enabled collectors whose answer is the
+// same from any database on the server, so one scrape of them describes the
+// whole cluster.
+func ClusterScopedCollectors() []string { return scopedCollectors(scopeCluster) }
+
+// DatabaseScopedCollectors returns the enabled collectors that read catalogs
+// belonging to one database, and which therefore run once per selected
+// database and carry a datname label.
+func DatabaseScopedCollectors() []string { return scopedCollectors(scopeDatabase) }
+
 // NewPostgresCollector creates a new PostgresCollector.
 func NewPostgresCollector(logger log.Logger, excludeDatabases []string, dsn string, filters []string, options ...Option) (*PostgresCollector, error) {
 	p := &PostgresCollector{
@@ -317,12 +355,20 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// later, but a failure before that still has to name something.
 	controlName, _ := config.DatabaseFromDSN(inst.dsn)
 
+	// Where the selected collectors run, decided before anything can go
+	// wrong. Every early exit below reports what this scrape meant to cover,
+	// and a scrape that selected no database-scoped collector meant to cover
+	// no database, whatever the catalog holds and whether or not the
+	// connection worked.
+	cluster, local := p.byScope()
+	databaseLocal := len(local) > 0
+
 	if !p.acquire() {
 		// Nothing was attempted, which is neither a success nor a connection
 		// failure. Returning silently here published no series at all, so a
 		// scrape that collected nothing was indistinguishable from one that
 		// was never configured to collect.
-		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonNotAttempted)
+		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonNotAttempted, databaseLocal)
 		return
 	}
 	// Set up the database connection for the collector.
@@ -330,17 +376,24 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "err", err)
 		p.release()
-		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonConnect)
+		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonConnect, databaseLocal)
 		return
 	}
 
-	cluster, local := p.byScope()
-
-	sel, err := selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases)
-	if err != nil {
-		level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
+	// The catalog read is what the fan-out needs: which databases exist, and
+	// which of them configuration keeps. With no database-local collector
+	// selected there is no fan-out, so the query is not run. A cluster-scoped
+	// collector that wants the catalogue reads it for itself, as its own
+	// metric, rather than waiting on this one.
+	var sel dbSelection
+	if databaseLocal {
+		var err error
+		sel, err = selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases)
+		if err != nil {
+			level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
+		}
 	}
-	p.reportSelection(ch, inst.name, sel)
+	p.reportSelection(ch, inst.name, sel, databaseLocal)
 
 	// The control connection is held for the cluster-wide work and released
 	// before the fan-out, so the per-database connections are bounded by the
@@ -371,10 +424,17 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	inst.Close()
 	p.release()
 
+	// The control connection worked, whatever was selected to run over it.
+	// Without a catalog read there is no target to take the name from, so it
+	// comes from the connection string, which is where reportControlFailure
+	// takes it from on the paths where the connection did not work.
+	upName := controlName
 	if control != nil {
-		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, control.datname)
+		upName = control.datname
 	}
-	if len(local) == 0 {
+	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, upName)
+
+	if !databaseLocal {
 		return
 	}
 
@@ -467,26 +527,40 @@ func (p PostgresCollector) release() {
 }
 
 // reportSelection publishes what this engine meant to cover, before it tries.
-func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server string, sel dbSelection) {
+//
+// databaseLocal says whether any database-scoped collector is enabled for this
+// request. None means no database was meant to be covered, whatever the
+// catalog holds, which is what collect[]=postgres.cluster asks for.
+func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server string, sel dbSelection, databaseLocal bool) {
 	selected := 0
-	for _, t := range sel.targets {
-		if !t.skipDatabaseLocal {
-			selected++
+	if databaseLocal {
+		for _, t := range sel.targets {
+			if !t.skipDatabaseLocal {
+				selected++
+			}
 		}
 	}
 	gauge := func(d *prometheus.Desc, v float64) {
 		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, server)
 	}
+	// Known, unknown and not asked for are three different things.
+	//
 	// discovered is published only when the catalog was actually read. A
 	// number here when it was not would be an invented total, and the number
 	// it would invent is 1, which is exactly what a one-database server looks
 	// like. discovery_success says the set is unknown instead.
-	if sel.catalogRead {
-		gauge(collectorDiscoveredDesc, float64(sel.discovered))
+	//
+	// Neither is published when no database-local collector was selected,
+	// because then the set was never asked for. A zero there would invent a
+	// server with no databases, and a one would claim a catalogue nobody read.
+	if databaseLocal {
+		if sel.catalogRead {
+			gauge(collectorDiscoveredDesc, float64(sel.discovered))
+		}
+		gauge(collectorDiscoverySuccessDesc, boolToFloat(sel.ok))
 	}
 	gauge(collectorSelectedDesc, float64(selected))
 	gauge(collectorExcludedDesc, float64(len(sel.excluded)+sel.notIncluded))
-	gauge(collectorDiscoverySuccessDesc, boolToFloat(sel.ok))
 	for _, name := range sel.excluded {
 		ch <- prometheus.MustNewConstMetric(collectorExcludedDatabaseDesc, prometheus.GaugeValue, 1,
 			server, name, dbselect.ReasonExcludeList)
@@ -500,13 +574,21 @@ func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server s
 // here would be invented. Selected is 1 only when the rule would have kept the
 // control database, so a scrape configured to collect from nothing does not
 // report a shortfall it never intended.
-func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, server, datname, reason string) {
+func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, server, datname, reason string, databaseLocal bool) {
 	selected := 0
-	if p.controlSelected(datname) {
+	if databaseLocal && p.controlSelected(datname) {
 		selected = 1
 	}
 	ch <- prometheus.MustNewConstMetric(collectorSelectedDesc, prometheus.GaugeValue, float64(selected), server)
-	ch <- prometheus.MustNewConstMetric(collectorDiscoverySuccessDesc, prometheus.GaugeValue, 0, server)
+	// Only where the set of databases was wanted. A request that selected no
+	// database-scoped collector never needed one, and a zero here says the
+	// set has collapsed to the configured database, which is a claim about
+	// something nobody asked about. Where database-local work was selected
+	// the zero stands: its discovery could not happen, and that is exactly
+	// what the series is for.
+	if databaseLocal {
+		ch <- prometheus.MustNewConstMetric(collectorDiscoverySuccessDesc, prometheus.GaugeValue, 0, server)
+	}
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, datname)
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, datname, reason)
 }
