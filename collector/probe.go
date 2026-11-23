@@ -19,7 +19,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/percona/postgres_exporter/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -33,7 +32,14 @@ type ProbeCollector struct {
 	ctx        context.Context
 }
 
-func NewProbeCollector(ctx context.Context, logger log.Logger, excludeDatabases []string, registry *prometheus.Registry, dsn config.DSN, connSema *semaphore.Weighted) (*ProbeCollector, error) {
+// NewProbeCollector builds the collector behind the probe endpoint.
+//
+// connectionString is taken rather than a config.DSN because the caller has
+// already applied the connection limits to it. Rebuilding the string here
+// from the DSN threw those away, so the probe's own connection had no bound
+// on how long it could spend being established while the rest of the request
+// was budgeted.
+func NewProbeCollector(ctx context.Context, logger log.Logger, excludeDatabases []string, registry *prometheus.Registry, connectionString string, connSema *semaphore.Weighted) (*ProbeCollector, error) {
 	collectors := make(map[string]Collector)
 	initiatedCollectorsMtx.Lock()
 	defer initiatedCollectorsMtx.Unlock()
@@ -61,7 +67,7 @@ func NewProbeCollector(ctx context.Context, logger log.Logger, excludeDatabases 
 		}
 	}
 
-	instance, err := newInstance(dsn.GetConnectionString())
+	instance, err := newInstance(connectionString)
 	if err != nil {
 		return nil, err
 	}

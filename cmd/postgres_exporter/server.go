@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -28,7 +29,10 @@ import (
 // Server describes a connection to Postgres.
 // Also it contains metrics map and query overrides.
 type Server struct {
-	db           *sql.DB
+	db  *sql.DB
+	dsn string
+	// distribution is empty until something asks for it. Use
+	// distributionOf rather than reading it.
 	distribution string
 	labels       prometheus.Labels
 	master       bool
@@ -87,7 +91,11 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 		},
 		metricCache: make(map[string]cachedMetrics),
 	}
-	s.distribution = distribution.Get(dsn, db)
+	// The distribution is detected on first use rather than here, because
+	// detecting it is a query and NewServer has no budget to run one under.
+	// It is cached per host and port, so the cost is one round trip per
+	// server whichever scrape pays it.
+	s.dsn = dsn
 
 	for _, opt := range opts {
 		opt(s)
@@ -114,9 +122,14 @@ func (s *Server) Close() error {
 	return s.db.Close()
 }
 
-// Ping checks connection availability and possibly invalidates the connection if it fails.
-func (s *Server) Ping() error {
-	if err := s.db.Ping(); err != nil {
+// Ping checks connection availability and possibly invalidates the connection
+// if it fails.
+//
+// ctx bounds the attempt. A ping without one waits as long as the driver
+// feels like, which on a server that accepts a connection and then stops
+// answering is forever, at a phase before any collector has started.
+func (s *Server) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
 		if cerr := s.Close(); cerr != nil {
 			level.Error(logger).Log("msg", "Error while closing non-pinging DB connection", "server", s, "err", cerr)
 		}
@@ -131,19 +144,24 @@ func (s *Server) String() string {
 }
 
 // Scrape loads metrics.
-func (s *Server) Scrape(ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
+//
+// ctx carries the collection budget. Every query below has to run under it,
+// or the budget bounds only the parts of a scrape that happen to consult it:
+// a slow statement reached through a context-free Query runs to completion
+// whatever the scrape was allowed.
+func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
 	s.mappingMtx.RLock()
 	defer s.mappingMtx.RUnlock()
 
 	var err error
 
 	if !disableSettingsMetrics && s.master {
-		if err = querySettings(ch, s); err != nil {
+		if err = querySettings(ctx, ch, s); err != nil {
 			err = fmt.Errorf("error retrieving settings: %s", err)
 		}
 	}
 
-	errMap := queryNamespaceMappings(ch, s)
+	errMap := queryNamespaceMappings(ctx, ch, s)
 	if len(errMap) > 0 {
 		err = fmt.Errorf("queryNamespaceMappings returned %d errors", len(errMap))
 		level.Error(logger).Log("msg", "NAMESPACE ERRORS FOUND")
@@ -171,7 +189,7 @@ func NewServers(opts ...ServerOpt) *Servers {
 }
 
 // GetServer returns established connection from a collection.
-func (s *Servers) GetServer(dsn string) (*Server, error) {
+func (s *Servers) GetServer(ctx context.Context, dsn string) (*Server, error) {
 	s.m.Lock()
 	defer s.m.Unlock()
 	var err error
@@ -187,12 +205,14 @@ func (s *Servers) GetServer(dsn string) (*Server, error) {
 		if !ok {
 			server, err = NewServer(dsn, s.opts...)
 			if err != nil {
-				time.Sleep(time.Duration(errCount) * time.Second)
+				if werr := waitBeforeRetry(ctx, errCount); werr != nil {
+					return nil, err
+				}
 				continue
 			}
 			s.servers[dsn] = server
 		}
-		if err = server.Ping(); err != nil {
+		if err = server.Ping(ctx); err != nil {
 			server.Close()
 			delete(s.servers, dsn)
 			time.Sleep(time.Duration(errCount) * time.Second)
@@ -211,5 +231,32 @@ func (s *Servers) Close() {
 		if err := server.Close(); err != nil {
 			level.Error(logger).Log("msg", "Failed to close connection", "server", server, "err", err)
 		}
+	}
+}
+
+// distributionOf reports which PostgreSQL distribution this server is,
+// detecting it on first use under the caller's budget.
+func (s *Server) distributionOf(ctx context.Context) string {
+	if s.distribution == "" {
+		s.distribution = distribution.Get(ctx, s.dsn, s.db)
+	}
+	return s.distribution
+}
+
+// waitBeforeRetry sleeps between connection attempts, and stops waiting when
+// the scrape's budget runs out.
+//
+// A plain Sleep here kept a request alive past its own deadline doing nothing,
+// and with several retries it outlasted the budget by more than the budget.
+// The caller returns the error it already had rather than a context error,
+// because what went wrong is the connection, not the waiting.
+func waitBeforeRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

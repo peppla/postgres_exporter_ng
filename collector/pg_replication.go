@@ -68,7 +68,7 @@ var (
 func (c *PGReplicationCollector) Update(ctx context.Context, instance *instance, ch chan<- prometheus.Metric) error {
 	db := instance.getDB()
 	// Skip Aurora instances (not supported pg_last_wal_receive_lsn)
-	if distribution.IsAurora(instance.dsn, db) {
+	if distribution.IsAurora(ctx, instance.dsn, db) {
 		return nil
 	}
 

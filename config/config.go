@@ -14,6 +14,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"sync"
@@ -40,6 +41,8 @@ var (
 
 type Config struct {
 	AuthModules map[string]AuthModule `yaml:"auth_modules"`
+	// Limits is what one scrape is allowed to cost. See limits.go.
+	Limits Limits `yaml:"limits"`
 }
 
 type AuthModule struct {
@@ -77,16 +80,28 @@ func (ch *Handler) ReloadConfig(f string, logger log.Logger) error {
 		}
 	}()
 
-	yamlReader, err := os.Open(f)
+	// Read the file once and parse it twice. The typed parse cannot see a key
+	// written with no value, because yaml decodes a null into the same nil
+	// that an absent key produces, so the keys where that matters are checked
+	// against the document separately.
+	content, err := os.ReadFile(f)
 	if err != nil {
 		return fmt.Errorf("error opening config file %q: %s", f, err)
 	}
-	defer yamlReader.Close()
-	decoder := yaml.NewDecoder(yamlReader)
+
+	if err = rejectNullKeys(content, limitKeyPaths()...); err != nil {
+		return fmt.Errorf("error parsing config file %q: %s", f, err)
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
 	decoder.KnownFields(true)
 
 	if err = decoder.Decode(config); err != nil {
 		return fmt.Errorf("error parsing config file %q: %s", f, err)
+	}
+
+	if err = config.Limits.Budget().Validate(); err != nil {
+		return fmt.Errorf("error parsing config file %q: limits: %s", f, err)
 	}
 
 	ch.Lock()

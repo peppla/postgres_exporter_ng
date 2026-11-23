@@ -201,7 +201,7 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 		defer e.connSema.Release(1)
 	}
 
-	server, err := e.GetServer(dsn)
+	server, err := e.GetServer(e.ctx, dsn)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error opening connection to database", "dsn", loggableDSN(dsn), "err", err)
 		return nil, err
@@ -219,7 +219,7 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 
 func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) error {
 	dsn := target.dsn
-	server, err := e.GetServer(dsn)
+	server, err := e.GetServer(e.ctx, dsn)
 	if err != nil {
 		return &ErrorConnectToServer{fmt.Sprintf("Error opening connection to database (%s): %s", loggableDSN(dsn), err.Error())}
 	}
@@ -233,7 +233,7 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 	server.datname = target.datname
 
 	// Check if map versions need to be updated
-	if err := e.checkMapVersions(ch, server); err != nil {
+	if err := e.checkMapVersions(e.ctx, ch, server); err != nil {
 		// Proceeding is only defensible when there is something to proceed
 		// with. GetServer builds a fresh Server for every scrape, so when this
 		// step fails there is no previous map: metricMap is nil,
@@ -272,7 +272,7 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 		server.datname = name
 	}
 
-	return server.Scrape(ch, e.disableSettingsMetrics)
+	return server.Scrape(e.ctx, ch, e.disableSettingsMetrics)
 }
 
 // try to get the DataSource

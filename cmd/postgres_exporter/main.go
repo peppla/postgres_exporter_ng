@@ -21,6 +21,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
@@ -127,10 +128,16 @@ func main() {
 		return
 	}
 
-	// Load the config file if specified, otherwise use default/DSN settings
+	// Load the config file if specified, otherwise use default/DSN settings.
+	//
+	// A file that was named and could not be read is fatal. It used to be a
+	// warning, after which the exporter ran on defaults: with limits in the
+	// file, that means an operator who tightened a budget and mistyped a key
+	// gets the default budget, with one warning line to say so.
 	if *configFile != "" {
 		if err := c.ReloadConfig(*configFile, logger); err != nil {
-			level.Warn(logger).Log("msg", "Error loading config", "err", err)
+			level.Error(logger).Log("msg", "Error loading config", "err", err)
+			os.Exit(1)
 		}
 	} else {
 		level.Debug(logger).Log("msg", "No config file provided, using default/DSN settings")
@@ -163,8 +170,27 @@ func main() {
 		"version":          versionCollector,
 	}
 
-	connSema := semaphore.NewWeighted(*maxConnections)
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors))
+	// The operational budget, from the configuration file and the one flag
+	// that overlaps it. Validated here so a budget that cannot be satisfied
+	// stops the exporter starting rather than producing scrapes that fail for
+	// a reason nobody connects to the configuration.
+	limits, err := resolveLimits(c.GetConfig(), maxConnectionsSet, *maxConnections)
+	if err != nil {
+		level.Error(logger).Log("msg", "Invalid limits", "err", err.Error())
+		os.Exit(1)
+	}
+	level.Info(logger).Log("msg", "Operational budget",
+		"connections", limits.Connections,
+		"concurrent_requests", limits.ConcurrentRequests,
+		"request_timeout", limits.RequestTimeout,
+		"max_request_timeout", limits.MaxRequestTimeout,
+		"response_reserve_max", limits.ResponseReserveMax,
+		"response_reserve_fraction", limits.ResponseReserveFraction)
+
+	connSema := semaphore.NewWeighted(limits.Connections)
+	// One admission gate for every endpoint that collects.
+	collectionGate := NewCollectionGate(limits)
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate))
 
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{
@@ -186,10 +212,21 @@ func main() {
 		http.Handle("/", landingPage)
 	}
 
-	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema))
+	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema, limits, collectionGate))
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *webConfig.WebListenAddresses)
-	srv := &http.Server{}
+	// A backstop under the per-request write deadline. A handler sets its own
+	// from the request's budget, and this covers anything that does not, plus
+	// the time before a handler runs. Both exist because a client that stops
+	// reading otherwise holds its connection, and its admission slot, for as
+	// long as it likes.
+	//
+	// The read timeout is separate and deliberately generous: it bounds a
+	// client that opens a connection and sends nothing.
+	srv := &http.Server{
+		WriteTimeout:      limits.MaxRequestTimeout,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
 	if err := web.ListenAndServe(srv, webConfig, promslog.New(&promslog.Config{})); err != nil {
 		level.Error(logger).Log("msg", "Error running HTTP server", "err", err)
 		os.Exit(1)

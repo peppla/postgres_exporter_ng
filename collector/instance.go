@@ -85,7 +85,7 @@ func (i *instance) setup(ctx context.Context) error {
 		return fmt.Errorf("error connecting to database: %w", err)
 	}
 
-	version, _, err := versioncache.GetVersion(i.db, i.name, queryVersion)
+	version, _, err := versioncache.GetVersion(ctx, i.db, i.name, queryVersion)
 	if err != nil {
 		i.db = nil
 		db.Close()
@@ -108,9 +108,9 @@ func (i *instance) Close() error {
 var versionRegex = regexp.MustCompile(`^\w+ ((\d+)(\.\d+)?(\.\d+)?)`)
 var serverVersionRegex = regexp.MustCompile(`^((\d+)(\.\d+)?(\.\d+)?)`)
 
-func queryVersion(db *sql.DB, server string) (semver.Version, string, error) {
+func queryVersion(ctx context.Context, db *sql.DB, server string) (semver.Version, string, error) {
 	var version string
-	err := db.QueryRow("SELECT version();").Scan(&version)
+	err := db.QueryRowContext(ctx, "SELECT version();").Scan(&version)
 	if err != nil {
 		return semver.Version{}, "", fmt.Errorf("error scanning version string on %q: %w", server, err)
 	}
@@ -122,7 +122,7 @@ func queryVersion(db *sql.DB, server string) (semver.Version, string, error) {
 
 	// We could also try to parse the version from the server_version field.
 	// This is of the format 13.3 (Debian 13.3-1.pgdg100+1)
-	err = db.QueryRow("SHOW server_version;").Scan(&version)
+	err = db.QueryRowContext(ctx, "SHOW server_version;").Scan(&version)
 	if err != nil {
 		return semver.Version{}, "", fmt.Errorf("error scanning server_version on %q: %w", server, err)
 	}
