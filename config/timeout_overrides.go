@@ -36,6 +36,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -118,10 +119,24 @@ func durationSettingMS(value string) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("is not a number followed by a unit")
 		}
+		// ParseFloat accepts NaN and infinity, so "NaNs" and "Infms" parse.
+		// Converting either to a duration produces a number PostgreSQL would
+		// have rejected, and because this function is what decides whether a
+		// value is removed from the connection string, accepting one turned a
+		// configuration error into a successful connection with a different
+		// limit. Returning an error leaves the value in place for the server
+		// to refuse, which is what it is for.
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0, fmt.Errorf("is not a finite number")
+		}
 		if n < 0 {
 			return 0, fmt.Errorf("is negative")
 		}
-		ms := time.Duration(n * float64(unit.scale)).Milliseconds()
+		nanos := n * float64(unit.scale)
+		if nanos > float64(math.MaxInt64) {
+			return 0, fmt.Errorf("is longer than this can represent")
+		}
+		ms := time.Duration(nanos).Milliseconds()
 		if ms < 1 && n > 0 {
 			// Shorter than a millisecond, which PostgreSQL cannot express for
 			// these settings. Rounding down to zero would turn the strictest
