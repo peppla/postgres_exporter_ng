@@ -6,6 +6,97 @@
   * Add enhanced checkpointer metrics
   * Add `pg_stat_io` collector with byte statistics and WAL I/O activity tracking
 * [ENHANCEMENT] Update CI tested PostgreSQL versions to include PostgreSQL 18
+* [CHANGE] Database-local collectors run against every selected database
+  instead of only the one the exporter connects to. `pg_stat_user_tables`,
+  `pg_statio_user_tables`, `pg_stat_user_indexes`, `pg_statio_user_indexes` and
+  `pg_extensions` described the connection's own database and said nothing
+  about the rest of the server. Every series from them now carries `datname`,
+  so a query that aggregated across them without that label returns a sum over
+  more databases than before.
+* [CHANGE] A scrape is bounded in time and in concurrency. Each request gets a
+  deadline, with time reserved for writing the response; every connection
+  carries a connect timeout; every query runs under the request's deadline and
+  is cancelled when it passes; and a request beyond the concurrency limit is
+  refused with HTTP 503 before any SQL runs. Previously a scrape ran until it
+  finished, however long that took. Bounded admission of each piece of
+  per-database work, a bounded worker pool and fairness between repeated
+  attempts are not implemented yet.
+* [CHANGE] Every connection the exporter opens carries a `statement_timeout`,
+  a `lock_timeout` and a `connect_timeout`. They are applied downwards only, so
+  a stricter setting on the role or the server is never raised, and a scrape can
+  no longer wait indefinitely on a server that accepts a connection and then
+  stops answering.
+* [CHANGE] `cache_seconds` in a custom query file now suppresses the query for
+  as long as it says. It had no effect at all before, because the cache lived
+  on an object the exporter rebuilt for every request, so the query ran on
+  every scrape. Samples served from the cache carry the collection time on the
+  wire instead of being presented as fresh, so a reader can tell a value
+  measured a moment ago from one measured a minute ago. What a backend then
+  stores depends on its own ingestion settings, which this exporter does not
+  control.
+* [CHANGE] `collect[]` selects collectors individually and by scope:
+  `postgres.cluster` for the collectors that describe a whole server,
+  `postgres.database` for the per-database ones, and
+  `postgres.collector.<name>` for one by name. A request naming an individual
+  collector that does not exist or that ships disabled is refused with HTTP 400
+  instead of producing an empty but successful scrape. A group that expands to
+  nothing is not refused, because an empty group is a configuration an operator
+  can reasonably ask for.
+* [FEATURE] Report what a scrape meant to cover and what it did. The
+  custom-query engine publishes `pg_exporter_databases_discovered`,
+  `_selected`, `_attempted`, `_scraped`, `_failed`, `_deferred` and
+  `_excluded`, and per database `pg_exporter_database_selected`,
+  `_scrape_success`, `_scrape_error`, `_deferred` and `_excluded`. The
+  namespaced collectors publish a smaller set of their own:
+  `pg_collector_databases_discovered`, `_selected`, `_excluded` and
+  `_deferred`, `pg_collector_database_discovery_success`, and per database
+  `pg_collector_database_up`, `_error` and `_deferred`. They do not yet have
+  the attempted and completed counts.
+
+  Read these rather than `pg_up` to tell whether a scrape covered what it
+  intended. `pg_up` reports whether connections worked, not whether collection
+  succeeded: it goes to zero only when every database fails to connect, so
+  nine of ten unreachable databases read as a healthy server and a database
+  whose queries all failed does not move it at all.
+* [FEATURE] A custom query may name the databases it runs on, with `databases:`
+  in the query file, and `master: true` keeps a query on the configured
+  connection database alone. An omitted list means every database the engine
+  reaches, and an explicit empty list means none.
+* [FEATURE] A `limits` section in the configuration file bounds what the
+  exporter may spend. Two kinds of limit: process-wide caps on database
+  connections and on requests collecting at once, and per-request time budgets
+  made of the request timeout, its ceiling, the reserve kept for writing the
+  response, and the statement, lock and connect timeouts each connection
+  carries. `--max-connections` sets the same number as `limits.connections` and
+  is deprecated; setting both is refused at startup.
+* [FEATURE] Table and index catalog metrics from `pg_class`: `relpages`,
+  `reltuples`, `relallvisible`, version-gated `relallfrozen`, and
+  `n_ins_since_vacuum` and version-gated `n_tup_newpage_upd` from
+  `pg_stat_user_tables`.
+* [BUGFIX] A query that failed partway through its rows reported success. Six
+  iterators across both engines now check for the error that ends a row scan,
+  so a database that was half collected is no longer reported as covered.
+* [BUGFIX] `pg_stat_wal_receiver` reported a timeline number as a log position
+  and a log position as a timeline, because two columns were scanned in the
+  wrong order.
+* [BUGFIX] A version restriction in a query file is evaluated against the
+  server version the exporter detected. It was compared against a field nothing
+  assigned, which left every restriction reading the zero version, so a query
+  restricted to newer servers never ran and one restricted to older servers ran
+  everywhere.
+* [ENHANCEMENT] Table metrics share one label set across each row rather than
+  building one per metric. On the recorded 5000-table benchmark this cut
+  allocation from 127 to 81 MiB per scrape. Other schemas and collection
+  profiles will differ.
+* [CHANGE] A database the exporter had no room to collect from is reported as
+  deferred rather than as a failure of that database. `databases_failed` no
+  longer counts work that never started, and `databases_attempted` and
+  `databases_deferred` say how much did and did not. An alert on failures no
+  longer fires because the exporter was busy.
+* [CHANGE] Database selection written in both the configuration file and a
+  deprecated flag is refused at startup instead of being resolved at scrape
+  time. The exporter exits rather than starting and serving a response with no
+  metrics in it, which is what it used to do.
 * [CHANGE] A custom query that names a label column its SQL does not select now
   fails that namespace, and the exporter reports an error for it. Before this,
   the label took the value of the query's first selected column: a file naming
