@@ -3363,7 +3363,10 @@ func (s *IntegrationSuite) TestCollectRejectsAnUnusableSelection(c *C) {
 		collect string
 	}{
 		{"an unknown collector name", "postgres.collector.no_such_collector"},
-		{"a collector that ships disabled", "postgres.collector.stat_wal_receiver"},
+		// stat_wal_receiver used to be the example here. This change enables
+		// it, because the query file it replaces is being retired, so the
+		// case needs a collector that still ships disabled.
+		{"a collector that ships disabled", "postgres.collector.stat_statements"},
 		{"an unknown value in the postgres namespace", "postgres.nonsense"},
 		{"the old second-level collector form", "postgres.stat_user_tables"},
 	} {
