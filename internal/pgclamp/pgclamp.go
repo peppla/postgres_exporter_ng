@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/percona/postgres_exporter/config"
 )
 
 // clampQuery lowers one setting to at most the given number of milliseconds.
@@ -49,7 +50,12 @@ import (
 // value of 0 means no limit, so NULLIF turns it into NULL and LEAST, which
 // ignores NULLs, yields the configured ceiling. Anything else yields the
 // smaller of the two, so the setting only ever moves down.
-const clampQuery = `SELECT set_config($1, LEAST(NULLIF(setting::bigint, 0), $2::bigint)::text, false)
+// $2 is the exporter's ceiling and $3 is what the connection string asked
+// for, with zero meaning no instruction in both cases. LEAST ignores NULLs,
+// so whichever of the three is smallest and actually set wins, and a setting
+// that is already stricter than all of them is left alone.
+const clampQuery = `SELECT set_config($1,
+		LEAST(NULLIF(setting::bigint, 0), NULLIF($2::bigint, 0), NULLIF($3::bigint, 0))::text, false)
 	FROM pg_catalog.pg_settings WHERE name = $1`
 
 // Connector wraps a driver connector and applies the ceilings to each new
@@ -58,14 +64,18 @@ type Connector struct {
 	inner     driver.Connector
 	statement time.Duration
 	lock      time.Duration
+	// asked is what the connection string wanted, taken out of the string
+	// before connecting so that a looser client value cannot replace a
+	// stricter role setting before this package reads it.
+	asked config.TimeoutOverrides
 }
 
 // Wrap returns a connector that clamps every connection it opens.
 //
 // A zero duration leaves that setting alone, which is what an operator asking
 // for no ceiling gets.
-func Wrap(inner driver.Connector, statement, lock time.Duration) *Connector {
-	return &Connector{inner: inner, statement: statement, lock: lock}
+func Wrap(inner driver.Connector, statement, lock time.Duration, asked config.TimeoutOverrides) *Connector {
+	return &Connector{inner: inner, statement: statement, lock: lock, asked: asked}
 }
 
 // Driver implements driver.Connector.
@@ -78,7 +88,7 @@ func (c *Connector) Driver() driver.Driver { return c.inner.Driver() }
 // connection: the scrape reports a failure for this database and moves on,
 // where an unbounded one can hold work open past every budget.
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
-	conn, err := c.inner.Connect(ctx)
+	conn, err := c.connect(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -86,14 +96,15 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	for _, setting := range []struct {
 		name  string
 		value time.Duration
+		asked int64
 	}{
-		{"statement_timeout", c.statement},
-		{"lock_timeout", c.lock},
+		{"statement_timeout", c.statement, c.asked.StatementMS},
+		{"lock_timeout", c.lock, c.asked.LockMS},
 	} {
-		if setting.value <= 0 {
+		if setting.value <= 0 && setting.asked <= 0 {
 			continue
 		}
-		if err := clamp(ctx, conn, setting.name, setting.value); err != nil {
+		if err := clamp(ctx, conn, setting.name, setting.value, setting.asked); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("applying %s to a new connection: %w", setting.name, err)
 		}
@@ -101,8 +112,48 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	return conn, nil
 }
 
+// connect opens the connection and gives up when the caller's context does.
+//
+// The driver bounds its own startup with a whole number of seconds, so a
+// quarter-second request still waited a full second for a server that accepts
+// a socket and never speaks. Worse, the context it is handed does not reach
+// its handshake at all. Running the attempt alongside the context and
+// abandoning it is the only bound that matches what was asked for.
+//
+// An abandoned attempt is closed when it eventually finishes, rather than
+// left to the garbage collector, because until then it is a connection on the
+// server that this process is not counting.
+func (c *Connector) connect(ctx context.Context) (driver.Conn, error) {
+	type attempt struct {
+		conn driver.Conn
+		err  error
+	}
+	done := make(chan attempt, 1)
+	go func() {
+		conn, err := c.inner.Connect(ctx)
+		done <- attempt{conn, err}
+	}()
+
+	select {
+	case a := <-done:
+		return a.conn, a.err
+	case <-ctx.Done():
+		go func() {
+			a := <-done
+			// Only a successful attempt has anything to close. A failed one
+			// can carry a typed nil inside a non-nil interface, which is not
+			// nil to compare against and panics when closed. That is the same
+			// shape as the probe cleanup crash, and it bit here too.
+			if a.err == nil && a.conn != nil {
+				_ = a.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 // clamp runs the lowering statement on one connection.
-func clamp(ctx context.Context, conn driver.Conn, name string, value time.Duration) error {
+func clamp(ctx context.Context, conn driver.Conn, name string, value time.Duration, askedMS int64) error {
 	queryer, ok := conn.(driver.QueryerContext)
 	if !ok {
 		return fmt.Errorf("this driver cannot run a query on a new connection")
@@ -111,13 +162,14 @@ func clamp(ctx context.Context, conn driver.Conn, name string, value time.Durati
 	// Rounded up, because rounding a sub-millisecond ceiling down to zero
 	// would read as no limit at all.
 	ms := value.Milliseconds()
-	if ms < 1 {
+	if ms < 1 && value > 0 {
 		ms = 1
 	}
 
 	rows, err := queryer.QueryContext(ctx, clampQuery, []driver.NamedValue{
 		{Ordinal: 1, Value: name},
 		{Ordinal: 2, Value: fmt.Sprint(ms)},
+		{Ordinal: 3, Value: fmt.Sprint(askedMS)},
 	})
 	if err != nil {
 		return err
@@ -129,8 +181,8 @@ func clamp(ctx context.Context, conn driver.Conn, name string, value time.Durati
 //
 // It takes the connector rather than building one, so the caller decides how
 // the connection string is parsed and this package stays about the ceilings.
-func Open(inner driver.Connector, statement, lock time.Duration) *sql.DB {
-	return sql.OpenDB(Wrap(inner, statement, lock))
+func Open(inner driver.Connector, statement, lock time.Duration, asked config.TimeoutOverrides) *sql.DB {
+	return sql.OpenDB(Wrap(inner, statement, lock, asked))
 }
 
 // The ceilings every connection in this process gets.
@@ -147,20 +199,21 @@ var (
 	defaultsMtx      sync.RWMutex
 	defaultStatement time.Duration
 	defaultLock      time.Duration
+	defaultConnect   time.Duration
 )
 
 // SetDefaults records the ceilings for connections opened from now on.
-func SetDefaults(statement, lock time.Duration) {
+func SetDefaults(statement, lock, connect time.Duration) {
 	defaultsMtx.Lock()
 	defer defaultsMtx.Unlock()
-	defaultStatement, defaultLock = statement, lock
+	defaultStatement, defaultLock, defaultConnect = statement, lock, connect
 }
 
 // Defaults reports the current ceilings.
-func Defaults() (statement, lock time.Duration) {
+func Defaults() (statement, lock, connect time.Duration) {
 	defaultsMtx.RLock()
 	defer defaultsMtx.RUnlock()
-	return defaultStatement, defaultLock
+	return defaultStatement, defaultLock, defaultConnect
 }
 
 // OpenDSN opens a database handle whose connections carry the process
@@ -171,10 +224,26 @@ func Defaults() (statement, lock time.Duration) {
 // a handle opened before SetDefaults keeps whatever was set then, which is
 // why main sets them before serving.
 func OpenDSN(dsn string) (*sql.DB, error) {
-	connector, err := pq.NewConnector(dsn)
+	cleaned, asked, err := config.StripTimeoutOverrides(dsn)
 	if err != nil {
 		return nil, err
 	}
-	statement, lock := Defaults()
-	return Open(connector, statement, lock), nil
+
+	// The typed configuration rather than the string, because connect_timeout
+	// in a connection string is a whole number of seconds and a scrape can be
+	// given less than one.
+	cfg, err := pq.NewConfig(cleaned)
+	if err != nil {
+		return nil, err
+	}
+	statement, lock, connect := Defaults()
+	if connect > 0 && (cfg.ConnectTimeout <= 0 || cfg.ConnectTimeout > connect) {
+		cfg.ConnectTimeout = connect
+	}
+
+	connector, err := pq.NewConnectorConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return Open(connector, statement, lock, asked), nil
 }
