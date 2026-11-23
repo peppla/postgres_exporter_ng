@@ -15,9 +15,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -28,6 +26,7 @@ import (
 	"github.com/percona/postgres_exporter/distribution"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -152,14 +151,22 @@ func (s *Server) String() string {
 	return s.labels[serverLabelName]
 }
 
-// cacheIdentity hashes this server's connection string to separate connection
-// contexts without keeping a credential in a cache key.
+// cacheIdentity returns this server's connection context, for keying what was
+// collected over it and for saying which collection a diagnostic describes.
 //
-// The fingerprint cannot do it: it is host and port, which targets share. They
-// differ by database, by role, or by anything else the string carries.
+// The fingerprint cannot do either: it is host and port, which targets share.
+// They differ by database, by role, and by anything else the connection string
+// carries, including a search_path that changes which tables identical SQL
+// reads.
 func (s *Server) cacheIdentity() string {
-	sum := sha256.Sum256([]byte(s.dsn))
-	return hex.EncodeToString(sum[:])
+	id, first := targetid.ID(s.dsn)
+	if first {
+		// Once per target per process, so an operator can read which
+		// connection an identity stands for. The identity itself carries
+		// nothing from the string, which is the point of it.
+		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(s.dsn))
+	}
+	return id
 }
 
 // Scrape loads metrics.

@@ -319,7 +319,7 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 		if cacheable && err == nil {
 			ch <- prometheus.MustNewConstMetric(
 				cacheAgeDesc(server), prometheus.GaugeValue, age.Seconds(),
-				namespace, server.datname, server.role)
+				namespace, server.datname, server.role, server.cacheIdentity())
 		}
 
 		// A failed query is not an answer, so it is not cached. Caching it
@@ -344,18 +344,19 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 func cacheAgeDesc(server *Server) *prometheus.Desc {
 	return prometheus.NewDesc(
 		"pg_exporter_namespace_cache_age_seconds",
-		"Age in seconds of the samples this namespace served, per database and role. Published for the namespaces that set cache_seconds, and not for a collection that failed. Zero means they were collected during this scrape. A positive value means they came from the cache, and those samples carry the time they were collected rather than the time of this scrape.",
+		"Age in seconds of the samples this namespace served. Published for the namespaces that set cache_seconds, and not for a collection that failed. Zero means they were collected during this scrape. A positive value means they came from the cache, and those samples carry the time they were collected rather than the time of this scrape. The target label is this process's identity for the connection the samples were collected over, and it is not stable across restarts.",
 		// One series per collection, so the labels have to say which
-		// collection. The constant labels carry host and port, which several
-		// targets share: they differ by database, by role, or by something
-		// else the connection string carries. datname and the role name the
-		// first two, and two targets differing only in a connection parameter
-		// beyond them still share a label set, which collects the same data
-		// twice and reports it once.
+		// collection, and the host and port in the constant labels cannot:
+		// targets share those. datname and usename name what an operator
+		// recognises, and target is what separates two collections that agree
+		// on all of it, such as two connections to one database as one role
+		// with different search_path values. It is the same identity the
+		// cached result is keyed by.
 		//
-		// Either is empty when the connection string does not name it, which
-		// Prometheus reads as absent.
-		[]string{"namespace", "datname", "usename"},
+		// datname and usename are empty when the connection string does not
+		// name them and nothing has resolved them, which Prometheus reads as
+		// absent.
+		[]string{"namespace", "datname", "usename", "target"},
 		server.labels,
 	)
 }

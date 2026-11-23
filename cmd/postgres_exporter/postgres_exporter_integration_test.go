@@ -2509,6 +2509,173 @@ role_targets:
 			labelValues(served, "pg_exporter_namespace_cache_age_seconds", "usename")))
 }
 
+// TestTwoSearchPathsOnOneDatabaseAreTwoCollections covers the connection
+// context that no name in the series can carry.
+//
+// Both targets are the same host, port, database and role. They differ in a
+// search_path set through the connection string's options, so identical SQL
+// reads a different table in each, and their collections have different
+// values. Labelled by namespace, database and role alone, the two reported one
+// age between them: the registry refused the second as a duplicate.
+//
+// ChatGPT measured this case against the role-labelled version, which is why
+// the diagnostic carries the identity the cached result is keyed by.
+func (s *IntegrationSuite) TestTwoSearchPathsOnOneDatabaseAreTwoCollections(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+	parsed, err := url.Parse(configured)
+	c.Assert(err, IsNil)
+	c.Assert(parsed.Host, Not(Equals), "",
+		Commentf("DATA_SOURCE_NAME is not a URL, so two search paths cannot be configured here"))
+
+	admin, err := NewServer(configured)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	schemas := []string{"cache_context_a", "cache_context_b"}
+	values := map[string]float64{schemas[0]: 11, schemas[1]: 22}
+	cleanup := func() {
+		for _, schema := range schemas {
+			_, _ = admin.db.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+		}
+	}
+	cleanup()
+	defer cleanup()
+	for _, schema := range schemas {
+		_, err = admin.db.Exec(`CREATE SCHEMA ` + schema)
+		c.Assert(err, IsNil)
+		_, err = admin.db.Exec(`CREATE TABLE ` + schema + `.context_values (value double precision)`)
+		c.Assert(err, IsNil)
+		_, err = admin.db.Exec(fmt.Sprintf(`INSERT INTO %s.context_values VALUES (%v)`, schema, values[schema]))
+		c.Assert(err, IsNil)
+	}
+
+	withSearchPath := func(schema string) string {
+		u := *parsed
+		q := u.Query()
+		q.Set("options", "-csearch_path="+schema)
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+
+	// current_schema() reports where the unqualified table name resolved, so
+	// the sample says which connection collected it.
+	dir := writeQueryFile(c, "context.yaml", `
+context_probe:
+  query: "SELECT current_schema() AS context, value FROM context_values"
+  cache_seconds: 300
+  metrics:
+    - context: {usage: "LABEL", description: "The schema this resolved in"}
+    - value: {usage: "GAUGE", description: "A value only this schema has"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	cache := querycache.New()
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{withSearchPath(schemas[0]), withSearchPath(schemas[1])},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), cache)
+
+	scrape := func() string {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		c.Assert(rec.Code, Equals, 200)
+		return rec.Body.String()
+	}
+
+	first := scrape()
+	c.Assert(labelValues(first, "context_probe_value", "context"), DeepEquals, schemas,
+		Commentf("the first response carried %v, want one sample per search path",
+			labelValues(first, "context_probe_value", "context")))
+	c.Assert(cache.Len(), Equals, 2,
+		Commentf("two search paths left %d cache entries, want one each", cache.Len()))
+
+	served := scrape()
+	c.Check(labelValues(served, "context_probe_value", "context"), DeepEquals, schemas,
+		Commentf("the second response carried %v, want one sample per search path",
+			labelValues(served, "context_probe_value", "context")))
+
+	// Two collections, so two age series. The identities are this process's
+	// and their values are not worth asserting, only that there are two of
+	// them and that they differ.
+	identities := labelValues(served, "pg_exporter_namespace_cache_age_seconds", "target")
+	c.Check(len(identities), Equals, 2,
+		Commentf("two collections published %d age series: %v", len(identities), identities))
+	if len(identities) == 2 {
+		c.Check(identities[0], Not(Equals), identities[1],
+			Commentf("both age series carry the identity %q", identities[0]))
+	}
+}
+
+// TestAnOmittedDatabaseIsResolvedForTheAgeSeries covers the other half of the
+// per-database diagnostic.
+//
+// A connection string need not name a database. libpq then falls back to the
+// role name, and the exporter knows the name only by asking. Without asking,
+// the age series carried datname="" while the query running over the same
+// connection reported the real one, so the diagnostic named no database for a
+// collection that had one.
+//
+// The name is asked for because a namespace here asks to be cached. A file
+// with no cache_seconds and no databases list still pays nothing.
+func (s *IntegrationSuite) TestAnOmittedDatabaseIsResolvedForTheAgeSeries(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+	parsed, err := url.Parse(configured)
+	c.Assert(err, IsNil)
+	c.Assert(parsed.Host, Not(Equals), "",
+		Commentf("DATA_SOURCE_NAME is not a URL, so the database cannot be omitted from it here"))
+
+	// No path and no dbname, which is a supported connection form.
+	withoutDatabase := *parsed
+	withoutDatabase.Path = "/"
+	q := withoutDatabase.Query()
+	q.Del("dbname")
+	withoutDatabase.RawQuery = q.Encode()
+	target := withoutDatabase.String()
+	_, named := config.DatabaseFromDSN(target)
+	c.Assert(named, Equals, false,
+		Commentf("the connection string still names a database, so nothing has to be resolved"))
+
+	dir := writeQueryFile(c, "fallback.yaml", `
+fallback_probe:
+  query: "SELECT current_database() AS datname, 1::float8 AS value"
+  cache_seconds: 300
+  metrics:
+    - datname: {usage: "LABEL", description: "The database this ran on"}
+    - value: {usage: "GAUGE", description: "Constant one"}
+`)
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{target},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New())
+
+	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	c.Assert(rec.Code, Equals, 200)
+	body := rec.Body.String()
+
+	// What the server says it is, which is the answer the label has to match.
+	fromQuery := labelValues(body, "fallback_probe_value", "datname")
+	c.Assert(len(fromQuery), Equals, 1,
+		Commentf("the query produced %v, want one sample", fromQuery))
+	c.Assert(fromQuery[0], Not(Equals), "",
+		Commentf("the query reported no database, so there is nothing to compare the label against"))
+
+	c.Check(labelValues(body, "pg_exporter_namespace_cache_age_seconds", "datname"),
+		DeepEquals, fromQuery,
+		Commentf("the age series reported %v for a collection the query says ran on %v",
+			labelValues(body, "pg_exporter_namespace_cache_age_seconds", "datname"), fromQuery))
+}
+
 // TestASlowCollectionDoesNotReplaceANewerOne covers overlapping refreshes
 // through the handler, which is where they happen: two scrapes of one endpoint
 // overlap, and a mutex or the race detector says nothing about which

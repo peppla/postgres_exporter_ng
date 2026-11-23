@@ -267,25 +267,37 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 		level.Warn(logger).Log("msg", "Proceeding with outdated query maps, as the Postgres version could not be determined", "err", err)
 	}
 
-	// An application query can name the databases it runs on, so the server
-	// has to know which database it is. Discovery supplies the name when it
-	// runs; without discovery there is one target and no name, so it is asked
-	// for here.
+	// Two things need the name of the database this connection is on: a query
+	// that names the databases it runs on, and the per-database diagnostics a
+	// cached namespace publishes. Discovery supplies it when it runs, and the
+	// connection string supplies it above when it names one. What is left is a
+	// connection string that names none, where libpq falls back to the role
+	// name and only the server knows the answer.
 	//
-	// Asked only when some loaded query actually restricts itself by name, and
-	// only after the query maps exist, because that is what says whether any
-	// does. A file with no databases list anywhere pays nothing.
+	// Asked after the query maps exist, because that is what says whether
+	// anything needs it, and not asked at all otherwise: a file with no
+	// databases list and no cache_seconds pays nothing.
 	//
-	// A failure here is a collection failure, not an absent match. Leaving the
-	// name empty would make every restricted query quietly not run while the
-	// scrape reported the database as covered, which is the shape of claim
-	// these metrics exist to prevent.
-	if server.datname == "" && serverNeedsDatabaseName(server) {
-		var name string
-		if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
-			return fmt.Errorf("could not determine the current database on %s, so queries restricted by database name could not run: %w", server, err)
+	// A failure is fatal only where the name decides what runs. Leaving the
+	// name empty there would make every restricted query quietly not run while
+	// the scrape reported the database as covered, which is the shape of claim
+	// these metrics exist to prevent. Where only a label needs it, a failure
+	// leaves the label empty and collection goes ahead, because a diagnostic
+	// that cannot be labelled is not a reason to collect nothing.
+	if server.datname == "" {
+		forSelection := serverNeedsDatabaseName(server)
+		if forSelection || serverCachesANamespace(server) {
+			var name string
+			if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
+				if forSelection {
+					return fmt.Errorf("could not determine the current database on %s, so queries restricted by database name could not run: %w", server, err)
+				}
+				level.Warn(logger).Log("msg", "Could not determine the current database, so cached namespaces are reported without one",
+					"server", server, "err", err)
+			} else {
+				server.datname = name
+			}
 		}
-		server.datname = name
 	}
 
 	return server.Scrape(e.ctx, ch, e.disableSettingsMetrics, e.queryCache, e.collectorName)
@@ -354,6 +366,21 @@ func getDataSources() ([]string, error) {
 // Most query files contain nothing that does, so the lookup is usually
 // skipped. queryDatabaseList.needsDatabaseName holds the rule, so that what is
 // looked up here and what is decided in runsOn cannot drift apart.
+// serverCachesANamespace reports whether any loaded namespace asks to be
+// cached, which is what makes the database name worth a round trip for a label
+// alone: the age series is published per database, and two targets reporting
+// no database share a label set.
+func serverCachesANamespace(server *Server) bool {
+	server.mappingMtx.RLock()
+	defer server.mappingMtx.RUnlock()
+	for _, mapping := range server.metricMap {
+		if mapping.cacheSeconds > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func serverNeedsDatabaseName(server *Server) bool {
 	server.mappingMtx.RLock()
 	defer server.mappingMtx.RUnlock()
