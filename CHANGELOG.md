@@ -6,6 +6,23 @@
   * Add enhanced checkpointer metrics
   * Add `pg_stat_io` collector with byte statistics and WAL I/O activity tracking
 * [ENHANCEMENT] Update CI tested PostgreSQL versions to include PostgreSQL 18
+* [CHANGE] A custom query that names a label column its SQL does not select now
+  fails that namespace, and the exporter reports an error for it. Before this,
+  the label took the value of the query's first selected column: a file naming
+  `tenant_id` while selecting only `value` published `tenant_id="42"`. A query
+  file in that state has to name the column in its SELECT or drop it from its
+  metrics, and until it does, that namespace publishes nothing.
+* [CHANGE] The built-in `pg_stat_replication` metrics no longer carry a
+  `slot_name` label. `pg_stat_replication` has no column of that name on any
+  supported PostgreSQL version, so the label carried the view's first column,
+  which is the backend process id. Affected series are
+  `pg_stat_replication_pg_current_wal_lsn_bytes`,
+  `pg_stat_replication_pg_wal_lsn_diff` and any untyped series this namespace
+  publishes for columns the mapping does not name. A query or dashboard that
+  selects on `slot_name` for these metrics matches nothing after the upgrade,
+  and what it matched before was a process id. The slot name for a standby is
+  in `pg_replication_slots`, which is a different namespace, and is correlated
+  through `active_pid`.
 
 ## 0.15.0 / 2023-10-27
 

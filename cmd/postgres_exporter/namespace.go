@@ -71,19 +71,14 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 		columnIdx[n] = i
 	}
 
-	// Every column the mapping names as a label has to be in the result.
+	// Every column the mapping names as a label has to be in the result, and
+	// the namespace fails here if one is not.
 	//
-	// A missing one used to read as index zero, because that is what a map
-	// lookup returns for a key it does not hold, so the label carried the
-	// first column's value. Measured with one column, value 42, and a
-	// configured label tenant_id that the query does not select: the scrape
-	// reported success and published tenant_id="42".
-	//
-	// Checked before any row is read, and fatal for this namespace, because a
-	// label with another column's value is not a partial answer. The operator
-	// has to see it: a query file naming a column it does not select is a
-	// mistake in the file, and the series it produces cannot be aggregated by
-	// the label it is wrong about.
+	// A name that is absent reads as index zero, because that is what a map
+	// lookup returns for a key it does not hold, so the label would carry the
+	// first column's value. That is not a partial answer: the series cannot be
+	// aggregated by the label it is wrong about, and the file naming a column
+	// it does not select is a mistake only the operator can fix.
 	var missing []string
 	for _, label := range mapping.labels {
 		if _, ok := columnIdx[label]; !ok {
