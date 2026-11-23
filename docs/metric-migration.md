@@ -94,6 +94,36 @@ means writing collectors for `pg_stat_replication`, `pg_stat_subscription` and
 `pg_publication` first, and adding `restart_lsn` and the receiver lag
 calculations to the collectors that exist.
 
+## The legacy engine's own built-in maps
+
+The query files above are not everything the legacy engine publishes. It also
+carries six fixed metric maps in `cmd/postgres_exporter/postgres_exporter.go`,
+plus the settings metrics from `querySettings` and its own framework output.
+The exporter ships all of it, so none of it is operator-defined and none of it
+can be dropped by deleting a query file. The metric catalogue does not cover
+them, because what matters about them is what replaces them.
+
+| built-in map | what it publishes | replacement | status |
+| --- | --- | --- | --- |
+| `pg_stat_database_conflicts` | recovery conflicts per database, by cause: tablespace, lock, snapshot, bufferpin, deadlock | none | not covered. The `stat_database` collector reads `pg_stat_database`, which carries only the `conflicts` total, not the breakdown by cause |
+| `pg_lock_conflicts` | count of locks per blocking backend | none | not covered. The `locks` collector counts locks by mode, not by who is blocking whom |
+| `pg_stat_replication` | a primary's view of each standby: positions sent, written, flushed and replayed, the three lag intervals, sync state and priority | the collector written for PR #20 | implemented, not merged. Until it is, this is the only producer |
+| `pg_replication_slots` | per slot: active, and the distance from the current position | the `replication_slot` collector | covered for those columns, and that collector also publishes the confirmed flush position. Neither publishes `restart_lsn` |
+| `pg_stat_archiver` | archived and failed WAL counts, the last archived and failed files and times, and the age of the last archive | none | not covered. No Go collector reads `pg_stat_archiver` |
+| `pg_stat_activity` | connection counts and the longest transaction and state durations, by database, state, user and application | none | not covered. The `long_running_transactions` and `process_idle` collectors read the same view for different things, and neither reports connection counts by state |
+| `querySettings` | every `pg_settings` row of type bool, integer or real, as `pg_settings_<name>` | none | not covered, and nothing proposes to cover it. It is one series per setting per server, a few hundred of them |
+
+Four of the seven have no replacement written. Retiring the built-in path
+means writing collectors for the recovery-conflict breakdown, lock blocking,
+the archiver and connection counts by state, and deciding what happens to the
+settings metrics, which are a different kind of thing from the rest.
+
+The settings metrics deserve their own decision rather than a collector by
+default. They describe configuration, not activity, they do not change between
+scrapes, and there are hundreds of them per server. Publishing the whole of
+`pg_settings` every scrape is the kind of cost the operational budget work
+exists to bound.
+
 ## What retirement requires
 
 Stage 4 of the project plan says not to retire a query file until its intended
@@ -109,5 +139,19 @@ tells a reader the new one exists.
 
 The duplication is the part that can be ended first, because both names are
 already published with the same values. Turning off `pg_stat_user_tables` and
-`pg_database` in the query file removes twenty duplicated families and changes
-nothing a query sees, as long as the query does not pin `server`.
+`pg_database` in the query file removes twenty duplicated families, and that
+is a visible change rather than a silent one.
+
+An earlier version of this paragraph said it changes nothing for a query that
+does not pin `server`. That is wrong, and this document's own measurements
+show it: the two producers carry different `server` label values, so a query
+that does not pin `server` sums both and reads double. Removing one producer
+halves that sum, halves the series count for those families, and leaves the
+remaining series under one label set instead of two. A dashboard reading the
+doubled value sees its numbers halve on the day of the cutover.
+
+So the cutover has to be announced rather than slipped in: say which families
+lose a producer, say that any query summing across `server` will fall by the
+duplicated share, and give the date. The measurement behind it is in
+[what the overlap costs](#what-the-overlap-costs-measured), which lists the twenty families
+and the label sets each producer uses.

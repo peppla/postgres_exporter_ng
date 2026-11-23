@@ -7,8 +7,23 @@ with what labels, and what you see when collection fails.
 without an entry fails the build, and so does an entry for a metric that is no
 longer published. The labels listed in each section are checked too.
 
-The custom-query engine is not here. Its metrics come from query files an
-operator writes, so there is nothing fixed to catalogue.
+## What this covers, and what it does not
+
+The namespaced collectors in `collector/`, which is what
+`collector/metric_catalog_test.go` extracts and checks.
+
+Not the custom-query engine's operator-written query files, which have nothing
+fixed to catalogue.
+
+Not the built-in query maps the legacy engine still carries in
+`cmd/postgres_exporter/postgres_exporter.go`. Those are not operator-defined:
+the exporter ships them, and they publish `pg_stat_database_conflicts`,
+`pg_lock_conflicts`, `pg_stat_replication`, `pg_replication_slots`,
+`pg_stat_archiver` and `pg_stat_activity`, plus the settings metrics from
+`querySettings` and the engine's own framework output. They are inventoried in
+[the migration mapping](metric-migration.md) rather than here, because what
+matters about them is what replaces them, and none of that built-in path is
+retired until each of its measurements is accounted for.
 
 ## How to read an entry
 
@@ -25,19 +40,60 @@ wrong with this catalogue](#what-is-wrong-with-this-catalogue) rather than
 quietly corrected here.
 
 Versions are the range this exporter supports, 15 to 19. A narrower range means
-the metric is omitted below it rather than published as zero, which is the
+the metric is omitted outside it rather than published as zero, which is the
 distinction that lets a missing series mean "not available" instead of "none".
 
-Reset says what makes a counter go backwards. Every statistics view here is
-reset by `pg_stat_reset()` and by a crash that loses the statistics file, and
-some have their own reset functions. A dashboard that does not know this is
-wrong at the moment it matters most.
+Four bgwriter metrics break that rule and say so in their rows: they are
+published as zero on the versions that no longer have the column. That is a
+defect, not a convention, and it is in the correction queue.
+
+Reset says what makes a counter go backwards, and it is not one function for
+everything. PostgreSQL keeps these counters in several places and resets them
+separately:
+
+- `pg_stat_reset()` resets the statistics of the database it is run in. That
+  covers the table, index and function counters and that database's row in
+  `pg_stat_database`. Run in one database it leaves every other database's
+  counters alone.
+- `pg_stat_reset_shared(target)` resets one set of server-wide statistics.
+  Which targets a version accepts was measured on each supported version:
+  `bgwriter`, `archiver` and `wal` on all of 15 to 19, `io` from 16,
+  `checkpointer` and `slru` from 17.
+- `pg_stat_reset_single_table_counters(oid)` and
+  `pg_stat_reset_single_function_counters(oid)` reset one relation or one
+  function, so a single series can go backwards while its neighbours do not.
+- `pg_stat_reset_replication_slot(name)` and
+  `pg_stat_reset_subscription_stats(oid)` reset one slot's or one
+  subscription's counters.
+- `pg_stat_statements_reset()` resets the extension's own statistics, which no
+  core reset function touches.
+- A crash that loses the statistics file resets everything, and so does a
+  restore from a base backup.
+
+Each section below names the reset that applies to it. A dashboard that does
+not know which one is wrong at the moment it matters most: a reset of one
+database's tables and a reset of the server's checkpointer counters look the
+same in a graph and come from different commands.
 
 Partial failure says what an operator sees when collection does not finish.
-Across every collector here the unit of failure is the collector on one
-database: it either publishes its rows or it publishes none of them, and
-`pg_scrape_collector_success` says which. A relation that was never collected
-emits no series at all, which is not the same as a relation with a zero.
+The unit of failure is the collector on one database, and
+`pg_scrape_collector_success` says which collectors finished.
+
+A collector that failed partway keeps what it already published. Collectors
+write to a channel as they read rows, and the framework does not hold a
+collector's output until it finishes, so a query that returns some rows and
+then fails leaves those rows in the response alongside
+`pg_scrape_collector_success 0`. Measured on the extensions collector with a
+stub that returns one row and then a row error: one sample published, the
+error returned, the sample kept.
+
+So a success of 0 means some or all of that collector's rows are missing, and
+nothing in the output says which. Buffering each collector's rows to make the
+unit atomic was declined in the monitoring contract, along with what it would
+cost, and this document does not promise it.
+
+A relation that was never collected emits no series at all, which is not the
+same as a relation with a zero.
 
 ## exporter framework
 
@@ -138,7 +194,11 @@ Lock counts by mode.
 
 ## long_running_transactions
 
-Transactions that have been open a long time.
+Named for transactions that have been open a long time. Neither metric
+measures that, and both are in the correction queue in [what is wrong with
+this catalogue](#what-is-wrong-with-this-catalogue). What they publish today
+is described in the rows below and nowhere else, so that a reader is not
+misled by the names.
 
 | | |
 | --- | --- |
@@ -151,8 +211,8 @@ Transactions that have been open a long time.
 
 | metric | type | unit | versions | what it measures |
 | --- | --- | --- | --- | --- |
-| `pg_long_running_transactions` | gauge | transactions | 15-19 | Transactions open longer than the collector's threshold. |
-| `pg_long_running_transactions_oldest_timestamp_seconds` | gauge | seconds | 15-19 | Age of the oldest open transaction. |
+| `pg_long_running_transactions` | gauge | backends | 15-19 | Rows of `pg_stat_activity` whose state is not `idle` and whose query does not start with `autovacuum:`. There is no age threshold in the query and no requirement that the backend is in a transaction at all, so this counts active backends rather than long-running transactions. |
+| `pg_long_running_transactions_oldest_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | `MAX(EXTRACT(EPOCH FROM clock_timestamp()))` over those rows, which is the time the query ran and not an age or a start time. It is the same number for every server and every transaction, and it advances with the clock whether or not anything is open. |
 
 ## postmaster
 
@@ -163,13 +223,13 @@ When the server started.
 | Scope | cluster |
 | Labels | none |
 | Cardinality | one series per server |
-| Reset | the value changes when the server restarts, which is the point of it |
+| Reset | the value changes when the server restarts, which is the point of it. Normally it advances, because the new start is later than the old one. |
 | Availability | all versions |
 | Partial failure | the collector fails as a unit |
 
 | metric | type | unit | versions | what it measures |
 | --- | --- | --- | --- | --- |
-| `pg_postmaster_start_time_seconds` | gauge | seconds since the epoch | 15-19 | When the postmaster started, from `pg_postmaster_start_time()`. A drop in this is a restart. |
+| `pg_postmaster_start_time_seconds` | gauge | seconds since the epoch | 15-19 | When the postmaster started, from `pg_postmaster_start_time()`. Any change identifies a restart, and the usual direction is upwards: a server that restarts now starts later than it did before. A fall happens too, when a scrape reaches a different server behind one address or the clock moves, so an alert written for a fall alone misses most restarts. |
 
 ## process_idle
 
@@ -222,7 +282,7 @@ Replication slot positions.
 | metric | type | unit | versions | what it measures |
 | --- | --- | --- | --- | --- |
 | `pg_replication_slot_slot_current_wal_lsn` | gauge | bytes of WAL | 15-19 | The server's current write-ahead log position, as a number. |
-| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how much WAL the slot is holding. |
+| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds: `restart_lsn` is the oldest position the slot may still need, and it is what retention is measured from. `restart_lsn` is not published today, and the gap is in the correction queue. Physical slots and slots that have never been used report NULL here. |
 | `pg_replication_slot_slot_is_active` | gauge | boolean | 15-19 | Whether anything is connected to the slot. An inactive slot still holds WAL. |
 
 ## stat_activity_autovacuum
@@ -257,7 +317,7 @@ migration mapping rather than something to do quietly.
 | Scope | cluster |
 | Labels | `collector`, `server` |
 | Cardinality | 26 series per server, of which 13 duplicate the other 13 |
-| Reset | `pg_stat_reset_shared('bgwriter')`, and a crash that loses the statistics file |
+| Reset | `pg_stat_reset_shared('bgwriter')` for the writer counters. From 17 the checkpoint counters come from `pg_stat_checkpointer` and are reset by `pg_stat_reset_shared('checkpointer')`, so this one section has two reset sources there and one below it. A crash that loses the statistics file resets both. |
 | Availability | PostgreSQL 17 moved checkpoint counters from `pg_stat_bgwriter` to `pg_stat_checkpointer`; the collector reads whichever exists. `checkpoints_done` and `slru_written` need 18 |
 | Partial failure | the collector fails as a unit |
 
@@ -281,10 +341,10 @@ Times here are milliseconds, which the names do not say.
 | `pg_stat_bgwriter_buffers_clean` | counter | buffers | 15-19 | The same measurement under the older name. |
 | `pg_stat_bgwriter_maxwritten_clean_total` | counter | occurrences | 15-19 | Times the background writer stopped a scan for having written too many buffers. |
 | `pg_stat_bgwriter_maxwritten_clean` | counter | occurrences | 15-19 | The same measurement under the older name. |
-| `pg_stat_bgwriter_buffers_backend_total` | counter | buffers | 15-19 | Buffers written by a backend rather than by the writer or a checkpoint. |
-| `pg_stat_bgwriter_buffers_backend` | counter | buffers | 15-19 | The same measurement under the older name. |
-| `pg_stat_bgwriter_buffers_backend_fsync_total` | counter | occurrences | 15-19 | Times a backend had to run its own fsync. |
-| `pg_stat_bgwriter_buffers_backend_fsync` | counter | occurrences | 15-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_backend_total` | counter | buffers | measured 15-16, published as zero 17-19 | Buffers written by a backend rather than by the writer or a checkpoint. `pg_stat_bgwriter` lost the column in 17 and the series is published as zero there, which reads as no backend writes rather than as no measurement. `pg_stat_io` carries the accounting from 17. |
+| `pg_stat_bgwriter_buffers_backend` | counter | buffers | measured 15-16, published as zero 17-19 | The same measurement under the older name. |
+| `pg_stat_bgwriter_buffers_backend_fsync_total` | counter | occurrences | measured 15-16, published as zero 17-19 | Times a backend had to run its own fsync. Zero from 17 for the same reason. |
+| `pg_stat_bgwriter_buffers_backend_fsync` | counter | occurrences | measured 15-16, published as zero 17-19 | The same measurement under the older name. |
 | `pg_stat_bgwriter_buffers_alloc_total` | counter | buffers | 15-19 | Buffers allocated. |
 | `pg_stat_bgwriter_buffers_alloc` | counter | buffers | 15-19 | The same measurement under the older name. |
 | `pg_stat_bgwriter_slru_written_total` | counter | buffers | 18-19 | SLRU buffers written during checkpoints and restartpoints. |
@@ -595,3 +655,33 @@ Three label sets are unbounded, and nothing in the exposition says so.
 `pg_process_idle_seconds` mints one per `application_name` that any client
 chooses to send, and `pg_stat_activity_autovacuum_timestamp_seconds` mints one
 per relation that has ever been autovacuumed while a scrape was running.
+
+Both long-running transaction metrics measure something other than their
+names. The query counts rows of `pg_stat_activity` that are not idle and not
+autovacuum, with no age threshold and no requirement that a transaction is
+open, and its second column is `MAX(EXTRACT(EPOCH FROM clock_timestamp()))`,
+which is the time the query ran. Measured on PostgreSQL 18 against a
+transaction about half a second old: the metrics reported 10 and
+1795247634.153131, while the age of the oldest transaction was 0.476791
+seconds. A correct version needs a threshold the operator sets and an age
+taken from `xact_start`, which changes both the value and the meaning, so it
+is a compatibility decision rather than a fix.
+
+Two bgwriter metrics are published as zero where the server does not have
+them. `buffers_backend` and `buffers_backend_fsync`, with their `_total`
+aliases, come from columns that `pg_stat_bgwriter` lost in 17. The query for
+17 and later does not select them, the collector leaves their
+`sql.NullInt64` unset, and it publishes zero rather than omitting the series.
+A zero there reads as a measured absence of backend writes, which is the
+false-zero shape the version gating exists to avoid, and it is why the
+availability column says 15-19 for metrics that are only measured below 17.
+PostgreSQL moved that accounting into `pg_stat_io`, which this exporter
+already collects.
+
+`pg_replication_slot_slot_confirmed_flush_lsn` is the only slot position
+published, and retention is measured from `restart_lsn`, which is not. The
+difference between them is the WAL a slot holds beyond what its consumer has
+acknowledged, which is the number an operator watching disk usage needs.
+Adding `restart_lsn` is a new metric rather than a correction, and summing
+per-slot distances is not a disk figure in any case, because slots that
+overlap hold the same segments once.

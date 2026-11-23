@@ -212,6 +212,75 @@ func TestCatalogCoversEveryMetric(t *testing.T) {
 	}
 }
 
+// TestCatalogRecordsTheValueType compares the type column against the type the
+// code emits.
+//
+// The names and the labels were checked before this and the type was not, so
+// an entry could call a counter a gauge and nothing noticed. That is the field
+// a reader acts on first: it decides whether rate() is the right question to
+// ask, and it is the field the known defects in this catalogue are about.
+func TestCatalogRecordsTheValueType(t *testing.T) {
+	defs, err := readMetricInventory(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitted := map[string][]string{}
+	for _, d := range defs {
+		emitted[d.Name] = d.Types
+	}
+
+	content, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatalf("reading the catalogue: %s", err)
+	}
+
+	// The first two cells of an entry: the name and the type.
+	row := regexp.MustCompile("(?m)^\\| `(pg_[a-z0-9_]+)` \\| ([a-z]+) \\|")
+	matches := row.FindAllStringSubmatch(string(content), -1)
+	if len(matches) == 0 {
+		t.Fatalf("no entries with a type were found in %s, so this test proves nothing", catalogPath)
+	}
+
+	// What the code's value type names mean in the type column.
+	wanted := map[string]string{
+		"Counter":   "counter",
+		"Gauge":     "gauge",
+		"Untyped":   "untyped",
+		"Histogram": "histogram",
+		"Summary":   "summary",
+	}
+
+	checked := 0
+	for _, m := range matches {
+		name, documented := m[1], m[2]
+		types, ok := emitted[name]
+		if !ok {
+			// Covered by TestCatalogCoversEveryMetric, which names it.
+			continue
+		}
+		if len(types) != 1 {
+			// Covered by TestEveryMetricHasExactlyOneValueType.
+			continue
+		}
+		want, known := wanted[types[0]]
+		if !known {
+			t.Errorf("%s is emitted as %q, which this test does not know how to compare with a catalogue type", name, types[0])
+			continue
+		}
+		checked++
+		if documented != want {
+			t.Errorf("%s is documented as a %s and is emitted as a %s", name, documented, want)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no entry was compared against an emitted type, so this test proves nothing")
+	}
+	if checked < len(matches)/2 {
+		t.Errorf("only %d of %d entries were compared, so the table's shape has changed and most rows are no longer being read",
+			checked, len(matches))
+	}
+}
+
 // TestCatalogRecordsTheLabels checks the one mechanical field the catalogue
 // repeats, because labels are what a query joins on and a wrong list there
 // sends someone writing a query that returns nothing.
