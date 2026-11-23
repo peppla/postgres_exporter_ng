@@ -15,11 +15,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +31,7 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -136,6 +140,11 @@ type MetricMapNamespace struct {
 	runOnServer    semver.Range         // Version restriction; nil means no restriction
 	runOnServerRaw string               // The restriction as written, for logging
 	cacheSeconds   uint64               // Number of seconds this metric namespace can be cached. 0 disables.
+	// definition fingerprints the query and its column mapping, so a cached
+	// result is not served after the query file that produced it changed. The
+	// cache key carries it rather than comparing definitions, because the
+	// thing being asked is whether two results describe the same question.
+	definition string
 }
 
 // MetricMap stores the prometheus metric description which a given column will
@@ -415,20 +424,29 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 			}
 		}
 
-		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.databases, intermediateMappings.runOnServer, intermediateMappings.runOnServerRaw, intermediateMappings.cacheSeconds}
+		metricMap[namespace] = MetricMapNamespace{
+			labels:         variableLabels,
+			columnMappings: thisMap,
+			master:         intermediateMappings.master,
+			databases:      intermediateMappings.databases,
+			runOnServer:    intermediateMappings.runOnServer,
+			runOnServerRaw: intermediateMappings.runOnServerRaw,
+			cacheSeconds:   intermediateMappings.cacheSeconds,
+			definition:     namespaceDefinition(namespace, intermediateMappings),
+		}
 	}
 
 	return metricMap
 }
 
-type cachedMetrics struct {
-	metrics    []prometheus.Metric
-	lastScrape time.Time
-}
-
 // Exporter collects Postgres metrics. It implements prometheus.Collector.
 type Exporter struct {
-	collectorName     string
+	collectorName string
+
+	// queryCache outlives this exporter, which a request creates and
+	// discards. Nil means no caching at all, which is what every test that
+	// does not pass one gets.
+	queryCache        *querycache.Cache
 	userQueriesPath   map[MetricResolution]string
 	resolutionEnabled MetricResolution
 	enabled           bool
@@ -540,6 +558,19 @@ func IncludeDatabases(s string) ExporterOpt {
 		if len(s) > 0 {
 			e.includeDatabases = dbselect.Of(strings.Split(s, ","))
 		}
+	}
+}
+
+// WithQueryCache gives the exporter somewhere to keep results that outlive a
+// request.
+//
+// The cache belongs to the process and is passed in rather than created here,
+// because an exporter is built per request and anything it owns is discarded
+// with it. That is exactly what cache_seconds was doing: every scrape built a
+// server with an empty cache and ran the query again.
+func WithQueryCache(cache *querycache.Cache) ExporterOpt {
+	return func(e *Exporter) {
+		e.queryCache = cache
 	}
 }
 
@@ -872,4 +903,30 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 	wg.Wait()
 
 	return int(errorsCount.Load()), int(connectionErrorsCount.Load())
+}
+
+// namespaceDefinition fingerprints what a namespace asks for, so a cached
+// result from before a query file was edited is not served after it.
+//
+// The column mapping is included as well as the query, because changing what a
+// column means changes the answer without changing the SQL. The map is walked
+// in sorted order, since Go's iteration order is not stable and a fingerprint
+// that changes on its own would throw the cache away on every scrape.
+func namespaceDefinition(namespace string, mapping intermediateMetricMap) string {
+	columns := make([]string, 0, len(mapping.columnMappings))
+	for name := range mapping.columnMappings {
+		columns = append(columns, name)
+	}
+	sort.Strings(columns)
+
+	h := sha256.New()
+	fmt.Fprintf(h, "namespace=%s\n", namespace)
+	fmt.Fprintf(h, "master=%v cache=%d runOnServer=%s\n",
+		mapping.master, mapping.cacheSeconds, mapping.runOnServerRaw)
+	for _, name := range columns {
+		column := mapping.columnMappings[name]
+		fmt.Fprintf(h, "column=%s usage=%v description=%s\n",
+			name, column.usage, column.description)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

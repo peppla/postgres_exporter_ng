@@ -324,6 +324,19 @@ func DatabaseFromDSN(in string) (string, bool) {
 	}
 }
 
+// UserFromDSN returns the role a connection string names, and whether it names
+// one.
+//
+// libpq falls back to the operating system user when the string names none,
+// and naming that here would report a role nobody configured.
+func UserFromDSN(in string) (string, bool) {
+	d, err := dsnFromString(in)
+	if err != nil {
+		return "", false
+	}
+	return d.username, d.username != ""
+}
+
 // DSNWithConnectTimeout returns the connection string with a connect_timeout
 // no longer than d.
 //

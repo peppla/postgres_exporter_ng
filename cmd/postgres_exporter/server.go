@@ -22,8 +22,11 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/distribution"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
+	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -41,6 +44,10 @@ type Server struct {
 	// application query with its own databases list runs. Empty when it is
 	// not known, which the caller resolves before running those queries.
 	datname string
+	// role is the login role this connection names, for the diagnostics that
+	// have to tell two targets apart. Empty when the connection string names
+	// none and libpq falls back to the operating system user.
+	role string
 
 	// Last version used to calculate metric map. If mismatch on scrape,
 	// then maps are recalculated.
@@ -51,8 +58,6 @@ type Server struct {
 	queryOverrides map[string]string
 	mappingMtx     sync.RWMutex
 	// Currently cached metrics
-	metricCache map[string]cachedMetrics
-	cacheMtx    sync.Mutex
 }
 
 // ServerOpt configures a server.
@@ -84,13 +89,15 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 
 	level.Debug(logger).Log("msg", "Established new database connection", "fingerprint", fingerprint)
 
+	role, _ := config.UserFromDSN(dsn)
+
 	s := &Server{
 		db:     db,
+		role:   role,
 		master: false,
 		labels: prometheus.Labels{
 			serverLabelName: fingerprint,
 		},
-		metricCache: make(map[string]cachedMetrics),
 	}
 	// The distribution is detected on first use rather than here, because
 	// detecting it is a query and NewServer has no budget to run one under.
@@ -144,13 +151,31 @@ func (s *Server) String() string {
 	return s.labels[serverLabelName]
 }
 
+// cacheIdentity returns this server's connection context, for keying what was
+// collected over it and for saying which collection a diagnostic describes.
+//
+// The fingerprint cannot do either: it is host and port, which targets share.
+// They differ by database, by role, and by anything else the connection string
+// carries, including a search_path that changes which tables identical SQL
+// reads.
+func (s *Server) cacheIdentity() string {
+	id, first := targetid.ID(s.dsn)
+	if first {
+		// Once per target per process, so an operator can read which
+		// connection an identity stands for. The identity itself carries
+		// nothing from the string, which is the point of it.
+		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(s.dsn))
+	}
+	return id
+}
+
 // Scrape loads metrics.
 //
 // ctx carries the collection budget. Every query below has to run under it,
 // or the budget bounds only the parts of a scrape that happen to consult it:
 // a slow statement reached through a context-free Query runs to completion
 // whatever the scrape was allowed.
-func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disableSettingsMetrics bool) error {
+func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disableSettingsMetrics bool, cache *querycache.Cache, collector string) error {
 	s.mappingMtx.RLock()
 	defer s.mappingMtx.RUnlock()
 
@@ -162,7 +187,7 @@ func (s *Server) Scrape(ctx context.Context, ch chan<- prometheus.Metric, disabl
 		}
 	}
 
-	errMap := queryNamespaceMappings(ctx, ch, s)
+	errMap := queryNamespaceMappings(ctx, ch, s, cache, collector)
 	if len(errMap) > 0 {
 		err = fmt.Errorf("queryNamespaceMappings returned %d errors", len(errMap))
 		level.Error(logger).Log("msg", "NAMESPACE ERRORS FOUND")
