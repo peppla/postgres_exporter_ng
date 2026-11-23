@@ -191,7 +191,7 @@ than predicted:
 | --- | --- | --- | --- |
 | `pg_stat_database_conflicts_confl_active_logicalslot` | 16-19 | Recovery conflicts with active logical slots, per database, labelled `datid` and `datname` | none. No Go collector reads `pg_stat_database_conflicts` at all |
 | `pg_stat_database_conflicts_stats_reset` | 19 | When those conflict counters were last reset, as unix seconds | none |
-| `pg_stat_replication_reply_time` | 15-19 | When the standby last replied, as unix seconds | none |
+| `pg_stat_replication_reply_time` | 15-19 | When the standby last replied, as unix seconds | none. The `stat_replication` collector publishes positions and lags and not this |
 
 They arrived by accident, because nobody mapped the column, and they are
 untyped and named after a view's column rather than after a measurement. None
