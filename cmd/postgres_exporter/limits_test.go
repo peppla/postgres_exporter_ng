@@ -366,11 +366,20 @@ func TestASlowReaderDoesNotHoldItsSlotForever(t *testing.T) {
 		if !ok {
 			return
 		}
-		defer release()
 		boundResponseWrite(w, limits.RequestBudget(0, 0))
 		start := time.Now()
 		_, _ = w.Write(bytes.Repeat([]byte("x"), 64<<20))
-		returned <- time.Since(start)
+		took := time.Since(start)
+		// Released before the notification, not in a defer. A defer runs
+		// after the send, so the test could receive it and try to admit while
+		// this handler still held the permit: a completed Write is not a
+		// completed handler. That ordering passed here and failed on a
+		// PostgreSQL 17 runner. Released exactly once, on the one path there
+		// is: a panic in Write would leave the permit held, and the test would
+		// then fail on its own deadline, which is the right answer for a
+		// handler that never returned.
+		release()
+		returned <- took
 	})
 	// Deliberately no WriteTimeout on the server. main sets one as a
 	// backstop, and leaving it out here is what makes this a test of the
@@ -395,7 +404,10 @@ func TestASlowReaderDoesNotHoldItsSlotForever(t *testing.T) {
 		if took > 10*time.Second {
 			t.Errorf("the handler was blocked writing for %s", took)
 		}
-		// And the slot is free again, which is the point.
+		// And the slot is free again, which is the point. The handler
+		// released it before sending what this select received, so there is
+		// nothing to wait for and no retry here: either the permit came back
+		// or the gate is leaking one.
 		rec := httptest.NewRecorder()
 		release, ok := admit(rec, gate, limits)
 		if !ok {
