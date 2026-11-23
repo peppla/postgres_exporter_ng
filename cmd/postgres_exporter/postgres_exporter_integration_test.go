@@ -150,6 +150,70 @@ func gather(c *C, coll prometheus.Collector) map[string]*dto.MetricFamily {
 	return byName
 }
 
+// TestEveryBuiltInLabelColumnIsSelected checks the built-in maps against the
+// queries they run.
+//
+// A map declares its labels by column name and the query has to return those
+// columns. pg_stat_replication declared slot_name, which belongs to
+// pg_replication_slots and is not in pg_stat_replication at all, so every
+// sample of that namespace carried slot_name set to the first column's value,
+// which is the backend pid.
+//
+// The result columns are read rather than the rows, so this works on a server
+// with no standbys and no slots: a query that returns nothing still says what
+// it would have returned.
+func (s *IntegrationSuite) TestEveryBuiltInLabelColumnIsSelected(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	server, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer server.Close()
+	// The built-in maps are prepared for the master server only.
+	server.master = true
+
+	rec := newRecorder()
+	c.Assert(s.e.checkMapVersions(context.Background(), rec.ch, server), IsNil)
+	c.Assert(len(server.metricMap) > 0, Equals, true,
+		Commentf("no namespaces were prepared, so nothing below is checked"))
+
+	checked := 0
+	for namespace, mapping := range server.metricMap {
+		if len(mapping.labels) == 0 {
+			continue
+		}
+		query, found := server.queryOverrides[namespace]
+		if found && query == "" {
+			// Disabled on this version.
+			continue
+		}
+		if !found {
+			query = fmt.Sprintf("SELECT * FROM %s;", namespace)
+		}
+
+		rows, err := server.db.QueryContext(context.Background(), query)
+		if !c.Check(err, IsNil, Commentf("%s: %s", namespace, query)) {
+			continue
+		}
+		columns, err := rows.Columns()
+		c.Check(err, IsNil)
+		rows.Close()
+
+		returned := map[string]bool{}
+		for _, name := range columns {
+			returned[name] = true
+		}
+		for _, label := range mapping.labels {
+			checked++
+			c.Check(returned[label], Equals, true,
+				Commentf("%s declares the label column %q, and its query returns %v",
+					namespace, label, columns))
+		}
+	}
+	c.Check(checked > 0, Equals, true,
+		Commentf("no built-in namespace declares a label, so this test proves nothing"))
+}
+
 // TestAllNamespacesReturnResults runs the built-in namespace queries against
 // the server and checks that they produced metrics.
 //

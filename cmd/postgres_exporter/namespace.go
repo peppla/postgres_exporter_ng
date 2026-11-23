@@ -20,6 +20,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
@@ -67,6 +69,27 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 	var columnIdx = make(map[string]int, len(columnNames))
 	for i, n := range columnNames {
 		columnIdx[n] = i
+	}
+
+	// Every column the mapping names as a label has to be in the result, and
+	// the namespace fails here if one is not.
+	//
+	// A name that is absent reads as index zero, because that is what a map
+	// lookup returns for a key it does not hold, so the label would carry the
+	// first column's value. That is not a partial answer: the series cannot be
+	// aggregated by the label it is wrong about, and the file naming a column
+	// it does not select is a mistake only the operator can fix.
+	var missing []string
+	for _, label := range mapping.labels {
+		if _, ok := columnIdx[label]; !ok {
+			missing = append(missing, label)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return []prometheus.Metric{}, []error{}, fmt.Errorf(
+			"%s declares the label column %s, which its query does not return, so every sample would carry another column's value",
+			namespace, strings.Join(missing, ", "))
 	}
 
 	var columnData = make([]interface{}, len(columnNames))
