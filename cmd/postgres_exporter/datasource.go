@@ -360,12 +360,6 @@ func getDataSources() ([]string, error) {
 	return []string{dsn}, nil
 }
 
-// serverNeedsDatabaseName reports whether any namespace loaded for this server
-// decides where it runs from the database name.
-//
-// Most query files contain nothing that does, so the lookup is usually
-// skipped. queryDatabaseList.needsDatabaseName holds the rule, so that what is
-// looked up here and what is decided in runsOn cannot drift apart.
 // serverCachesANamespace reports whether any loaded namespace asks to be
 // cached, which is what makes the database name worth a round trip for a label
 // alone: the age series is published per database, and two targets reporting
@@ -381,6 +375,12 @@ func serverCachesANamespace(server *Server) bool {
 	return false
 }
 
+// serverNeedsDatabaseName reports whether any namespace loaded for this server
+// decides where it runs from the database name.
+//
+// Most query files contain nothing that does, so the lookup is usually
+// skipped. queryDatabaseList.needsDatabaseName holds the rule, so that what is
+// looked up here and what is decided in runsOn cannot drift apart.
 func serverNeedsDatabaseName(server *Server) bool {
 	server.mappingMtx.RLock()
 	defer server.mappingMtx.RUnlock()

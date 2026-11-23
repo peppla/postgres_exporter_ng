@@ -275,26 +275,8 @@ func queryNamespaceMappings(ctx context.Context, ch chan<- prometheus.Metric, se
 			}
 		}
 
-		// Samples from the cache carry the time they were collected, not the
-		// time of this scrape.
-		//
-		// The contract is explicit that old values must never be republished
-		// with fresh timestamps as though recollected, and that is what this
-		// did: with cache_seconds at 60 and a scrape every 5 seconds, one
-		// measurement was recorded twelve times, each at a different moment,
-		// and a reader could not tell a value that had just been measured from
-		// one that was a minute old.
-		//
-		// Prometheus stores one sample per series per timestamp, so repeating
-		// a timestamped sample leaves the series with a point per collection
-		// instead of a point per scrape. That is a visible change to the data,
-		// and it is the data being right rather than looking continuous.
-		//
-		// A cacheable namespace is stamped on every response, including the
-		// one that collected it, so that one collection is one instant
-		// however many responses carry it. A namespace that does not ask to
-		// be cached is collected every scrape and is left unstamped, so the
-		// scraper records it when it reads it.
+		// Cacheable samples retain their collection timestamp on every
+		// response. Uncached samples use the scraper's timestamp.
 		cacheable := mapping.cacheSeconds > 0
 		age := now.Sub(collectedAt)
 		if age < 0 {
