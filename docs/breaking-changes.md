@@ -49,11 +49,18 @@ receiver collector publishes positions without differencing them, so the two
 lag figures an operator actually reads have no replacement, and neither does
 `written_lsn`. The file goes when they exist.
 
-One of the removed metrics never worked. `pg_custom_stat_subscription_received_lsn`
-selected a `pg_lsn` without converting it, and a `pg_lsn` reaches the query
-engine as the string `0/1FDF5FA0`, which it cannot parse into a number. It
-logged one line at info level and published nothing. Its replacement is a
-metric that exists.
+One of the removed metrics published nothing a reader could use.
+`pg_custom_stat_subscription_received_lsn` selected a `pg_lsn` without
+converting it, and a `pg_lsn` reaches the query engine as the string
+`0/1FDF5FA0`, which it cannot parse into a number. Every real position was
+dropped with one line at info level.
+
+It was not silent in every case. A NULL in a column the file maps as a gauge
+reaches `dbToFloat64(nil)`, which returns NaN rather than failing, so a
+subscription with no received position published a NaN sample. A NaN is not a
+number a dashboard can read either, and it is worse than a missing series,
+because it looks like a measurement. Its replacement omits the series when
+there is no position.
 
 ## Metrics lose the server label
 

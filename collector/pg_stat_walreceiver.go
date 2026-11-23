@@ -194,28 +194,35 @@ func (c *PGStatWalReceiverCollector) Update(ctx context.Context, instance *insta
 		// slot name with a repmgr pattern, so every slot name that is not
 		// repmgr_slot_<n>, and every standby with no slot, left it NULL and
 		// lost the receiver's positions, timelines and message times with it.
-		emitInt := func(desc *prometheus.Desc, vtype prometheus.ValueType, v sql.NullInt64) {
-			if v.Valid {
-				ch <- prometheus.MustNewConstMetric(desc, vtype, float64(v.Int64), labels...)
-			}
-		}
-		emitFloat := func(desc *prometheus.Desc, vtype prometheus.ValueType, v sql.NullFloat64) {
-			if v.Valid {
-				ch <- prometheus.MustNewConstMetric(desc, vtype, v.Float64, labels...)
+		// One shape, with the descriptor and its value type at the call, so
+		// that the catalogue's extractor can still see what each descriptor is
+		// emitted as. Closures it does not know about leave a descriptor with
+		// no value type, which drops it out of every check that reads the
+		// inventory.
+		emit := func(desc *prometheus.Desc, vtype prometheus.ValueType, value float64, present bool) {
+			if present {
+				ch <- prometheus.MustNewConstMetric(desc, vtype, value, labels...)
 			}
 		}
 
-		emitInt(statWalReceiverReceiveStartLsn, prometheus.CounterValue, receiveStartLsn)
-		emitInt(statWalReceiverReceiveStartTli, prometheus.GaugeValue, receiveStartTli)
-		if hasFlushedLSN {
-			emitInt(statWalReceiverFlushedLSN, prometheus.CounterValue, flushedLsn)
-		}
-		emitInt(statWalReceiverReceivedTli, prometheus.GaugeValue, receivedTli)
-		emitFloat(statWalReceiverLastMsgSendTime, prometheus.CounterValue, lastMsgSendTime)
-		emitFloat(statWalReceiverLastMsgReceiptTime, prometheus.CounterValue, lastMsgReceiptTime)
-		emitInt(statWalReceiverLatestEndLsn, prometheus.CounterValue, latestEndLsn)
-		emitFloat(statWalReceiverLatestEndTime, prometheus.CounterValue, latestEndTime)
-		emitInt(statWalReceiverUpstreamNode, prometheus.GaugeValue, upstreamNode)
+		emit(statWalReceiverReceiveStartLsn, prometheus.CounterValue,
+			float64(receiveStartLsn.Int64), receiveStartLsn.Valid)
+		emit(statWalReceiverReceiveStartTli, prometheus.GaugeValue,
+			float64(receiveStartTli.Int64), receiveStartTli.Valid)
+		emit(statWalReceiverFlushedLSN, prometheus.CounterValue,
+			float64(flushedLsn.Int64), hasFlushedLSN && flushedLsn.Valid)
+		emit(statWalReceiverReceivedTli, prometheus.GaugeValue,
+			float64(receivedTli.Int64), receivedTli.Valid)
+		emit(statWalReceiverLastMsgSendTime, prometheus.CounterValue,
+			lastMsgSendTime.Float64, lastMsgSendTime.Valid)
+		emit(statWalReceiverLastMsgReceiptTime, prometheus.CounterValue,
+			lastMsgReceiptTime.Float64, lastMsgReceiptTime.Valid)
+		emit(statWalReceiverLatestEndLsn, prometheus.CounterValue,
+			float64(latestEndLsn.Int64), latestEndLsn.Valid)
+		emit(statWalReceiverLatestEndTime, prometheus.CounterValue,
+			latestEndTime.Float64, latestEndTime.Valid)
+		emit(statWalReceiverUpstreamNode, prometheus.GaugeValue,
+			float64(upstreamNode.Int64), upstreamNode.Valid)
 	}
 	if err := rows.Err(); err != nil {
 		return err

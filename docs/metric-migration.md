@@ -101,11 +101,31 @@ so adding a database needs no configuration change.
 | --- | --- | --- |
 | `pg_database` | the `database` collector | fully covered, and duplicated today |
 | `pg_postmaster` | the `postmaster` collector | covered, and the collector is enabled now |
-| `pg_replication` | the `replication` collector, as `pg_replication_lag_seconds` | covered under a different name |
+| `pg_replication` | the `replication` collector, as `pg_replication_lag_seconds` | covered under a different name, and calculated differently |
 
-Everything this file produces has a replacement that is switched on. It can be
-retired once the two renames below are agreed, since `pg_replication_lag` and
-`pg_custom_database_size_custom_bytes` are the only names that change.
+The replication lag is not only a rename. The query file computes the lag from
+the timestamp of the last replayed transaction whenever the server is in
+recovery. The collector reports zero when the standby has caught up, which the
+file does not: on a caught-up standby with received and replayed positions
+equal, the file reported 0.95 seconds and the collector reported 0. Both
+describe the same standby. The file is reporting the age of the last
+transaction it replayed, which on an idle primary grows without anything being
+behind, and the collector is reporting that there is nothing left to replay.
+
+The collector's answer is the one an operator wants from a metric called lag,
+so this is a correction rather than a regression, and it is a change in the
+number rather than in the name. A threshold set against the file's value will
+behave differently against the collector's, and an alert on "lag above a few
+seconds" will stop firing on idle standbys that were never behind.
+
+The file also carries an Aurora-specific query, selected by distribution. The
+collector returns without metrics on Aurora. Aurora support is not settled in
+the supported-distribution contract, and that has to be resolved before this
+file can be called fully replaced: today, retiring it would take replication
+lag away from Aurora entirely. No Aurora instance was tested here, and this
+is read from the query file and the collector rather than measured.
+
+Everything else this file produces has a replacement that is switched on.
 
 ## queries-hr.yml
 

@@ -179,8 +179,13 @@ func TestPgReplicationSlotCollectorTestNilValues(t *testing.T) {
 		}
 	}()
 
+	// Two, not four. A row of NULLs has no confirmed flush position and no
+	// restart position, and a position that does not exist is left out rather
+	// than published as zero: zero is a real position, the start of the log.
+	// What remains is the server's current position, which does not come from
+	// the slot, and whether the slot is active, which is never NULL in
+	// practice and reads as false when it is.
 	expected := []MetricResult{
-		{labels: labelMap{"slot_name": "unknown", "plugin": "unknown", "slot_type": "unknown"}, value: 0, metricType: dto.MetricType_GAUGE},
 		{labels: labelMap{"slot_name": "unknown", "plugin": "unknown", "slot_type": "unknown"}, value: 0, metricType: dto.MetricType_GAUGE},
 		{labels: labelMap{"slot_name": "unknown", "plugin": "unknown", "slot_type": "unknown"}, value: 1, metricType: dto.MetricType_GAUGE},
 	}
@@ -191,7 +196,85 @@ func TestPgReplicationSlotCollectorTestNilValues(t *testing.T) {
 			convey.So(expect, convey.ShouldResemble, m)
 		}
 	})
+	if extra, open := <-ch; open {
+		t.Errorf("a row of NULLs published a further metric: %s", extra.Desc())
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+// TestReplicationSlotConfirmedFlushAppliesOnlyWhereItExists covers the four
+// slot shapes an operator actually has.
+//
+// A physical slot has no confirmed flush position: the column is NULL whether
+// the slot is active or not. A logical slot has one once something has
+// consumed from it, and an inactive logical slot keeps the last one it
+// confirmed, which is the case an operator watching retention cares about.
+//
+// The query used to COALESCE that NULL to zero, so a physical slot reported a
+// consumer that had confirmed nothing. Zero is a real position, the start of
+// the log, so there was nothing in the output to tell the two apart.
+func TestReplicationSlotConfirmedFlushAppliesOnlyWhereItExists(t *testing.T) {
+	const flushMetric = "pg_replication_slot_slot_confirmed_flush_lsn"
+	const restartMetric = "pg_replication_slot_slot_restart_lsn"
+
+	for _, tc := range []struct {
+		name          string
+		slotType      string
+		active        bool
+		confirmed     interface{}
+		restart       interface{}
+		wantConfirmed bool
+	}{
+		{"an active physical slot", "physical", true, nil, int64(5000), false},
+		{"an inactive physical slot", "physical", false, nil, int64(5000), false},
+		{"an active logical slot", "logical", true, int64(6000), int64(5000), true},
+		{"an inactive logical slot", "logical", false, int64(6000), int64(5000), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("opening a stub connection: %s", err)
+			}
+			defer db.Close()
+
+			columns := []string{"slot_name", "plugin", "slot_type", "current_wal_lsn", "confirmed_flush_lsn", "restart_lsn", "active"}
+			mock.ExpectQuery(sanitizeQuery(pgReplicationSlotQuery)).WillReturnRows(
+				sqlmock.NewRows(columns).AddRow(
+					"a_slot", "pgoutput", tc.slotType, int64(7000), tc.confirmed, tc.restart, tc.active))
+
+			ch := make(chan prometheus.Metric, 16)
+			c := PGReplicationSlotCollector{}
+			if err := c.Update(context.Background(), &instance{db: db}, ch); err != nil {
+				t.Fatalf("the collector failed: %s", err)
+			}
+			close(ch)
+
+			published := map[string]MetricResult{}
+			for m := range ch {
+				published[descName(m)] = readMetric(m)
+			}
+
+			got, ok := published[flushMetric]
+			if ok != tc.wantConfirmed {
+				t.Errorf("confirmed flush published=%v, want %v", ok, tc.wantConfirmed)
+			}
+			if ok && tc.wantConfirmed && got.value != 6000 {
+				t.Errorf("confirmed flush is %v, want 6000", got.value)
+			}
+			// The retention boundary is published for every shape, because it
+			// is what the slot holds and it exists for all of them.
+			restart, ok := published[restartMetric]
+			if !ok {
+				t.Fatalf("%s is missing", restartMetric)
+			}
+			if restart.value != 5000 {
+				t.Errorf("restart position is %v, want 5000", restart.value)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("there were unfulfilled expectations: %s", err)
+			}
+		})
 	}
 }

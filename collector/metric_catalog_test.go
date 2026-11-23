@@ -343,6 +343,14 @@ func TestNoNewCounterWithoutTotal(t *testing.T) {
 
 	seen := map[string]bool{}
 	for _, d := range defs {
+		if len(d.Types) == 0 {
+			// Reported by TestEveryMetricHasExactlyOneValueType, which names
+			// it and says what to do. Reading Types[0] here panicked instead,
+			// so one unfollowed descriptor took down the whole package's
+			// tests with an index out of range rather than failing one of
+			// them with a message.
+			continue
+		}
 		if d.Types[0] != "Counter" || strings.HasSuffix(d.Name, "_total") {
 			continue
 		}
