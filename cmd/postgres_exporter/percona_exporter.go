@@ -392,6 +392,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			filters.postgresCollectors(),
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema),
+			collector.WithLastSuccess(lastSuccess),
 			// Built-in monitoring's own set, resolved at startup. Never
 			// intersected with the legacy engine's, which builds its own from
 			// its own configuration.

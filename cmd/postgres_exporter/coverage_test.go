@@ -730,7 +730,7 @@ func TestTwoTargetsOnOneDatabaseKeepSeparateLastSuccess(t *testing.T) {
 func TestLastSuccessSurvivesANameTheScrapeCannotResolve(t *testing.T) {
 	store := lastsuccess.New()
 	when := time.Now().Add(-time.Minute)
-	store.Record(lastsuccess.Key{Target: "1", Database: "root", Collector: "exporter"}, when)
+	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1", Database: "root", Collector: "exporter"}, when)
 
 	// A target the scrape could not name, which is what a failed connection
 	// leaves behind.
