@@ -45,8 +45,18 @@ const (
 	// exporter did reach.
 	ReasonScrape = "scrape"
 	// ReasonNotAttempted is work that never started, so it is neither a
-	// success nor a connection failure.
+	// success nor a connection failure. It is a deferral: the database was
+	// selected, nothing was tried, and the next scrape may reach it.
+	//
+	// Reported as a deferral rather than as an error. The contract requires
+	// failure and deferral to be distinguishable, because they call for
+	// different responses: a failure says something is wrong with that
+	// database, and a deferral says the exporter ran out of room.
 	ReasonNotAttempted = "not_attempted"
+
+	// ReasonNoPermit is a deferral for want of a connection permit, which is
+	// the only reason anything is deferred today.
+	ReasonNoPermit = "no_connection_permit"
 )
 
 // List is a configured list of database names that remembers whether it was
