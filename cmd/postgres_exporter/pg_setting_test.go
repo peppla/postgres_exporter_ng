@@ -16,6 +16,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	. "gopkg.in/check.v1"
@@ -237,17 +239,23 @@ func (s *PgSettingSuite) TestNormaliseUnit(c *C) {
 }
 
 func (s *PgSettingSuite) TestMetric(c *C) {
-	defer func() {
-		if r := recover(); r != nil {
-			if r.(error).Error() != `unknown unit for runtime variable: "nonexistent"` {
-				panic(r)
-			}
-		}
-	}()
-
 	for _, f := range fixtures {
+		m, err := f.p.metric(prometheus.Labels{})
+		// A fixture with a normalisation error is one this used to panic on.
+		// It has to come back as an error now, with the setting named, because
+		// a unit the exporter does not recognise is one missing metric rather
+		// than a reason to stop the process.
+		if f.n.err != "" {
+			c.Check(err, NotNil, Commentf("%s was expected to fail", f.p.name))
+			if err != nil {
+				c.Check(err.Error(), Equals, fmt.Sprintf("setting %q: %s", f.p.name, f.n.err))
+			}
+			c.Check(m, IsNil, Commentf("%s produced a metric as well as an error", f.p.name))
+			continue
+		}
+		c.Assert(err, IsNil, Commentf("%s: %v", f.p.name, err))
+
 		d := &dto.Metric{}
-		m := f.p.metric(prometheus.Labels{})
 		m.Write(d) // nolint: errcheck
 
 		c.Check(m.Desc().String(), Equals, f.d)

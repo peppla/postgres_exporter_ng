@@ -139,6 +139,66 @@ func TestQuerySettingsReportsRowErrors(t *testing.T) {
 	}
 }
 
+// TestQuerySettingsReportsWhatItCouldNotPublish covers the other way the
+// settings read can be incomplete.
+//
+// A setting the exporter cannot turn into a metric used to panic, which ended
+// the process. Warning and skipping instead left the scrape reporting success
+// with a setting missing from it, which is the same claim in a quieter form.
+// The valid settings are still published, and the failure is reported after
+// the iteration so one bad row costs the others nothing.
+func TestQuerySettingsReportsWhatItCouldNotPublish(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("opening a stub connection: %s", err)
+	}
+	defer db.Close()
+
+	// A valid setting, one with a unit the exporter does not recognise, and
+	// another valid one after it, so that stopping at the bad row would be
+	// visible as a missing third metric.
+	mock.ExpectQuery("FROM pg_settings").WillReturnRows(
+		sqlmock.NewRows([]string{"name", "setting", "unit", "short_desc", "vartype"}).
+			AddRow("max_connections", "100", "", "Sets the maximum number of concurrent connections.", "integer").
+			AddRow("odd_setting", "10", "nonexistent", "A setting with a unit nothing knows.", "integer").
+			AddRow("work_mem", "4096", "kB", "Sets the maximum memory for query workspaces.", "integer"))
+
+	ch := make(chan prometheus.Metric, 8)
+	err = querySettings(context.Background(), ch, &Server{db: db, labels: prometheus.Labels{"server": "test"}})
+	close(ch)
+
+	if err == nil {
+		t.Fatal("settings conversion omission reported success")
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Errorf("the error does not say what could not be published: %s", err)
+	}
+
+	var values []float64
+	for metric := range ch {
+		pb := &dto.Metric{}
+		if err := metric.Write(pb); err != nil {
+			t.Fatalf("writing a metric: %s", err)
+		}
+		values = append(values, pb.GetGauge().GetValue())
+	}
+	// Both valid settings, including the one after the failure. work_mem is
+	// published in bytes, which is 4096 kB.
+	if len(values) != 2 {
+		t.Fatalf("%d settings were published, want the two that are readable: %v", len(values), values)
+	}
+	if values[0] != 100 {
+		t.Errorf("the first setting reads %v, want 100", values[0])
+	}
+	if values[1] != 4194304 {
+		t.Errorf("the setting after the failure reads %v, want 4194304", values[1])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
 // TestQueryDatabasesReportsRowErrors covers the catalog read that decides
 // which databases exist.
 //

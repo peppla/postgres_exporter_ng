@@ -32,6 +32,10 @@ import (
 
 // Query within a namespace mapping and emit metrics. Returns fatal errors if
 // the scrape fails, and a slice of errors if they were non-fatal.
+//
+// Metrics are built with constructors that return an error. A query file
+// decides these names and labels, so an invalid one fails its namespace rather
+// than the process.
 func queryNamespaceMapping(ctx context.Context, server *Server, namespace string, mapping MetricMapNamespace) ([]prometheus.Metric, []error, error) {
 	// Check for a query override for this namespace
 	query, found := server.queryOverrides[namespace]
@@ -173,11 +177,15 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 						continue
 					}
 
-					metric = prometheus.MustNewConstHistogram(
+					metric, err = prometheus.NewConstHistogram(
 						metricMapping.desc,
 						count, sum, buckets,
 						labels...,
 					)
+					if err != nil {
+						return []prometheus.Metric{}, nonfatalErrors, fmt.Errorf(
+							"%s cannot publish %s: %w", namespace, columnName, err)
+					}
 				} else {
 					value, ok := dbToFloat64(columnData[idx])
 					if !ok {
@@ -185,7 +193,11 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 						continue
 					}
 					// Generate the metric
-					metric = prometheus.MustNewConstMetric(metricMapping.desc, metricMapping.vtype, value, labels...)
+					metric, err = prometheus.NewConstMetric(metricMapping.desc, metricMapping.vtype, value, labels...)
+					if err != nil {
+						return []prometheus.Metric{}, nonfatalErrors, fmt.Errorf(
+							"%s cannot publish %s: %w", namespace, columnName, err)
+					}
 				}
 			} else {
 				// Unknown metric. Report as untyped if scan to float64 works, else note an error too.
@@ -199,7 +211,11 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 					nonfatalErrors = append(nonfatalErrors, errors.New(fmt.Sprintln("Unparseable column type - discarding: ", namespace, columnName, err)))
 					continue
 				}
-				metric = prometheus.MustNewConstMetric(desc, prometheus.UntypedValue, value, labels...)
+				metric, err = prometheus.NewConstMetric(desc, prometheus.UntypedValue, value, labels...)
+				if err != nil {
+					return []prometheus.Metric{}, nonfatalErrors, fmt.Errorf(
+						"%s cannot publish %s: %w", namespace, columnName, err)
+				}
 			}
 			metrics = append(metrics, metric)
 		}

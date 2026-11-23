@@ -51,6 +51,8 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 	}
 	defer rows.Close() // nolint: errcheck
 
+	var unpublished []error
+
 	for rows.Next() {
 		s := &pgSetting{}
 		err = rows.Scan(&s.name, &s.setting, &s.unit, &s.shortDesc, &s.vartype)
@@ -58,13 +60,28 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 			return fmt.Errorf("Error retrieving rows on %q: %s %v", server, namespace, err)
 		}
 
-		ch <- s.metric(server.labels)
+		metric, err := s.metric(server.labels)
+		if err != nil {
+			// Keep valid settings and report conversion failures after
+			// iteration.
+			unpublished = append(unpublished, err)
+			continue
+		}
+		ch <- metric
 	}
 
 	// Next stops on error exactly as it stops at the end of the rows, so
 	// without this a settings query that failed partway reports success.
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("Error retrieving rows on %q: %s %v", server, namespace, err)
+	}
+
+	if len(unpublished) > 0 {
+		for _, err := range unpublished {
+			level.Warn(logger).Log("msg", "A setting could not be published", "err", err)
+		}
+		return fmt.Errorf("%d of the settings on %q could not be published, the first being: %w",
+			len(unpublished), server, unpublished[0])
 	}
 
 	return nil
@@ -76,7 +93,10 @@ type pgSetting struct {
 	name, setting, unit, shortDesc, vartype string
 }
 
-func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
+// metric turns one pg_settings row into a metric, and returns an error for a
+// row it cannot publish: an unrecognised unit, an unexpected vartype, or a
+// descriptor the registry refuses.
+func (s *pgSetting) metric(labels prometheus.Labels) (prometheus.Metric, error) {
 	var (
 		err       error
 		name      = strings.ReplaceAll(s.name, ".", "_")
@@ -93,9 +113,7 @@ func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
 		}
 	case "integer", "real":
 		if val, unit, err = s.normaliseUnit(); err != nil {
-			// Panic, since we should recognise all units
-			// and don't want to silently exlude metrics
-			panic(err)
+			return nil, fmt.Errorf("setting %q: %w", s.name, err)
 		}
 
 		if len(unit) > 0 {
@@ -103,12 +121,15 @@ func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
 			shortDesc = fmt.Sprintf("%s [Units converted to %s.]", shortDesc, unit)
 		}
 	default:
-		// Panic because we got a type we didn't ask for
-		panic(fmt.Sprintf("Unsupported vartype %q", s.vartype))
+		return nil, fmt.Errorf("setting %q has the unsupported vartype %q", s.name, s.vartype)
 	}
 
 	desc := newDesc(subsystem, name, shortDesc, labels)
-	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
+	metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, val)
+	if err != nil {
+		return nil, fmt.Errorf("setting %q cannot be published: %w", s.name, err)
+	}
+	return metric, nil
 }
 
 // Removes units from any of the setting values.
