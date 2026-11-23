@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -105,7 +106,7 @@ func gathered(t *testing.T, c *coverageMetrics) map[string]float64 {
 func TestCoverageMetricNames(t *testing.T) {
 	c := newCoverageMetrics(nil)
 	c.setSelection(true, true, 10, targetsFor("one", "two"), []databaseRef{ref("skipped")}, 7)
-	c.setOutcome(2, 1)
+	c.setOutcome(2, 1, 0)
 	c.setDatabaseOutcome(ref("one"), "")
 	c.setDatabaseOutcome(ref("two"), reasonConnect)
 
@@ -123,6 +124,8 @@ func TestCoverageMetricNames(t *testing.T) {
 		"pg_exporter_database_scrape_success{datname=two,server=h:5432}",
 		"pg_exporter_database_scrape_error{datname=two,reason=connect,server=h:5432}",
 		"pg_exporter_database_excluded{datname=skipped,reason=exclude_list,server=h:5432}",
+		"pg_exporter_databases_attempted",
+		"pg_exporter_databases_deferred",
 	}
 	got := series(t, c)
 	if len(got) != len(want) {
@@ -135,25 +138,38 @@ func TestCoverageMetricNames(t *testing.T) {
 	}
 }
 
-// TestCoverageInvariant is the property the whole set rests on. If scraped and
-// failed do not account for selected, the exporter has lost track of its own
-// work and no alert built on these numbers can be trusted.
+// TestCoverageInvariant is the property the whole set rests on. If the
+// outcomes do not account for what was selected, the exporter has lost track
+// of its own work and no alert built on these numbers can be trusted.
+//
+// Two invariants, because a deferral is neither a success nor a failure:
+// attempted plus deferred is selected, and scraped plus failed is attempted.
 func TestCoverageInvariant(t *testing.T) {
-	for _, tc := range []struct{ selected, failed int }{
-		{1, 0}, {1, 1}, {10, 0}, {10, 3}, {10, 10}, {120, 40}, {0, 0},
+	for _, tc := range []struct{ selected, failed, deferred int }{
+		{1, 0, 0}, {1, 1, 0}, {1, 0, 1}, {10, 0, 0}, {10, 3, 0}, {10, 3, 2},
+		{10, 0, 10}, {10, 10, 0}, {120, 40, 40}, {0, 0, 0},
 	} {
 		c := newCoverageMetrics(nil)
 		c.setSelection(true, true, tc.selected, make([]scrapeTarget, tc.selected), nil, 0)
-		c.setOutcome(tc.selected, tc.failed)
+		c.setOutcome(tc.selected, tc.failed, tc.deferred)
 
 		g := gathered(t, c)
 		scraped := g["pg_exporter_databases_scraped"]
 		failed := g["pg_exporter_databases_failed"]
 		selected := g["pg_exporter_databases_selected"]
+		attempted := g["pg_exporter_databases_attempted"]
+		deferred := g["pg_exporter_databases_deferred"]
 
-		if scraped+failed != selected {
-			t.Errorf("selected=%d failed=%d: scraped(%v) + failed(%v) = %v, want %v",
-				tc.selected, tc.failed, scraped, failed, scraped+failed, selected)
+		if attempted+deferred != selected {
+			t.Errorf("selected=%d failed=%d deferred=%d: attempted(%v) + deferred(%v) = %v, want %v",
+				tc.selected, tc.failed, tc.deferred, attempted, deferred, attempted+deferred, selected)
+		}
+		if scraped+failed != attempted {
+			t.Errorf("selected=%d failed=%d deferred=%d: scraped(%v) + failed(%v) = %v, want attempted %v",
+				tc.selected, tc.failed, tc.deferred, scraped, failed, scraped+failed, attempted)
+		}
+		if deferred != float64(tc.deferred) {
+			t.Errorf("selected=%d deferred=%d: published deferred %v", tc.selected, tc.deferred, deferred)
 		}
 		if failed != float64(tc.failed) {
 			t.Errorf("selected=%d failed=%d: published failed %v", tc.selected, tc.failed, failed)
@@ -170,7 +186,7 @@ func TestCoverageReportsDiscoveryFailure(t *testing.T) {
 	// Discovery enabled, discovery failed, so only the seed is known and only
 	// the seed is selected.
 	c.setSelection(true, false, 1, targetsFor("postgres"), nil, 0)
-	c.setOutcome(1, 0)
+	c.setOutcome(1, 0, 0)
 
 	g := gathered(t, c)
 	if g["pg_exporter_database_discovery_enabled"] != 1 {
@@ -188,7 +204,7 @@ func TestCoverageReportsDiscoveryFailure(t *testing.T) {
 	// scrape of one database because discovery broke.
 	healthy := newCoverageMetrics(nil)
 	healthy.setSelection(false, true, 1, targetsFor("postgres"), nil, 0)
-	healthy.setOutcome(1, 0)
+	healthy.setOutcome(1, 0, 0)
 	h := gathered(t, healthy)
 
 	if h["pg_exporter_database_discovery_success"] == g["pg_exporter_database_discovery_success"] {
@@ -258,7 +274,7 @@ func TestDiscoveryFailsOnUnparseableSeed(t *testing.T) {
 // derived from selected minus errors, so databases that were never attempted
 // were published as successfully covered. No database is needed to show it,
 // because acquisition fails first.
-func TestCoverageCountsUnacquiredWorkAsFailed(t *testing.T) {
+func TestCoverageCountsUnacquiredWorkAsDeferred(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // every Acquire now fails immediately
 
@@ -291,8 +307,16 @@ func TestCoverageCountsUnacquiredWorkAsFailed(t *testing.T) {
 		t.Errorf("scraped %v: work that was never attempted was reported as covered",
 			g["pg_exporter_databases_scraped"])
 	}
-	if g["pg_exporter_databases_failed"] != float64(len(dsns)) {
-		t.Errorf("failed %v, want %d", g["pg_exporter_databases_failed"], len(dsns))
+	if g["pg_exporter_databases_failed"] != 0 {
+		t.Errorf("failed %v: work that was never attempted was reported as a failure of the database",
+			g["pg_exporter_databases_failed"])
+	}
+	if g["pg_exporter_databases_deferred"] != float64(len(dsns)) {
+		t.Errorf("deferred %v, want %d", g["pg_exporter_databases_deferred"], len(dsns))
+	}
+	if g["pg_exporter_databases_attempted"] != 0 {
+		t.Errorf("attempted %v, want none: no permit was available for any of them",
+			g["pg_exporter_databases_attempted"])
 	}
 }
 
@@ -318,7 +342,7 @@ func TestDatabaseOutcomeNamesTheFailure(t *testing.T) {
 	c.setDatabaseOutcome(ref("app"), "")
 	c.setDatabaseOutcome(ref("tenant_1"), "")
 	c.setDatabaseOutcome(ref("tenant_2"), reasonConnect)
-	c.setOutcome(3, 1)
+	c.setOutcome(3, 1, 0)
 
 	g := series(t, c)
 	if g["pg_exporter_databases_scraped"] != 2 || g["pg_exporter_databases_failed"] != 1 {
@@ -350,7 +374,7 @@ func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
 	c.setSelection(true, true, 2, targetsFor("app", "going_away"), nil, 0)
 	c.setDatabaseOutcome(ref("app"), "")
 	c.setDatabaseOutcome(ref("going_away"), "")
-	c.setOutcome(2, 0)
+	c.setOutcome(2, 0, 0)
 	if g := series(t, c); g["pg_exporter_database_scrape_success{datname=going_away,server=h:5432}"] != 1 {
 		t.Fatalf("setup: going_away was not reported as covered: %v", g)
 	}
@@ -358,7 +382,7 @@ func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
 	// Next scrape: the database is gone.
 	c.setSelection(true, true, 1, targetsFor("app"), nil, 0)
 	c.setDatabaseOutcome(ref("app"), "")
-	c.setOutcome(1, 0)
+	c.setOutcome(1, 0, 0)
 
 	g := series(t, c)
 	if _, found := g["pg_exporter_database_selected{datname=going_away,server=h:5432}"]; found {
@@ -377,7 +401,7 @@ func TestExcludedIsNeverFailed(t *testing.T) {
 	c := newCoverageMetrics(nil)
 	c.setSelection(true, true, 5, targetsFor("app"), []databaseRef{ref("scratch"), ref("archive")}, 2)
 	c.setDatabaseOutcome(ref("app"), "")
-	c.setOutcome(1, 0)
+	c.setOutcome(1, 0, 0)
 
 	g := series(t, c)
 	if g["pg_exporter_databases_failed"] != 0 {
@@ -400,7 +424,7 @@ func TestExcludedIsNeverFailed(t *testing.T) {
 	}
 	// The databases an include list left out are counted, not named. A series
 	// per database would be a series per database on the whole server.
-	if n := len(g); n > 12 {
+	if n := len(g); n > 14 {
 		t.Errorf("%d series for one selected database and four exclusions: %v", n, g)
 	}
 }
@@ -418,7 +442,7 @@ func TestUnreachableDatabasesAreNamed(t *testing.T) {
 	e.coverage.setSelection(true, true, 2, targets, nil, 0)
 
 	ch, stop := drain()
-	failed, _ := e.scrapeTargets(ch, targets)
+	failed, _, _ := e.scrapeTargets(ch, targets)
 	stop()
 
 	if failed != len(targets) {
@@ -457,22 +481,32 @@ func TestUnattemptedWorkIsNamedNotAttempted(t *testing.T) {
 	e.coverage.setSelection(true, true, 2, targets, nil, 0)
 
 	ch, stop := drain()
-	failed, connFailures := e.scrapeTargets(ch, targets)
+	failed, connFailures, deferred := e.scrapeTargets(ch, targets)
 	stop()
 
-	if failed != len(targets) {
-		t.Fatalf("%d of %d targets failed, want all of them", failed, len(targets))
+	if deferred != len(targets) {
+		t.Fatalf("%d of %d targets were deferred, want all of them", deferred, len(targets))
+	}
+	if failed != 0 {
+		t.Errorf("%d targets failed: nothing was tried, so nothing is known to be wrong with them", failed)
 	}
 	if connFailures != 0 {
 		t.Errorf("%d connection failures: nothing was connected to, so pg_up must keep its meaning", connFailures)
 	}
 	g := series(t, e.coverage)
 	for _, name := range []string{"one", "two"} {
-		if g["pg_exporter_database_scrape_error{datname="+name+",reason="+reasonNotAttempted+",server=127.0.0.1:1}"] != 1 {
-			t.Errorf("%s was never attempted but is not reported as such: %v", name, g)
+		if g["pg_exporter_database_deferred{datname="+name+",reason="+dbselect.ReasonNoPermit+",server=127.0.0.1:1}"] != 1 {
+			t.Errorf("%s was never attempted but is not reported as deferred: %v", name, g)
 		}
 		if g["pg_exporter_database_scrape_success{datname="+name+",server=127.0.0.1:1}"] != 0 {
 			t.Errorf("%s was never attempted but is reported as a success", name)
+		}
+		// Not an error. A deferral says the exporter ran out of room, and an
+		// alert on the error series must not fire for it.
+		for _, reason := range []string{reasonConnect, reasonScrape, reasonNotAttempted} {
+			if _, found := g["pg_exporter_database_scrape_error{datname="+name+",reason="+reason+",server=127.0.0.1:1}"]; found {
+				t.Errorf("%s was deferred and carries a %s error series", name, reason)
+			}
 		}
 	}
 }
@@ -502,7 +536,7 @@ func TestSameDatabaseNameOnTwoServersStaysApart(t *testing.T) {
 	c.setSelection(true, true, 2, targets, nil, 0)
 	c.setDatabaseOutcome(targets[0].databaseRef, "")
 	c.setDatabaseOutcome(targets[1].databaseRef, reasonConnect)
-	c.setOutcome(2, 1)
+	c.setOutcome(2, 1, 0)
 
 	g := series(t, c)
 	if g["pg_exporter_database_scrape_success{datname=postgres,server=10.0.0.1:5432}"] != 1 {

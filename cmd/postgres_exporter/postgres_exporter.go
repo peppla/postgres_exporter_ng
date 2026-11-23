@@ -835,9 +835,9 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	// intended is indistinguishable from no shortfall.
 	e.coverage.setSelection(e.autoDiscoverDatabases, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
 
-	errorsCount, connectionErrorsCount := e.scrapeTargets(ch, d.targets)
+	errorsCount, connectionErrorsCount, deferredCount := e.scrapeTargets(ch, d.targets)
 
-	e.coverage.setOutcome(len(d.targets), errorsCount)
+	e.coverage.setOutcome(len(d.targets), errorsCount, deferredCount)
 
 	switch {
 	case connectionErrorsCount >= len(d.targets):
@@ -855,15 +855,17 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 }
 
 // scrapeTargets runs the per-database fan-out and returns how many targets
-// failed and how many of those failed to connect.
+// failed, how many of those failed to connect, and how many were deferred
+// without being started.
 //
 // Split out of scrape so the per-database outcome reporting can be tested with
 // targets that carry names. scrape builds its targets from discovery, and
 // discovery needs a server, so without this the only reachable test case was
 // the one where no name is known and the per-database gauges are empty.
-func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTarget) (failed, connectionFailures int) {
+func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTarget) (failed, connectionFailures, deferred int) {
 	var errorsCount atomic.Int32
 	var connectionErrorsCount atomic.Int32
+	var deferredCount atomic.Int32
 	var wg sync.WaitGroup
 
 	for _, target := range targets {
@@ -876,16 +878,20 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				if err := e.connSema.Acquire(e.ctx, 1); err != nil {
 					level.Warn(logger).Log("msg", "Failed to acquire semaphore", "err", err)
 					// This database is not scraped, so it must not be
-					// counted as one that was. scraped is selected minus
-					// errors, so returning silently here would publish a
-					// database that was never attempted as successfully
-					// covered -- the exact false claim these metrics exist
-					// to prevent.
+					// counted as one that was: returning silently here would
+					// publish a database that was never attempted as
+					// successfully covered, which is the false claim these
+					// metrics exist to prevent.
 					//
-					// Deliberately not a connection error: nothing was
-					// connected to, so pg_up keeps the meaning it had.
-					errorsCount.Add(1)
-					e.coverage.setDatabaseOutcome(target.databaseRef, reasonNotAttempted)
+					// Deferred rather than failed. Nothing was tried, so
+					// nothing is known to be wrong with this database, and
+					// the two call for different responses: a failure points
+					// at the database and a deferral points at the budget.
+					// It is deliberately not a connection error either,
+					// because nothing was connected to, so pg_up keeps the
+					// meaning it had.
+					deferredCount.Add(1)
+					e.coverage.setDatabaseDeferred(target.databaseRef, dbselect.ReasonNoPermit)
 					return
 				}
 				defer e.connSema.Release(1)
@@ -909,7 +915,7 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 
 	wg.Wait()
 
-	return int(errorsCount.Load()), int(connectionErrorsCount.Load())
+	return int(errorsCount.Load()), int(connectionErrorsCount.Load()), int(deferredCount.Load())
 }
 
 // namespaceDefinition fingerprints what a namespace asks for, so a cached

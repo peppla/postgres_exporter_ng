@@ -118,13 +118,16 @@ type coverageMetrics struct {
 	discoverySuccess prometheus.Gauge
 	discovered       prometheus.Gauge
 	selected         prometheus.Gauge
+	attempted        prometheus.Gauge
 	scraped          prometheus.Gauge
 	failed           prometheus.Gauge
+	deferred         prometheus.Gauge
 	excluded         prometheus.Gauge
 
 	databaseSelected *prometheus.GaugeVec
 	databaseSuccess  *prometheus.GaugeVec
 	databaseError    *prometheus.GaugeVec
+	databaseDeferred *prometheus.GaugeVec
 	databaseExcluded *prometheus.GaugeVec
 }
 
@@ -156,10 +159,14 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 			"Databases known to the last scrape. When discovery ran, this is what the server reported plus the database named in the DSN, which the discovery query omits. When discovery is disabled or failed, it is the configured DSNs alone, which is a fallback and not a server inventory -- read database_discovery_enabled and database_discovery_success before reading this as one. With several DSNs it is a sum across them, not a distinct total."),
 		selected: gauge("databases_selected",
 			"Databases the last scrape intended to cover, after exclusion and inclusion."),
+		attempted: gauge("databases_attempted",
+			"Selected databases the last scrape started work on. Selected minus deferred."),
 		scraped: gauge("databases_scraped",
-			"Databases whose scrape returned no error at the last scrape. Not a claim of complete coverage for that database."),
+			"Databases whose scrape returned no error at the last scrape. This is the completed count. Not a claim of complete coverage for that database."),
 		failed: gauge("databases_failed",
-			"Databases the last scrape did not cover: the scrape returned an error, or it could not be started. Work that was skipped is counted here rather than left out, so it cannot be mistaken for success."),
+			"Databases the last scrape started work on and did not cover, because the connection or a query failed. Work that was never started is counted in databases_deferred instead, which is a different thing: a failure says something is wrong with that database and a deferral says the exporter ran out of room."),
+		deferred: gauge("databases_deferred",
+			"Selected databases the last scrape did not start work on, because there was no room within its budget. Not covered and not failed. A number here that does not fall is a selected set the exporter cannot keep up with."),
 		excluded: gauge("databases_excluded",
 			"Databases the server offered that configuration left out of the selected set, by an exclude list or by a non-empty include list. These are decisions, not failures, and are never counted in databases_failed."),
 
@@ -168,7 +175,9 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 		databaseSuccess: vec("database_scrape_success",
 			"Whether the last scrape of this database returned no error (1 for yes, 0 for no). Present for every selected database whose name is known, so a database going dark is visible rather than averaged into a count. Not a claim of complete coverage for that database.", "server", "datname"),
 		databaseError: vec("database_scrape_error",
-			"1 for each selected database the last scrape did not cover, labelled with why: connect for a connection that failed, scrape for a query or collector that failed, not_attempted for work that never started. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
+			"1 for each selected database the last scrape started work on and did not cover, labelled with why: connect for a connection that failed, scrape for a query or collector that failed. Work that never started is in database_deferred instead. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
+		databaseDeferred: vec("database_deferred",
+			"1 for each selected database the last scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
 		databaseExcluded: vec("database_excluded",
 			"1 for each database an exclude list named and kept out of the selected set. Databases left out by a non-empty include list are counted in databases_excluded and not named here, because that set can be the whole server.", "server", "datname", "reason"),
 	}
@@ -193,6 +202,7 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 	c.databaseSelected.Reset()
 	c.databaseSuccess.Reset()
 	c.databaseError.Reset()
+	c.databaseDeferred.Reset()
 	c.databaseExcluded.Reset()
 
 	for _, t := range targets {
@@ -223,11 +233,32 @@ func (c *coverageMetrics) setDatabaseOutcome(ref databaseRef, reason string) {
 	c.databaseError.WithLabelValues(ref.server, ref.datname, reason).Set(1)
 }
 
-// setOutcome records what actually happened. scraped is derived from selected
-// and failed rather than counted separately, so the invariant cannot drift.
-func (c *coverageMetrics) setOutcome(selected, failed int) {
-	c.scraped.Set(float64(selected - failed))
+// setDatabaseDeferred records one database the scrape never started work on.
+//
+// Success is 0, as it is for a failure: the database was not covered either
+// way. What differs is that no error series is published for it, because
+// nothing was tried and nothing went wrong with the database.
+func (c *coverageMetrics) setDatabaseDeferred(ref databaseRef, reason string) {
+	if ref.datname == "" {
+		return
+	}
+	c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(0)
+	c.databaseDeferred.WithLabelValues(ref.server, ref.datname, reason).Set(1)
+}
+
+// setOutcome records what actually happened.
+//
+// attempted and scraped are derived rather than counted separately, so the two
+// invariants cannot drift: attempted plus deferred is selected, and scraped
+// plus failed is attempted. An exporter that loses track of its own work is
+// the thing these metrics exist to make visible, so they must not be able to
+// disagree with each other.
+func (c *coverageMetrics) setOutcome(selected, failed, deferred int) {
+	attempted := selected - deferred
+	c.attempted.Set(float64(attempted))
+	c.scraped.Set(float64(attempted - failed))
 	c.failed.Set(float64(failed))
+	c.deferred.Set(float64(deferred))
 }
 
 func (c *coverageMetrics) collect(ch chan<- prometheus.Metric) {
@@ -235,12 +266,15 @@ func (c *coverageMetrics) collect(ch chan<- prometheus.Metric) {
 	ch <- c.discoverySuccess
 	ch <- c.discovered
 	ch <- c.selected
+	ch <- c.attempted
 	ch <- c.scraped
 	ch <- c.failed
+	ch <- c.deferred
 	ch <- c.excluded
 	c.databaseSelected.Collect(ch)
 	c.databaseSuccess.Collect(ch)
 	c.databaseError.Collect(ch)
+	c.databaseDeferred.Collect(ch)
 	c.databaseExcluded.Collect(ch)
 }
 

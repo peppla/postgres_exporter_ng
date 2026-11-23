@@ -290,9 +290,15 @@ func TestAClusterOnlyScrapeWithNoPermitSelectsNoDatabase(t *testing.T) {
 	if got := gaugeValue(t, out["pg_collector_database_up"]); got != 0 {
 		t.Errorf("database_up is %v when nothing was opened", got)
 	}
-	if len(out["pg_collector_database_error"]) != 1 {
-		t.Errorf("a scrape with no permit published %d error series, want 1",
-			len(out["pg_collector_database_error"]))
+	// Deferred, not failed: nothing was tried, so nothing is known to be
+	// wrong with this server. The connection is still named, because it is
+	// what the cluster-wide work would have run on.
+	if len(out["pg_collector_database_deferred"]) != 1 {
+		t.Errorf("a scrape with no permit published %d deferral series, want 1",
+			len(out["pg_collector_database_deferred"]))
+	}
+	if _, ok := out["pg_collector_database_error"]; ok {
+		t.Error("a scrape with no permit published an error, so an alert on failures fires for a busy exporter")
 	}
 }
 

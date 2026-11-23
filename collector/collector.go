@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
@@ -102,7 +103,19 @@ var (
 	)
 	collectorDatabaseErrorDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_error"),
-		"1 for each database the collectors did not reach, labelled with why: connect for a connection that failed, not_attempted for work that never started. Covers the same set as database_up, which includes the configured connection database whether or not selection kept it. Reasons are a closed set, never an error message.",
+		"1 for each database the collectors tried to reach and could not, labelled with why: connect for a connection that failed. Work that never started is in database_deferred instead. Covers the same set as database_up, which includes the configured connection database whether or not selection kept it. Reasons are a closed set, never an error message.",
+		[]string{"server", "datname", "reason"},
+		nil,
+	)
+	collectorDeferredDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_deferred"),
+		"Selected databases this scrape did not start work on, because there was no room within its budget. Not covered and not failed: nothing was tried, so nothing is known to be wrong with them. A number here that does not fall is a selected set the exporter cannot keep up with.",
+		[]string{"server"},
+		nil,
+	)
+	collectorDeferredDatabaseDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "database_deferred"),
+		"1 for each selected database this scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it for database-local work, because that connection is what cluster-wide collection runs on. So this can name one more database than databases_deferred counts, in the same way database_up can. Reasons are a closed set, never an error message. A deferral is not an error and is not counted in database_error.",
 		[]string{"server", "datname", "reason"},
 		nil,
 	)
@@ -337,6 +350,8 @@ func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collectorDiscoverySuccessDesc
 	ch <- collectorExcludedDatabaseDesc
 	ch <- collectorDatabaseErrorDesc
+	ch <- collectorDeferredDesc
+	ch <- collectorDeferredDatabaseDesc
 }
 
 // Collect implements the prometheus.Collector interface.
@@ -368,7 +383,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		// failure. Returning silently here published no series at all, so a
 		// scrape that collected nothing was indistinguishable from one that
 		// was never configured to collect.
-		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonNotAttempted, databaseLocal)
+		p.reportControlDeferral(ch, inst.name, controlName, databaseLocal)
 		return
 	}
 	// Set up the database connection for the collector.
@@ -438,6 +453,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	var deferred atomic.Int32
 	fanout := sync.WaitGroup{}
 	for _, t := range sel.targets {
 		if t.control || t.skipDatabaseLocal {
@@ -446,10 +462,19 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		fanout.Add(1)
 		go func(t dbTarget) {
 			defer fanout.Done()
-			p.collectDatabase(ch, t, local, inst.name)
+			if p.collectDatabase(ch, t, local, inst.name) {
+				deferred.Add(1)
+			}
 		}(t)
 	}
 	fanout.Wait()
+
+	// After the fan-out, because it is the only point where the number is
+	// known. Published even when it is zero, so that a scrape which deferred
+	// nothing says so rather than leaving a reader to wonder whether the
+	// series is missing or the exporter kept up.
+	ch <- prometheus.MustNewConstMetric(collectorDeferredDesc, prometheus.GaugeValue,
+		float64(deferred.Load()), inst.name)
 }
 
 // collectDatabase opens one database and runs the database-local collectors
@@ -458,14 +483,22 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 // A database that cannot be opened reports database_up 0 and nothing else. The
 // alternative is emitting no series for it at all, which reads the same as a
 // database that was never selected.
-func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) {
+// It returns whether the database was deferred rather than attempted.
+func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) (deferred bool) {
 	fail := func(reason string) {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, t.datname, reason)
 	}
 	if !p.acquire() {
-		fail(dbselect.ReasonNotAttempted)
-		return
+		// Deferred, not failed. Nothing was connected to and nothing was
+		// tried, so this says the exporter ran out of room rather than that
+		// something is wrong with this database, and an alert on the error
+		// series must not fire for it. database_up is still 0: it was not
+		// reached.
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
+		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
+			server, t.datname, dbselect.ReasonNoPermit)
+		return true
 	}
 	defer p.release()
 
@@ -476,7 +509,7 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "datname", t.datname, "err", err)
 		fail(dbselect.ReasonConnect)
-		return
+		return false
 	}
 	defer dbInst.Close()
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, server, t.datname)
@@ -490,6 +523,7 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		}(name, c)
 	}
 	wg.Wait()
+	return false
 }
 
 // byScope splits the enabled collectors by where they run.
@@ -591,6 +625,35 @@ func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, ser
 	}
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, datname)
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, datname, reason)
+}
+
+// reportControlDeferral publishes what is known when there was no connection
+// permit for the control connection: nothing was tried.
+//
+// Separate from reportControlFailure because a deferral is not a failure. The
+// connection was never opened, so nothing is known to be wrong with the
+// server, and an alert on the error series must not fire for a busy exporter.
+func (p PostgresCollector) reportControlDeferral(ch chan<- prometheus.Metric, server, datname string, databaseLocal bool) {
+	selected := 0
+	if databaseLocal && p.controlSelected(datname) {
+		selected = 1
+	}
+	ch <- prometheus.MustNewConstMetric(collectorSelectedDesc, prometheus.GaugeValue, float64(selected), server)
+	// Same rule as the failure path: the set of databases is reported on only
+	// where it was wanted. A request that selected no database-scoped
+	// collector asked for no set, and nothing about discovery is said for it.
+	if databaseLocal {
+		ch <- prometheus.MustNewConstMetric(collectorDiscoverySuccessDesc, prometheus.GaugeValue, 0, server)
+	}
+	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, datname)
+	// The per-connection diagnostic names the control database whether or not
+	// database-local work was selected for it, because that connection is
+	// what cluster-wide collection would have run on. The count beside it is
+	// the local set, so on a cluster-only request the two describe different
+	// things: one deferred connection, no deferred databases.
+	ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
+		server, datname, dbselect.ReasonNoPermit)
+	ch <- prometheus.MustNewConstMetric(collectorDeferredDesc, prometheus.GaugeValue, float64(selected), server)
 }
 
 // controlSelected reports whether the configured database would get
