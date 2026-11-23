@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/distribution"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -181,113 +180,42 @@ func (c *PGStatWalReceiverCollector) Update(ctx context.Context, instance *insta
 				return err
 			}
 		}
-		if !upstreamHost.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because upstream host is null")
-			continue
-		}
-
-		if !slotName.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because slotname host is null")
-			continue
-		}
-
-		if !status.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because status is null")
-			continue
-		}
+		// A label the server did not report is published empty, which
+		// Prometheus reads as absent. It used to skip the row: an ordinary
+		// standby streaming without a replication slot reports slot_name
+		// NULL, and the collector published nothing at all for it. There is
+		// at most one receiver per standby, so an empty label cannot collide
+		// with another row.
 		labels := []string{upstreamHost.String, slotName.String, status.String}
 
-		if !receiveStartLsn.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because receive_start_lsn is null")
-			continue
+		// Each measurement is published when the server reported it and
+		// omitted when it did not, rather than one NULL column costing all of
+		// them. upstream_node is the clearest case: it is parsed out of the
+		// slot name with a repmgr pattern, so every slot name that is not
+		// repmgr_slot_<n>, and every standby with no slot, left it NULL and
+		// lost the receiver's positions, timelines and message times with it.
+		emitInt := func(desc *prometheus.Desc, vtype prometheus.ValueType, v sql.NullInt64) {
+			if v.Valid {
+				ch <- prometheus.MustNewConstMetric(desc, vtype, float64(v.Int64), labels...)
+			}
 		}
-		if !receiveStartTli.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because receive_start_tli is null")
-			continue
+		emitFloat := func(desc *prometheus.Desc, vtype prometheus.ValueType, v sql.NullFloat64) {
+			if v.Valid {
+				ch <- prometheus.MustNewConstMetric(desc, vtype, v.Float64, labels...)
+			}
 		}
-		if hasFlushedLSN && !flushedLsn.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because flushed_lsn is null")
-			continue
-		}
-		if !receivedTli.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because received_tli is null")
-			continue
-		}
-		if !lastMsgSendTime.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because last_msg_send_time is null")
-			continue
-		}
-		if !lastMsgReceiptTime.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because last_msg_receipt_time is null")
-			continue
-		}
-		if !latestEndLsn.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because latest_end_lsn is null")
-			continue
-		}
-		if !latestEndTime.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because latest_end_time is null")
-			continue
-		}
-		if !upstreamNode.Valid {
-			level.Debug(c.log).Log("msg", "Skipping wal receiver stats because upstream_node is null")
-			continue
-		}
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverReceiveStartLsn,
-			prometheus.CounterValue,
-			float64(receiveStartLsn.Int64),
-			labels...)
 
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverReceiveStartTli,
-			prometheus.GaugeValue,
-			float64(receiveStartTli.Int64),
-			labels...)
-
+		emitInt(statWalReceiverReceiveStartLsn, prometheus.CounterValue, receiveStartLsn)
+		emitInt(statWalReceiverReceiveStartTli, prometheus.GaugeValue, receiveStartTli)
 		if hasFlushedLSN {
-			ch <- prometheus.MustNewConstMetric(
-				statWalReceiverFlushedLSN,
-				prometheus.CounterValue,
-				float64(flushedLsn.Int64),
-				labels...)
+			emitInt(statWalReceiverFlushedLSN, prometheus.CounterValue, flushedLsn)
 		}
-
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverReceivedTli,
-			prometheus.GaugeValue,
-			float64(receivedTli.Int64),
-			labels...)
-
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverLastMsgSendTime,
-			prometheus.CounterValue,
-			float64(lastMsgSendTime.Float64),
-			labels...)
-
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverLastMsgReceiptTime,
-			prometheus.CounterValue,
-			float64(lastMsgReceiptTime.Float64),
-			labels...)
-
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverLatestEndLsn,
-			prometheus.CounterValue,
-			float64(latestEndLsn.Int64),
-			labels...)
-
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverLatestEndTime,
-			prometheus.CounterValue,
-			latestEndTime.Float64,
-			labels...)
-
-		ch <- prometheus.MustNewConstMetric(
-			statWalReceiverUpstreamNode,
-			prometheus.GaugeValue,
-			float64(upstreamNode.Int64),
-			labels...)
+		emitInt(statWalReceiverReceivedTli, prometheus.GaugeValue, receivedTli)
+		emitFloat(statWalReceiverLastMsgSendTime, prometheus.CounterValue, lastMsgSendTime)
+		emitFloat(statWalReceiverLastMsgReceiptTime, prometheus.CounterValue, lastMsgReceiptTime)
+		emitInt(statWalReceiverLatestEndLsn, prometheus.CounterValue, latestEndLsn)
+		emitFloat(statWalReceiverLatestEndTime, prometheus.CounterValue, latestEndTime)
+		emitInt(statWalReceiverUpstreamNode, prometheus.GaugeValue, upstreamNode)
 	}
 	if err := rows.Err(); err != nil {
 		return err
