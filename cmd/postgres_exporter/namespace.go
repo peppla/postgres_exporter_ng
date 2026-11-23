@@ -20,6 +20,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
@@ -67,6 +69,32 @@ func queryNamespaceMapping(ctx context.Context, server *Server, namespace string
 	var columnIdx = make(map[string]int, len(columnNames))
 	for i, n := range columnNames {
 		columnIdx[n] = i
+	}
+
+	// Every column the mapping names as a label has to be in the result.
+	//
+	// A missing one used to read as index zero, because that is what a map
+	// lookup returns for a key it does not hold, so the label carried the
+	// first column's value. Measured with one column, value 42, and a
+	// configured label tenant_id that the query does not select: the scrape
+	// reported success and published tenant_id="42".
+	//
+	// Checked before any row is read, and fatal for this namespace, because a
+	// label with another column's value is not a partial answer. The operator
+	// has to see it: a query file naming a column it does not select is a
+	// mistake in the file, and the series it produces cannot be aggregated by
+	// the label it is wrong about.
+	var missing []string
+	for _, label := range mapping.labels {
+		if _, ok := columnIdx[label]; !ok {
+			missing = append(missing, label)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return []prometheus.Metric{}, []error{}, fmt.Errorf(
+			"%s declares the label column %s, which its query does not return, so every sample would carry another column's value",
+			namespace, strings.Join(missing, ", "))
 	}
 
 	var columnData = make([]interface{}, len(columnNames))
