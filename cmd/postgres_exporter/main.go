@@ -196,13 +196,30 @@ func main() {
 	// setting on the role or the server is never raised.
 	pgclamp.SetDefaults(limits.StatementTimeout, limits.LockTimeout, limits.ConnectTimeout)
 
+	// Which databases built-in monitoring runs its database-local collectors
+	// against, from the configuration file where it is written there and from
+	// the deprecated flags otherwise. Resolved once, here, so that the one
+	// thing that can go wrong with it stops the exporter starting.
+	//
+	// Resolved per scrape, a set configured in both places logged a line and
+	// served a response with no metrics in it: HTTP 200 and a zero-length
+	// body, which Prometheus records as a healthy target with nothing to say.
+	// The README has always said this is refused at startup.
+	excludeSelection, includeSelection, err := builtinDatabaseSelection(
+		c.GetConfig(), excludedDatabases, strings.Split(*includeDatabases, ","))
+	if err != nil {
+		level.Error(logger).Log("msg", "Invalid database selection", "err", err.Error())
+		os.Exit(1)
+	}
+
 	connSema := semaphore.NewWeighted(limits.Connections)
 	// One admission gate for every endpoint that collects.
 	collectionGate := NewCollectionGate(limits)
 	// One cache for the process, so a result a query file asked to keep
 	// survives the request that collected it.
 	queryCache := querycache.New()
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache))
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache,
+		excludeSelection, includeSelection))
 
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{

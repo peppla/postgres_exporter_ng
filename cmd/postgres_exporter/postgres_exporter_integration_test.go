@@ -30,6 +30,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1988,7 +1989,8 @@ func scrapeHTTP(dsn string, limits budget.Limits, header string, collect ...stri
 	rec := httptest.NewRecorder()
 
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
-		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits), querycache.New())
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits), querycache.New(),
+		dbselect.Absent(), dbselect.Absent())
 
 	start := time.Now()
 	h.ServeHTTP(rec, req)
@@ -2206,7 +2208,7 @@ uncached_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2378,7 +2380,7 @@ two_targets:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured, secondTarget},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2489,7 +2491,7 @@ role_targets:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{asRole(roles[0]), asRole(roles[1])},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2587,7 +2589,7 @@ context_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{withSearchPath(schemas[0]), withSearchPath(schemas[1])},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2666,7 +2668,7 @@ fallback_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{target},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), querycache.New())
+		limits, NewCollectionGate(limits), querycache.New(), dbselect.Absent(), dbselect.Absent())
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
 	rec := httptest.NewRecorder()
@@ -2742,7 +2744,7 @@ resolution_probe:
 	// absent, which is not what this is about.
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), globalCollectorsForTest(),
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func(query string) string {
 		req := httptest.NewRequest("GET", "/metrics"+query, nil)
@@ -2828,7 +2830,7 @@ overlap_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2925,7 +2927,7 @@ slow_two:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
 	rec := httptest.NewRecorder()
@@ -2976,7 +2978,7 @@ edited_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache)
+		limits, NewCollectionGate(limits), cache, dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -3198,6 +3200,60 @@ func withConfigFile(path string) (func(), error) {
 	return func() { c.Config = previous }, nil
 }
 
+// configuredSelection resolves built-in monitoring's database set from the
+// installed configuration file and no flags, the way main does at startup.
+//
+// Outside the method because the package-level configuration handler is named
+// c, which a gocheck method parameter shadows.
+func configuredSelection() (dbselect.List, dbselect.List, error) {
+	return builtinDatabaseSelection(c.GetConfig(), nil, nil)
+}
+
+// TestAConflictingDatabaseSelectionIsRefusedAtStartup covers the claim the
+// README makes and the code did not.
+//
+// The same set configured in the file and in a flag is a configuration error.
+// Resolved per scrape, it logged a line and served a response with no metrics
+// in it: HTTP 200 and a zero-length body, which Prometheus records as a
+// healthy target with nothing to say. It is resolved at startup now, so the
+// exporter refuses to start.
+//
+// This builds and runs the binary, because what is being tested is that main
+// reaches the check before it listens. Calling the resolver from a test proves
+// only that the resolver works, which it already did.
+func (s *IntegrationSuite) TestAConflictingDatabaseSelectionIsRefusedAtStartup(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	binary := filepath.Join(c.MkDir(), "postgres_exporter_startup_probe")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	built, err := build.CombinedOutput()
+	c.Assert(err, IsNil, Commentf("building the exporter: %s", built))
+
+	path := filepath.Join(c.MkDir(), "postgres_exporter.yml")
+	c.Assert(os.WriteFile(path,
+		[]byte("monitoring:\n  databases:\n    include:\n      - app\n"), 0o600), IsNil)
+
+	// A deadline, because the failure this test is about is the exporter
+	// starting and serving: without one it would wait for a process that
+	// never returns.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	run := exec.CommandContext(ctx, binary,
+		"--config.file="+path,
+		"--include-databases=app",
+		"--web.listen-address=127.0.0.1:0")
+	run.Env = append(os.Environ(), "DATA_SOURCE_NAME="+dsn)
+	output, err := run.CombinedOutput()
+
+	c.Check(strings.Contains(string(output), "both configure the same set of databases"), Equals, true,
+		Commentf("the exporter did not refuse a set configured twice: %s", output))
+	c.Check(err, NotNil, Commentf("the exporter exited successfully with a set configured twice"))
+	c.Check(run.ProcessState.ExitCode(), Equals, 1,
+		Commentf("the exporter exited with %d, want 1: it was killed by this test's deadline rather than refusing to start",
+			run.ProcessState.ExitCode()))
+}
+
 // TestMonitoringDatabaseKeysSelectDatabases is the end-to-end half of the
 // configuration keys.
 //
@@ -3229,10 +3285,16 @@ func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
 	c.Assert(err, IsNil)
 	defer restore()
 
+	// Resolved the way main resolves it at startup, which is the step the
+	// handler no longer does: a scrape has no way to report a configuration
+	// error except by serving no metrics.
+	excludeSelection, includeSelection, err := configuredSelection()
+	c.Assert(err, IsNil)
+
 	limits := budget.Defaults()
 	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		Filters{EnablePostgresCollector: true}, limits, querycache.New())
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), excludeSelection, includeSelection)
 	c.Assert(err, IsNil)
 	families, err := registry.Gather()
 	c.Assert(err, IsNil)
