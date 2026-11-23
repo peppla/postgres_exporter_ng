@@ -725,7 +725,7 @@ func (e *Exporter) setupInternalMetrics() {
 		Help:        "Whether the user queries file was loaded and parsed successfully (1 for error, 0 for success).",
 		ConstLabels: e.constantLabels,
 	}, []string{"filename", "hashsum"})
-	e.coverage = newCoverageMetrics(e.constantLabels, e.lastSuccess)
+	e.coverage = newCoverageMetrics(e.constantLabels, e.lastSuccess, e.collectorName)
 }
 
 // Describe implements prometheus.Collector.

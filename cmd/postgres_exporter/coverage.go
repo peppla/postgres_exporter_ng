@@ -120,8 +120,11 @@ import (
 
 type coverageMetrics struct {
 	// lastSuccess is the process's, not this scrape's: how long a database has
-	// been failing cannot be answered from one scrape.
+	// been failing cannot be answered from one scrape. job names the collection
+	// this set of metrics belongs to, because one store serves them all and
+	// they succeed and fail independently.
 	lastSuccess *lastsuccess.Store
+	job         string
 
 	discoveryEnabled prometheus.Gauge
 	discoverySuccess prometheus.Gauge
@@ -142,7 +145,7 @@ type coverageMetrics struct {
 	databaseExcluded *prometheus.GaugeVec
 }
 
-func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.Store) *coverageMetrics {
+func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.Store, job string) *coverageMetrics {
 	gauge := func(name, help string) prometheus.Gauge {
 		return prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
@@ -163,6 +166,7 @@ func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.
 	}
 	return &coverageMetrics{
 		lastSuccess: lastSuccess,
+		job:         job,
 
 		discoveryEnabled: gauge("database_discovery_enabled",
 			"Whether database auto-discovery is configured (1 for yes, 0 for no)."),
@@ -184,7 +188,7 @@ func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.
 			"Databases the server offered that configuration left out of the selected set, by an exclude list or by a non-empty include list. These are decisions, not failures, and are never counted in databases_failed."),
 
 		databaseLastSuccess: vec("database_last_success_timestamp_seconds",
-			"When this database was last collected without error, as seconds since the epoch. Absent for a database this process has never collected, which is not the same as one it last collected at the epoch. Published for every selected database whose name is known, so a database that is failing keeps reporting when it last worked.", "server", "datname"),
+			"When this database was last collected without error, as seconds since the epoch. Absent for a database this process has never collected, which is not the same as one it last collected at the epoch. Published for every selected database whose name is known, so a database that is failing keeps reporting when it last worked. The target label is this process's identity for the connection, because several connections share a host and port and each is collected separately; it is not stable across restarts.", "server", "datname", "target"),
 
 		databaseSelected: vec("database_selected",
 			"1 for each database the last scrape intended to cover, by server and database name. Absent for a database that was not selected.", "server", "datname"),
@@ -230,8 +234,8 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 		// What this process knows from before this scrape. A database that
 		// fails today keeps reporting when it last worked, which is the
 		// question the counts cannot answer.
-		if when, ok := c.lastSuccess.At(lastsuccess.Key{Target: t.identity, Database: t.datname}); ok {
-			c.databaseLastSuccess.WithLabelValues(t.server, t.datname).Set(float64(when.UnixNano()) / 1e9)
+		if when, ok := c.lastSuccess.At(c.keyFor(t.databaseRef)); ok {
+			c.databaseLastSuccess.WithLabelValues(t.server, t.datname, t.identity).Set(float64(when.UnixNano()) / 1e9)
 		}
 		// Assume nothing until the outcome is known. A scrape cut short
 		// leaves this at 0, which is the honest reading: it was not covered.
@@ -254,12 +258,18 @@ func (c *coverageMetrics) setDatabaseOutcome(ref databaseRef, reason string) {
 		// because several targets share those and a success on one of them is
 		// not a success on the others.
 		now := time.Now()
-		c.lastSuccess.Record(lastsuccess.Key{Target: ref.identity, Database: ref.datname}, now)
-		c.databaseLastSuccess.WithLabelValues(ref.server, ref.datname).Set(float64(now.UnixNano()) / 1e9)
+		c.lastSuccess.Record(c.keyFor(ref), now)
+		c.databaseLastSuccess.WithLabelValues(ref.server, ref.datname, ref.identity).Set(float64(now.UnixNano()) / 1e9)
 		return
 	}
 	c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(0)
 	c.databaseError.WithLabelValues(ref.server, ref.datname, reason).Set(1)
+}
+
+// keyFor is what this set of metrics remembers a success under: the
+// connection, the database, and the job collecting them.
+func (c *coverageMetrics) keyFor(ref databaseRef) lastsuccess.Key {
+	return lastsuccess.Key{Target: ref.identity, Database: ref.datname, Collector: c.job}
 }
 
 // setDatabaseDeferred records one database the scrape never started work on.

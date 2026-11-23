@@ -81,30 +81,6 @@ func TestAnEarlierRecordingDoesNotMoveItBack(t *testing.T) {
 	}
 }
 
-// TestForgetDropsTargetsThatAreGone keeps the store bounded by the
-// configuration rather than by everything the process has ever seen.
-func TestForgetDropsTargetsThatAreGone(t *testing.T) {
-	s := New()
-	when := time.Now()
-	s.Record(Key{Target: "1", Database: "app"}, when)
-	s.Record(Key{Target: "1", Database: "other"}, when)
-	s.Record(Key{Target: "2", Database: "app"}, when)
-
-	s.Forget(map[string]bool{"1": true})
-
-	if s.Len() != 2 {
-		t.Errorf("%d keys remain, want the two belonging to the kept target", s.Len())
-	}
-	if _, ok := s.At(Key{Target: "2", Database: "app"}); ok {
-		t.Error("a target that is gone is still remembered")
-	}
-	// A failing database keeps its last success, because that is the one an
-	// operator needs. Forget is about targets, not databases.
-	if _, ok := s.At(Key{Target: "1", Database: "other"}); !ok {
-		t.Error("a database of a kept target was forgotten")
-	}
-}
-
 // TestConcurrentRecordingIsSafe covers the fan-out under the race detector.
 func TestConcurrentRecordingIsSafe(t *testing.T) {
 	s := New()
@@ -133,5 +109,4 @@ func TestANilStoreIsUsable(t *testing.T) {
 	if s.Len() != 0 {
 		t.Error("a nil store reported keys")
 	}
-	s.Forget(nil)
 }

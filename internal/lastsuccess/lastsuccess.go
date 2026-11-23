@@ -29,12 +29,17 @@ import (
 	"time"
 )
 
-// Key identifies what succeeded: one connection, one database, and one
-// collector where the engine has collectors to name.
+// Key identifies what succeeded: one connection, one database, and the job
+// that collected it.
 //
 // Target is an opaque per-process identity for the connection rather than its
 // host and port, because several targets share a host and port and a last
 // success recorded against one of them is not true of the others.
+//
+// Collector is the job: the built-in exporter, each custom-query resolution,
+// and the namespaced collectors are separate collections of the same database,
+// and they succeed and fail independently. One store serves all of them, so
+// without this an hourly job's success answers for a failing five-second one.
 type Key struct {
 	Target    string
 	Database  string
@@ -86,8 +91,13 @@ func (s *Store) At(key Key) (time.Time, bool) {
 	return t, ok
 }
 
-// Len reports how many keys are held, for tests and for seeing that the store
-// is bounded.
+// Len reports how many keys are held.
+//
+// One entry per connection, database and job this process has collected. That
+// grows with databases created and dropped over a long-running process, and
+// nothing prunes it yet: pruning needs to know a database is gone, which only
+// a discovery that succeeded can say, and a failing or deferred database must
+// be kept because its last success is the answer an operator wants.
 func (s *Store) Len() int {
 	if s == nil {
 		return 0
@@ -95,23 +105,4 @@ func (s *Store) Len() int {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	return len(s.seen)
-}
-
-// Forget drops every key whose target is not in keep.
-//
-// Called with the targets a scrape knows about, so that a server removed from
-// the configuration stops being remembered. Databases are not pruned here: a
-// database that is failing is exactly the one whose last success matters, and
-// it is absent from a scrape's successes for as long as it fails.
-func (s *Store) Forget(keep map[string]bool) {
-	if s == nil {
-		return
-	}
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	for key := range s.seen {
-		if !keep[key.Target] {
-			delete(s.seen, key)
-		}
-	}
 }

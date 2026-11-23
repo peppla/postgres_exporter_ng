@@ -2619,7 +2619,7 @@ label_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), querycache.New(),
+		limits, NewCollectionGate(limits), querycache.New(), lastsuccess.New(),
 		dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() (int, string) {
