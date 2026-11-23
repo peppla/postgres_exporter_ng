@@ -111,9 +111,18 @@
 
 package main
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"time"
+
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 type coverageMetrics struct {
+	// lastSuccess is the process's, not this scrape's: how long a database has
+	// been failing cannot be answered from one scrape.
+	lastSuccess *lastsuccess.Store
+
 	discoveryEnabled prometheus.Gauge
 	discoverySuccess prometheus.Gauge
 	discovered       prometheus.Gauge
@@ -124,6 +133,8 @@ type coverageMetrics struct {
 	deferred         prometheus.Gauge
 	excluded         prometheus.Gauge
 
+	databaseLastSuccess *prometheus.GaugeVec
+
 	databaseSelected *prometheus.GaugeVec
 	databaseSuccess  *prometheus.GaugeVec
 	databaseError    *prometheus.GaugeVec
@@ -131,7 +142,7 @@ type coverageMetrics struct {
 	databaseExcluded *prometheus.GaugeVec
 }
 
-func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
+func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.Store) *coverageMetrics {
 	gauge := func(name, help string) prometheus.Gauge {
 		return prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
@@ -151,6 +162,8 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 		}, labels)
 	}
 	return &coverageMetrics{
+		lastSuccess: lastSuccess,
+
 		discoveryEnabled: gauge("database_discovery_enabled",
 			"Whether database auto-discovery is configured (1 for yes, 0 for no)."),
 		discoverySuccess: gauge("database_discovery_success",
@@ -169,6 +182,9 @@ func newCoverageMetrics(constLabels prometheus.Labels) *coverageMetrics {
 			"Selected databases the last scrape did not start work on, because there was no room within its budget. Not covered and not failed. A number here that does not fall is a selected set the exporter cannot keep up with."),
 		excluded: gauge("databases_excluded",
 			"Databases the server offered that configuration left out of the selected set, by an exclude list or by a non-empty include list. These are decisions, not failures, and are never counted in databases_failed."),
+
+		databaseLastSuccess: vec("database_last_success_timestamp_seconds",
+			"When this database was last collected without error, as seconds since the epoch. Absent for a database this process has never collected, which is not the same as one it last collected at the epoch. Published for every selected database whose name is known, so a database that is failing keeps reporting when it last worked.", "server", "datname"),
 
 		databaseSelected: vec("database_selected",
 			"1 for each database the last scrape intended to cover, by server and database name. Absent for a database that was not selected.", "server", "datname"),
@@ -199,6 +215,7 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 
 	// Reset before setting, so a database that is gone stops being reported
 	// instead of keeping the value it had when it was last seen.
+	c.databaseLastSuccess.Reset()
 	c.databaseSelected.Reset()
 	c.databaseSuccess.Reset()
 	c.databaseError.Reset()
@@ -210,6 +227,12 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 			continue
 		}
 		c.databaseSelected.WithLabelValues(t.server, t.datname).Set(1)
+		// What this process knows from before this scrape. A database that
+		// fails today keeps reporting when it last worked, which is the
+		// question the counts cannot answer.
+		if when, ok := c.lastSuccess.At(lastsuccess.Key{Target: t.identity, Database: t.datname}); ok {
+			c.databaseLastSuccess.WithLabelValues(t.server, t.datname).Set(float64(when.UnixNano()) / 1e9)
+		}
 		// Assume nothing until the outcome is known. A scrape cut short
 		// leaves this at 0, which is the honest reading: it was not covered.
 		c.databaseSuccess.WithLabelValues(t.server, t.datname).Set(0)
@@ -227,6 +250,12 @@ func (c *coverageMetrics) setDatabaseOutcome(ref databaseRef, reason string) {
 	}
 	if reason == "" {
 		c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(1)
+		// Recorded against the connection rather than the host and port,
+		// because several targets share those and a success on one of them is
+		// not a success on the others.
+		now := time.Now()
+		c.lastSuccess.Record(lastsuccess.Key{Target: ref.identity, Database: ref.datname}, now)
+		c.databaseLastSuccess.WithLabelValues(ref.server, ref.datname).Set(float64(now.UnixNano()) / 1e9)
 		return
 	}
 	c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(0)
@@ -271,6 +300,7 @@ func (c *coverageMetrics) collect(ch chan<- prometheus.Metric) {
 	ch <- c.failed
 	ch <- c.deferred
 	ch <- c.excluded
+	c.databaseLastSuccess.Collect(ch)
 	c.databaseSelected.Collect(ch)
 	c.databaseSuccess.Collect(ch)
 	c.databaseError.Collect(ch)

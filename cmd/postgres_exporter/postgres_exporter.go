@@ -31,6 +31,7 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -455,7 +456,10 @@ type Exporter struct {
 	// queryCache outlives this exporter, which a request creates and
 	// discards. Nil means no caching at all, which is what every test that
 	// does not pass one gets.
-	queryCache        *querycache.Cache
+	queryCache *querycache.Cache
+	// lastSuccess outlives this exporter too, for the same reason: how long a
+	// database has been failing cannot be answered from one scrape.
+	lastSuccess       *lastsuccess.Store
 	userQueriesPath   map[MetricResolution]string
 	resolutionEnabled MetricResolution
 	enabled           bool
@@ -580,6 +584,14 @@ func IncludeDatabases(s string) ExporterOpt {
 func WithQueryCache(cache *querycache.Cache) ExporterOpt {
 	return func(e *Exporter) {
 		e.queryCache = cache
+	}
+}
+
+// WithLastSuccess configures the process-owned record of when each database
+// was last collected without error.
+func WithLastSuccess(store *lastsuccess.Store) ExporterOpt {
+	return func(e *Exporter) {
+		e.lastSuccess = store
 	}
 }
 
@@ -713,7 +725,7 @@ func (e *Exporter) setupInternalMetrics() {
 		Help:        "Whether the user queries file was loaded and parsed successfully (1 for error, 0 for success).",
 		ConstLabels: e.constantLabels,
 	}, []string{"filename", "hashsum"})
-	e.coverage = newCoverageMetrics(e.constantLabels)
+	e.coverage = newCoverageMetrics(e.constantLabels, e.lastSuccess)
 }
 
 // Describe implements prometheus.Collector.
@@ -828,7 +840,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			}
 			d.targets = append(d.targets, scrapeTarget{
 				dsn:         dsn,
-				databaseRef: databaseRef{server: fingerprint},
+				databaseRef: databaseRef{server: fingerprint, identity: identityOf(dsn)},
 			})
 		}
 	}

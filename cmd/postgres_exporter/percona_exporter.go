@@ -20,6 +20,7 @@ import (
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -60,7 +61,7 @@ var (
 // configuration here because resolving them can fail, and a scrape is the wrong
 // place to discover that: it has no way to report a configuration error except
 // by serving no metrics.
-func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, excludeSelection, includeSelection dbselect.List) http.Handler {
+func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, lastSuccess *lastsuccess.Store, excludeSelection, includeSelection dbselect.List) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Refused before any SQL runs, and not queued. A queue turns an
 		// overloaded exporter into a slow one, and the scrapes waiting in it
@@ -113,7 +114,7 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		}
 
 		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache,
-			excludeSelection, includeSelection)
+			lastSuccess, excludeSelection, includeSelection)
 		if err != nil {
 			// Only a request that named collectors turns a build failure into
 			// a client error, because then the names came from the request.
@@ -261,7 +262,7 @@ func (f Filters) postgresCollectors() []string {
 // names came from the request. Everything else is logged and the registry is
 // returned with whatever could be built, which is the behaviour a scrape has
 // always had.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, error) {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, lastSuccess *lastsuccess.Store, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, error) {
 	registry := prometheus.NewRegistry()
 
 	// Always, whatever was selected. A refused request serves no metrics of
@@ -292,6 +293,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		// so one it owned would be empty on arrival and discarded on the way
 		// out, which is what cache_seconds was doing.
 		WithQueryCache(queryCache),
+		WithLastSuccess(lastSuccess),
 	}
 
 	if filters.EnableAllCollectors || filters.EnableDefaultCollector {

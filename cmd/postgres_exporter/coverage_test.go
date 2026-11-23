@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -104,7 +105,7 @@ func gathered(t *testing.T, c *coverageMetrics) map[string]float64 {
 // operator and an alert both depend on, so a rename has to be a deliberate act
 // that fails this test rather than a quiet edit.
 func TestCoverageMetricNames(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	c.setSelection(true, true, 10, targetsFor("one", "two"), []databaseRef{ref("skipped")}, 7)
 	c.setOutcome(2, 1, 0)
 	c.setDatabaseOutcome(ref("one"), "")
@@ -126,6 +127,9 @@ func TestCoverageMetricNames(t *testing.T) {
 		"pg_exporter_database_excluded{datname=skipped,reason=exclude_list,server=h:5432}",
 		"pg_exporter_databases_attempted",
 		"pg_exporter_databases_deferred",
+		// The database that succeeded keeps a last-success time; the one that
+		// failed has none to keep, because this process has never collected it.
+		"pg_exporter_database_last_success_timestamp_seconds{datname=one,server=h:5432}",
 	}
 	got := series(t, c)
 	if len(got) != len(want) {
@@ -149,7 +153,7 @@ func TestCoverageInvariant(t *testing.T) {
 		{1, 0, 0}, {1, 1, 0}, {1, 0, 1}, {10, 0, 0}, {10, 3, 0}, {10, 3, 2},
 		{10, 0, 10}, {10, 10, 0}, {120, 40, 40}, {0, 0, 0},
 	} {
-		c := newCoverageMetrics(nil)
+		c := newCoverageMetrics(nil, lastsuccess.New())
 		c.setSelection(true, true, tc.selected, make([]scrapeTarget, tc.selected), nil, 0)
 		c.setOutcome(tc.selected, tc.failed, tc.deferred)
 
@@ -182,7 +186,7 @@ func TestCoverageInvariant(t *testing.T) {
 // one database covered where fifty were expected, and nothing in the old output
 // said so. pg_up stays 1, because the one database that is left works.
 func TestCoverageReportsDiscoveryFailure(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	// Discovery enabled, discovery failed, so only the seed is known and only
 	// the seed is selected.
 	c.setSelection(true, false, 1, targetsFor("postgres"), nil, 0)
@@ -202,7 +206,7 @@ func TestCoverageReportsDiscoveryFailure(t *testing.T) {
 	// And the healthy case must be distinguishable from it, which is the whole
 	// point: a scrape of one database because there is one database, against a
 	// scrape of one database because discovery broke.
-	healthy := newCoverageMetrics(nil)
+	healthy := newCoverageMetrics(nil, lastsuccess.New())
 	healthy.setSelection(false, true, 1, targetsFor("postgres"), nil, 0)
 	healthy.setOutcome(1, 0, 0)
 	h := gathered(t, healthy)
@@ -220,7 +224,7 @@ func TestCoverageReportsDiscoveryFailure(t *testing.T) {
 // finishes delivers nothing at all. An earlier revision of this test was named
 // as though it proved otherwise.
 func TestCoverageSelectionRetainedWithoutOutcome(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	c.setSelection(true, true, 120, make([]scrapeTarget, 120), nil, 0)
 	// No setOutcome: the scrape was cut short.
 
@@ -336,7 +340,7 @@ func drain() (chan prometheus.Metric, func()) {
 // Three databases, one of them unreachable: the counts say two of three, and
 // only the per-database series says which one went dark.
 func TestDatabaseOutcomeNamesTheFailure(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	targets := targetsFor("app", "tenant_1", "tenant_2")
 	c.setSelection(true, true, 3, targets, nil, 0)
 	c.setDatabaseOutcome(ref("app"), "")
@@ -369,7 +373,7 @@ func TestDatabaseOutcomeNamesTheFailure(t *testing.T) {
 // in the selection, and without a reset its last value stays in the output
 // forever: a deleted database reported as healthy, indefinitely.
 func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 
 	c.setSelection(true, true, 2, targetsFor("app", "going_away"), nil, 0)
 	c.setDatabaseOutcome(ref("app"), "")
@@ -398,7 +402,7 @@ func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
 // exclusion counted as a failure would page somebody for working as
 // configured.
 func TestExcludedIsNeverFailed(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	c.setSelection(true, true, 5, targetsFor("app"), []databaseRef{ref("scratch"), ref("archive")}, 2)
 	c.setDatabaseOutcome(ref("app"), "")
 	c.setOutcome(1, 0, 0)
@@ -531,7 +535,7 @@ func targetsForDSN(hostport string, names ...string) []scrapeTarget {
 // on another, and the aggregate count says two databases while one series
 // claims to describe them both.
 func TestSameDatabaseNameOnTwoServersStaysApart(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	targets := append(targetsOn("10.0.0.1:5432", "postgres"), targetsOn("10.0.0.2:5432", "postgres")...)
 	c.setSelection(true, true, 2, targets, nil, 0)
 	c.setDatabaseOutcome(targets[0].databaseRef, "")
@@ -566,7 +570,7 @@ func TestSameDatabaseNameOnTwoServersStaysApart(t *testing.T) {
 // TestExcludedSameNameOnTwoServersStaysApart is the same collision on the
 // exclusion family, which is keyed the same way.
 func TestExcludedSameNameOnTwoServersStaysApart(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New())
 	c.setSelection(true, true, 4, targetsOn("10.0.0.1:5432", "app"), []databaseRef{
 		{server: "10.0.0.1:5432", datname: "scratch"},
 		{server: "10.0.0.2:5432", datname: "scratch"},
@@ -580,5 +584,69 @@ func TestExcludedSameNameOnTwoServersStaysApart(t *testing.T) {
 	}
 	if g["pg_exporter_databases_excluded"] != 2 {
 		t.Errorf("excluded count is %v, want 2", g["pg_exporter_databases_excluded"])
+	}
+}
+
+// TestLastSuccessSurvivesAFailingScrape is what the series exists for.
+//
+// The counts say what this scrape did. They cannot say how long a database has
+// been failing, and that is the first question an operator asks: a database
+// that failed once is a blip, and one that has not been collected for an hour
+// is an outage. The store is the process's, so the answer survives the
+// exporter the handler builds and throws away for each request.
+func TestLastSuccessSurvivesAFailingScrape(t *testing.T) {
+	store := lastsuccess.New()
+	target := scrapeTarget{
+		dsn:         "postgresql://u:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "1"},
+	}
+
+	// A scrape that worked.
+	working := newCoverageMetrics(nil, store)
+	working.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	working.setDatabaseOutcome(target.databaseRef, "")
+	working.setOutcome(1, 0, 0)
+
+	first := gathered(t, working)
+	recorded := first["pg_exporter_database_last_success_timestamp_seconds"]
+	if recorded == 0 {
+		t.Fatalf("a successful scrape recorded no last success: %v", first)
+	}
+
+	// A later scrape that failed, from a fresh set of metrics, which is what
+	// the next request builds.
+	failing := newCoverageMetrics(nil, store)
+	failing.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	failing.setDatabaseOutcome(target.databaseRef, reasonConnect)
+	failing.setOutcome(1, 1, 0)
+
+	second := gathered(t, failing)
+	if got := second["pg_exporter_database_scrape_success"]; got != 0 {
+		t.Errorf("the failing scrape reports success %v", got)
+	}
+	kept := second["pg_exporter_database_last_success_timestamp_seconds"]
+	if kept != recorded {
+		t.Errorf("the last success reads %v after a failing scrape, want the %v it recorded before",
+			kept, recorded)
+	}
+}
+
+// TestADatabaseNeverCollectedHasNoLastSuccess keeps the absent case absent. A
+// zero there says the database was last collected at the epoch, which is a
+// different claim from never having been collected.
+func TestADatabaseNeverCollectedHasNoLastSuccess(t *testing.T) {
+	target := scrapeTarget{
+		dsn:         "postgresql://u:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "1"},
+	}
+	c := newCoverageMetrics(nil, lastsuccess.New())
+	c.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	c.setDatabaseOutcome(target.databaseRef, reasonConnect)
+	c.setOutcome(1, 1, 0)
+
+	for name := range series(t, c) {
+		if strings.HasPrefix(name, "pg_exporter_database_last_success_timestamp_seconds") {
+			t.Errorf("a database nothing has ever collected reports %s", name)
+		}
 	}
 }
