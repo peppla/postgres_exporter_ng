@@ -22,8 +22,10 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -104,7 +106,7 @@ func gathered(t *testing.T, c *coverageMetrics) map[string]float64 {
 // operator and an alert both depend on, so a rename has to be a deliberate act
 // that fails this test rather than a quiet edit.
 func TestCoverageMetricNames(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	c.setSelection(true, true, 10, targetsFor("one", "two"), []databaseRef{ref("skipped")}, 7)
 	c.setOutcome(2, 1, 0)
 	c.setDatabaseOutcome(ref("one"), "")
@@ -126,6 +128,9 @@ func TestCoverageMetricNames(t *testing.T) {
 		"pg_exporter_database_excluded{datname=skipped,reason=exclude_list,server=h:5432}",
 		"pg_exporter_databases_attempted",
 		"pg_exporter_databases_deferred",
+		// The database that succeeded keeps a last-success time; the one that
+		// failed has none to keep, because this process has never collected it.
+		"pg_exporter_database_last_success_timestamp_seconds{datname=one,server=h:5432,target=}",
 	}
 	got := series(t, c)
 	if len(got) != len(want) {
@@ -149,7 +154,7 @@ func TestCoverageInvariant(t *testing.T) {
 		{1, 0, 0}, {1, 1, 0}, {1, 0, 1}, {10, 0, 0}, {10, 3, 0}, {10, 3, 2},
 		{10, 0, 10}, {10, 10, 0}, {120, 40, 40}, {0, 0, 0},
 	} {
-		c := newCoverageMetrics(nil)
+		c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 		c.setSelection(true, true, tc.selected, make([]scrapeTarget, tc.selected), nil, 0)
 		c.setOutcome(tc.selected, tc.failed, tc.deferred)
 
@@ -182,7 +187,7 @@ func TestCoverageInvariant(t *testing.T) {
 // one database covered where fifty were expected, and nothing in the old output
 // said so. pg_up stays 1, because the one database that is left works.
 func TestCoverageReportsDiscoveryFailure(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	// Discovery enabled, discovery failed, so only the seed is known and only
 	// the seed is selected.
 	c.setSelection(true, false, 1, targetsFor("postgres"), nil, 0)
@@ -202,7 +207,7 @@ func TestCoverageReportsDiscoveryFailure(t *testing.T) {
 	// And the healthy case must be distinguishable from it, which is the whole
 	// point: a scrape of one database because there is one database, against a
 	// scrape of one database because discovery broke.
-	healthy := newCoverageMetrics(nil)
+	healthy := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	healthy.setSelection(false, true, 1, targetsFor("postgres"), nil, 0)
 	healthy.setOutcome(1, 0, 0)
 	h := gathered(t, healthy)
@@ -220,7 +225,7 @@ func TestCoverageReportsDiscoveryFailure(t *testing.T) {
 // finishes delivers nothing at all. An earlier revision of this test was named
 // as though it proved otherwise.
 func TestCoverageSelectionRetainedWithoutOutcome(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	c.setSelection(true, true, 120, make([]scrapeTarget, 120), nil, 0)
 	// No setOutcome: the scrape was cut short.
 
@@ -336,7 +341,7 @@ func drain() (chan prometheus.Metric, func()) {
 // Three databases, one of them unreachable: the counts say two of three, and
 // only the per-database series says which one went dark.
 func TestDatabaseOutcomeNamesTheFailure(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	targets := targetsFor("app", "tenant_1", "tenant_2")
 	c.setSelection(true, true, 3, targets, nil, 0)
 	c.setDatabaseOutcome(ref("app"), "")
@@ -369,7 +374,7 @@ func TestDatabaseOutcomeNamesTheFailure(t *testing.T) {
 // in the selection, and without a reset its last value stays in the output
 // forever: a deleted database reported as healthy, indefinitely.
 func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 
 	c.setSelection(true, true, 2, targetsFor("app", "going_away"), nil, 0)
 	c.setDatabaseOutcome(ref("app"), "")
@@ -398,7 +403,7 @@ func TestDatabaseSeriesClearedBetweenScrapes(t *testing.T) {
 // exclusion counted as a failure would page somebody for working as
 // configured.
 func TestExcludedIsNeverFailed(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	c.setSelection(true, true, 5, targetsFor("app"), []databaseRef{ref("scratch"), ref("archive")}, 2)
 	c.setDatabaseOutcome(ref("app"), "")
 	c.setOutcome(1, 0, 0)
@@ -531,7 +536,7 @@ func targetsForDSN(hostport string, names ...string) []scrapeTarget {
 // on another, and the aggregate count says two databases while one series
 // claims to describe them both.
 func TestSameDatabaseNameOnTwoServersStaysApart(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	targets := append(targetsOn("10.0.0.1:5432", "postgres"), targetsOn("10.0.0.2:5432", "postgres")...)
 	c.setSelection(true, true, 2, targets, nil, 0)
 	c.setDatabaseOutcome(targets[0].databaseRef, "")
@@ -566,7 +571,7 @@ func TestSameDatabaseNameOnTwoServersStaysApart(t *testing.T) {
 // TestExcludedSameNameOnTwoServersStaysApart is the same collision on the
 // exclusion family, which is keyed the same way.
 func TestExcludedSameNameOnTwoServersStaysApart(t *testing.T) {
-	c := newCoverageMetrics(nil)
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
 	c.setSelection(true, true, 4, targetsOn("10.0.0.1:5432", "app"), []databaseRef{
 		{server: "10.0.0.1:5432", datname: "scratch"},
 		{server: "10.0.0.2:5432", datname: "scratch"},
@@ -580,5 +585,172 @@ func TestExcludedSameNameOnTwoServersStaysApart(t *testing.T) {
 	}
 	if g["pg_exporter_databases_excluded"] != 2 {
 		t.Errorf("excluded count is %v, want 2", g["pg_exporter_databases_excluded"])
+	}
+}
+
+// TestLastSuccessSurvivesAFailingScrape is what the series exists for.
+//
+// The counts say what this scrape did. They cannot say how long a database has
+// been failing, and that is the first question an operator asks: a database
+// that failed once is a blip, and one that has not been collected for an hour
+// is an outage. The store is the process's, so the answer survives the
+// exporter the handler builds and throws away for each request.
+func TestLastSuccessSurvivesAFailingScrape(t *testing.T) {
+	store := lastsuccess.New()
+	target := scrapeTarget{
+		dsn:         "postgresql://u:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "1"},
+	}
+
+	// A scrape that worked.
+	working := newCoverageMetrics(nil, store, "exporter")
+	working.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	working.setDatabaseOutcome(target.databaseRef, "")
+	working.setOutcome(1, 0, 0)
+
+	first := gathered(t, working)
+	recorded := first["pg_exporter_database_last_success_timestamp_seconds"]
+	if recorded == 0 {
+		t.Fatalf("a successful scrape recorded no last success: %v", first)
+	}
+
+	// A later scrape that failed, from a fresh set of metrics, which is what
+	// the next request builds.
+	failing := newCoverageMetrics(nil, store, "exporter")
+	failing.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	failing.setDatabaseOutcome(target.databaseRef, reasonConnect)
+	failing.setOutcome(1, 1, 0)
+
+	second := gathered(t, failing)
+	if got := second["pg_exporter_database_scrape_success"]; got != 0 {
+		t.Errorf("the failing scrape reports success %v", got)
+	}
+	kept := second["pg_exporter_database_last_success_timestamp_seconds"]
+	if kept != recorded {
+		t.Errorf("the last success reads %v after a failing scrape, want the %v it recorded before",
+			kept, recorded)
+	}
+}
+
+// TestADatabaseNeverCollectedHasNoLastSuccess keeps the absent case absent. A
+// zero there says the database was last collected at the epoch, which is a
+// different claim from never having been collected.
+func TestADatabaseNeverCollectedHasNoLastSuccess(t *testing.T) {
+	target := scrapeTarget{
+		dsn:         "postgresql://u:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "1"},
+	}
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
+	c.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	c.setDatabaseOutcome(target.databaseRef, reasonConnect)
+	c.setOutcome(1, 1, 0)
+
+	for name := range series(t, c) {
+		if strings.HasPrefix(name, "pg_exporter_database_last_success_timestamp_seconds") {
+			t.Errorf("a database nothing has ever collected reports %s", name)
+		}
+	}
+}
+
+// TestOneJobDoesNotInheritAnothersLastSuccess is ChatGPT's case, found by
+// writing it against the draft.
+//
+// One store serves the built-in exporter and each custom-query resolution, and
+// they all reach the same database over the same connection. They succeed and
+// fail independently, so a key without the job lets an hourly job's success
+// answer for a five-second one that is failing.
+func TestOneJobDoesNotInheritAnothersLastSuccess(t *testing.T) {
+	store := lastsuccess.New()
+	target := scrapeTarget{
+		dsn:         "postgresql://u:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "1"},
+	}
+
+	hr := newCoverageMetrics(nil, store, "custom_query.hr")
+	hr.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	hr.setDatabaseOutcome(target.databaseRef, "")
+	hr.setOutcome(1, 0, 0)
+	if gathered(t, hr)["pg_exporter_database_last_success_timestamp_seconds"] == 0 {
+		t.Fatal("the high-resolution job recorded no success, so there is nothing for the other to inherit")
+	}
+
+	lr := newCoverageMetrics(nil, store, "custom_query.lr")
+	lr.setSelection(true, true, 1, []scrapeTarget{target}, nil, 0)
+	lr.setDatabaseOutcome(target.databaseRef, reasonConnect)
+	lr.setOutcome(1, 1, 0)
+
+	for name := range series(t, lr) {
+		if strings.HasPrefix(name, "pg_exporter_database_last_success_timestamp_seconds") {
+			t.Errorf("the low-resolution job never succeeded and reports %s", name)
+		}
+	}
+}
+
+// TestTwoTargetsOnOneDatabaseKeepSeparateLastSuccess is the other case ChatGPT
+// found: internal identity alone does not separate what is published.
+//
+// Two connections to the same database, which an operator configures to
+// monitor it as two roles. Both succeed, and the series have to be two, or one
+// connection's time is reported for the other and the registry keeps whichever
+// came last.
+func TestTwoTargetsOnOneDatabaseKeepSeparateLastSuccess(t *testing.T) {
+	store := lastsuccess.New()
+	first := scrapeTarget{
+		dsn:         "postgresql://a:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "1"},
+	}
+	second := scrapeTarget{
+		dsn:         "postgresql://b:p@h:5432/app",
+		databaseRef: databaseRef{server: "h:5432", datname: "app", identity: "2"},
+	}
+
+	c := newCoverageMetrics(nil, store, "exporter")
+	c.setSelection(true, true, 2, []scrapeTarget{first, second}, nil, 0)
+	c.setDatabaseOutcome(first.databaseRef, "")
+	c.setDatabaseOutcome(second.databaseRef, "")
+	c.setOutcome(2, 0, 0)
+
+	published := 0
+	for name := range series(t, c) {
+		if strings.HasPrefix(name, "pg_exporter_database_last_success_timestamp_seconds") {
+			published++
+		}
+	}
+	if published != 2 {
+		t.Errorf("two connections to one database published %d last-success series, want 2", published)
+	}
+}
+
+// TestLastSuccessSurvivesANameTheScrapeCannotResolve covers the scrape that
+// cannot say which database it is.
+//
+// Without discovery the name comes from the server, so a connection that fails
+// has nothing to ask. ChatGPT found the series missing entirely on that path.
+// What the connection last succeeded on is the database it belongs to.
+func TestLastSuccessSurvivesANameTheScrapeCannotResolve(t *testing.T) {
+	store := lastsuccess.New()
+	when := time.Now().Add(-time.Minute)
+	store.Record(lastsuccess.Key{Target: "1", Database: "root", Collector: "exporter"}, when)
+
+	// A target the scrape could not name, which is what a failed connection
+	// leaves behind.
+	unnamed := scrapeTarget{
+		dsn:         "postgresql://root:p@h:5432/?sslmode=disable",
+		databaseRef: databaseRef{server: "h:5432", identity: "1"},
+	}
+
+	c := newCoverageMetrics(nil, store, "exporter")
+	c.setSelection(true, true, 1, []scrapeTarget{unnamed}, nil, 0)
+	c.setDatabaseOutcome(unnamed.databaseRef, reasonConnect)
+	c.setOutcome(1, 1, 0)
+
+	got := series(t, c)
+	key := "pg_exporter_database_last_success_timestamp_seconds{datname=root,server=h:5432,target=1}"
+	value, ok := got[key]
+	if !ok {
+		t.Fatalf("a connection that failed lost the last success it had: %v", got)
+	}
+	if want := float64(when.UnixNano()) / 1e9; value != want {
+		t.Errorf("the last success reads %v, want the recorded %v", value, want)
 	}
 }

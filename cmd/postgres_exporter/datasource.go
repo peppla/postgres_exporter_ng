@@ -24,6 +24,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -48,6 +49,11 @@ const (
 type databaseRef struct {
 	server  string
 	datname string
+	// identity is the process's identity for the connection this database is
+	// reached over. The server label is host and port, which several targets
+	// share, so it cannot key anything remembered between scrapes. Empty for a
+	// database that was excluded, which is never connected to.
+	identity string
 }
 
 // scrapeTarget is one database the scrape will try to cover, and how to report
@@ -125,7 +131,7 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 		if err != nil {
 			level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
 		}
-		dsns[seed] = databaseRef{server: fingerprint}
+		dsns[seed] = databaseRef{server: fingerprint, identity: identityOf(seed)}
 
 		// If autoDiscoverDatabases is true, set first dsn as master database (Default: false)
 		e.masterDSN = dsn
@@ -143,7 +149,7 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 		}
 		d.discovered += len(catalog)
 		if name, found := currentName(catalog); found {
-			dsns[seed] = databaseRef{server: fingerprint, datname: name}
+			dsns[seed] = databaseRef{server: fingerprint, datname: name, identity: identityOf(seed)}
 		} else {
 			// The connection database is not in its own catalog. The query
 			// also filters out templates and databases this role has no
@@ -178,7 +184,7 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 				// just append new dbname to override.
 				dsn = fmt.Sprintf("%s dbname=%s", dsnConnstring, databaseName)
 			}
-			dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName}
+			dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: identityOf(dsn)}
 		}
 	}
 
@@ -191,6 +197,17 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 	sort.Slice(d.targets, func(i, j int) bool { return d.targets[i].dsn < d.targets[j].dsn })
 
 	return d
+}
+
+// identityOf returns this process's identity for a connection string, logging
+// the mapping the first time it is assigned so an operator can read which
+// connection an identity stands for.
+func identityOf(dsn string) string {
+	id, first := targetid.ID(dsn)
+	if first {
+		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(dsn))
+	}
+	return id
 }
 
 func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
@@ -218,7 +235,10 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 	return dbNames, nil
 }
 
-func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) error {
+// scrapeDSN collects one target. It writes the database name back into the
+// target once it knows it, so the caller can report that database's outcome:
+// without discovery the name is not known before the connection is open.
+func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target *scrapeTarget) error {
 	dsn := target.dsn
 	server, err := e.GetServer(e.ctx, dsn)
 	if err != nil {
@@ -286,19 +306,30 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target scrapeTarget) e
 	// that cannot be labelled is not a reason to collect nothing.
 	if server.datname == "" {
 		forSelection := serverNeedsDatabaseName(server)
-		if forSelection || serverCachesANamespace(server) {
+		// The freshness diagnostic needs the name too, and it is published for
+		// every database, not only the ones a query restricts itself to. Asked
+		// once: after the first success the store knows the name, and asking
+		// again would be a round trip per scrape for an answer already held.
+		remembered, _, known := e.lastSuccess.Latest(target.identity, e.collectorName)
+		if forSelection || serverCachesANamespace(server) || !known {
 			var name string
 			if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {
 				if forSelection {
 					return fmt.Errorf("could not determine the current database on %s, so queries restricted by database name could not run: %w", server, err)
 				}
-				level.Warn(logger).Log("msg", "Could not determine the current database, so cached namespaces are reported without one",
+				level.Warn(logger).Log("msg", "Could not determine the current database, so this scrape is reported without one",
 					"server", server, "err", err)
+				server.datname = remembered
 			} else {
 				server.datname = name
 			}
+		} else {
+			server.datname = remembered
 		}
 	}
+
+	// What the caller reports this target's outcome against.
+	target.datname = server.datname
 
 	return server.Scrape(e.ctx, ch, e.disableSettingsMetrics, e.queryCache, e.collectorName)
 }
