@@ -58,7 +58,15 @@ func querySettings(ctx context.Context, ch chan<- prometheus.Metric, server *Ser
 			return fmt.Errorf("Error retrieving rows on %q: %s %v", server, namespace, err)
 		}
 
-		ch <- s.metric(server.labels)
+		metric, err := s.metric(server.labels)
+		if err != nil {
+			// One setting, not the whole view. The rest of pg_settings is
+			// readable and an operator losing all of it over one row would
+			// learn less, not more.
+			level.Warn(logger).Log("msg", "Skipping a setting that cannot be published", "err", err)
+			continue
+		}
+		ch <- metric
 	}
 
 	// Next stops on error exactly as it stops at the end of the rows, so
@@ -76,7 +84,14 @@ type pgSetting struct {
 	name, setting, unit, shortDesc, vartype string
 }
 
-func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
+// metric turns one pg_settings row into a metric, or says why it cannot.
+//
+// It used to panic on three things: a unit it did not recognise, a vartype the
+// query does not ask for, and a descriptor the registry refuses. All three come
+// from the server rather than from this exporter, and a panic here is a panic
+// in a scrape worker, where nothing recovers it. A setting the exporter cannot
+// read is one missing metric, not a reason to stop the process.
+func (s *pgSetting) metric(labels prometheus.Labels) (prometheus.Metric, error) {
 	var (
 		err       error
 		name      = strings.ReplaceAll(s.name, ".", "_")
@@ -93,9 +108,7 @@ func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
 		}
 	case "integer", "real":
 		if val, unit, err = s.normaliseUnit(); err != nil {
-			// Panic, since we should recognise all units
-			// and don't want to silently exlude metrics
-			panic(err)
+			return nil, fmt.Errorf("setting %q: %w", s.name, err)
 		}
 
 		if len(unit) > 0 {
@@ -103,12 +116,15 @@ func (s *pgSetting) metric(labels prometheus.Labels) prometheus.Metric {
 			shortDesc = fmt.Sprintf("%s [Units converted to %s.]", shortDesc, unit)
 		}
 	default:
-		// Panic because we got a type we didn't ask for
-		panic(fmt.Sprintf("Unsupported vartype %q", s.vartype))
+		return nil, fmt.Errorf("setting %q has the unsupported vartype %q", s.name, s.vartype)
 	}
 
 	desc := newDesc(subsystem, name, shortDesc, labels)
-	return prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
+	metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, val)
+	if err != nil {
+		return nil, fmt.Errorf("setting %q cannot be published: %w", s.name, err)
+	}
+	return metric, nil
 }
 
 // Removes units from any of the setting values.

@@ -2586,6 +2586,72 @@ role_targets:
 			labelValues(served, "pg_exporter_namespace_cache_age_seconds", "usename")))
 }
 
+// TestABadLabelNameDoesNotStopTheExporter is the production-path half of the
+// label-error correction.
+//
+// The unit cases show the namespace failing instead of panicking. What this
+// adds is that the process is still there afterwards and still serves: a panic
+// in a scrape worker ends the test binary, so a second scrape returning a
+// valid answer is the evidence that the first did not.
+//
+// Both inputs are ordinary editing mistakes in a query file. ChatGPT measured
+// each one ending the merged binary with exit 2.
+func (s *IntegrationSuite) TestABadLabelNameDoesNotStopTheExporter(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+	configured := strings.Split(dsn, ",")[0]
+
+	dir := c.MkDir()
+	path := filepath.Join(dir, "labels.yaml")
+	write := func(label string) {
+		c.Assert(os.WriteFile(path, []byte(`
+label_probe:
+  query: "SELECT 'a_value'::text AS `+label+`, 42::float8 AS value"
+  metrics:
+    - `+label+`: {usage: "LABEL", description: "A label the file names"}
+    - value: {usage: "GAUGE", description: "A value"}
+`), 0o600), IsNil)
+	}
+	restore := withQueryDirectory(c, LR, dir)
+	defer restore()
+
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{configured},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(),
+		dbselect.Absent(), dbselect.Absent())
+
+	scrape := func() (int, string) {
+		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr&collect[]=exporter", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	for _, label := range []string{"__tenant", "server"} {
+		write(label)
+		code, body := scrape()
+		// Reaching this line at all is the point: the handler returned.
+		c.Check(code, Equals, 200, Commentf("%s: the response was %d", label, code))
+		c.Check(strings.Contains(body, "label_probe_value"), Equals, false,
+			Commentf("%s: the namespace published a sample it cannot label", label))
+		// And the failure is reported rather than passed over.
+		c.Check(sampleValueOf(c, body, "pg_exporter_databases_failed"), Equals, float64(1),
+			Commentf("%s: the scrape reported no failure", label))
+	}
+
+	// A valid label after both, which shows the exporter is still working and
+	// that the refusals above were about the labels rather than the file.
+	write("tenant")
+	code, body := scrape()
+	c.Check(code, Equals, 200)
+	value, _ := sampleValue(c, body, "label_probe_value")
+	c.Check(value, Equals, float64(42),
+		Commentf("the exporter did not recover from the two refused labels"))
+	c.Check(sampleValueOf(c, body, "pg_exporter_databases_failed"), Equals, float64(0),
+		Commentf("a valid query file still reports a failure"))
+}
+
 // TestTwoSearchPathsOnOneDatabaseAreTwoCollections covers the connection
 // context that no name in the series can carry.
 //
