@@ -3119,16 +3119,23 @@ func (s *IntegrationSuite) TestClusterOnlyScrapeCoversNoDatabases(c *C) {
 	c.Assert(sampleValueOf(c, body, selected), Equals, float64(len(catalog)),
 		Commentf("the database group selected %v of %d databases", sampleValueOf(c, body, selected), len(catalog)))
 
-	// Cluster-scoped collectors only. Discovery still ran and still reports
-	// what it found, because that is the server's inventory and not this
-	// request's intent.
+	// Cluster-scoped collectors only. No database-local work, so no set of
+	// databases to cover, and the catalogue is not read at all: an inventory
+	// is not part of every cluster-only profile, and reporting one here would
+	// mean a query nothing asked for.
 	code, body = scrapeWith(dsn, "postgres.cluster")
 	c.Assert(code, Equals, 200)
-	c.Check(sampleValueOf(c, body, discovered), Equals, float64(len(catalog)),
-		Commentf("the cluster group stopped reporting the databases the server has"))
 	c.Check(sampleValueOf(c, body, selected), Equals, float64(0),
 		Commentf("a scrape that selected no database-scoped collector reported %v databases selected",
 			sampleValueOf(c, body, selected)))
+	// Not asked for is neither known nor unknown, so neither is published. A
+	// zero would invent a server with no databases and a one would claim a
+	// catalogue nobody read. Whether the query ran is checked where it can be
+	// checked, in collector/collect_scope_execution_test.go.
+	c.Check(hasFamily(body, discovered), Equals, false,
+		Commentf("the cluster group published a discovered total"))
+	c.Check(hasFamily(body, "pg_collector_database_discovery_success"), Equals, false,
+		Commentf("the cluster group reported on a discovery it never attempted"))
 }
 
 // sampleValueOf reads the value of a family's one sample, and fails when the
