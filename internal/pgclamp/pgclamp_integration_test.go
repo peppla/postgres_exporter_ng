@@ -289,6 +289,24 @@ func TestStrictRoleSurvivesALooserConnectionString(t *testing.T) {
 			wantStatement: 100, wantLock: 20,
 		},
 		{
+			// The server normalises setting names, so these reach a session
+			// exactly as the canonical spelling does. Matching only the
+			// lowercase underscore form let all three through.
+			name:          "options in upper case",
+			suffix:        "&options=-c%20STATEMENT_TIMEOUT%3D0%20-c%20LOCK_TIMEOUT%3D0",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "options written with dashes",
+			suffix:        "&options=--statement-timeout%3D0%20--lock-timeout%3D0",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
+			name:          "startup parameters in upper case",
+			suffix:        "&STATEMENT_TIMEOUT=0&LOCK_TIMEOUT=0",
+			wantStatement: 100, wantLock: 20,
+		},
+		{
 			// A client asking for less than everything else gets it. The
 			// ceiling only ever tightens, and so does the client.
 			name:          "options asking for less than the role",

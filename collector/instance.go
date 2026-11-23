@@ -103,10 +103,11 @@ func (i *instance) getDB() *sql.DB {
 // Close releases the connection, if there is one.
 //
 // setup clears db when it fails, so an instance that never connected has
-// nothing to close. Closing it anyway dereferenced a nil handle and crashed
-// the process: a probe against a target that refused the connection returned
-// RemoteDisconnected to the client and panicked the server on the way out.
-// A failure to connect is an ordinary outcome and has to be reported as one.
+// nothing to close. Closing it anyway dereferenced a nil handle and panicked
+// the handler: a probe against a target that refused the connection lost its
+// response and the client saw the connection drop. net/http recovers a
+// handler panic, so the process stayed up and later scrapes worked, but a
+// failure to connect is an ordinary outcome and has to be reported as one.
 func (i *instance) Close() error {
 	if i.db == nil {
 		return nil

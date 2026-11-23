@@ -35,7 +35,9 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -58,28 +60,91 @@ const clampQuery = `SELECT set_config($1,
 		LEAST(NULLIF(setting::bigint, 0), NULLIF($2::bigint, 0), NULLIF($3::bigint, 0))::text, false)
 	FROM pg_catalog.pg_settings WHERE name = $1`
 
-// Connector wraps a driver connector and applies the ceilings to each new
-// connection.
+// Connector opens connections with bounded startup and clamped ceilings.
+//
+// It holds the configuration rather than a built connector, because the
+// startup bound and the socket that carries it belong to one attempt. A
+// connector shared across attempts cannot be given a dialer for one of them.
 type Connector struct {
-	inner     driver.Connector
-	statement time.Duration
-	lock      time.Duration
+	cfg            pq.Config
+	statement      time.Duration
+	lock           time.Duration
+	connectCeiling time.Duration
 	// asked is what the connection string wanted, taken out of the string
 	// before connecting so that a looser client value cannot replace a
 	// stricter role setting before this package reads it.
 	asked config.TimeoutOverrides
 }
 
-// Wrap returns a connector that clamps every connection it opens.
+// Wrap returns a connector that bounds and clamps every connection it opens.
 //
 // A zero duration leaves that setting alone, which is what an operator asking
 // for no ceiling gets.
-func Wrap(inner driver.Connector, statement, lock time.Duration, asked config.TimeoutOverrides) *Connector {
-	return &Connector{inner: inner, statement: statement, lock: lock, asked: asked}
+func Wrap(cfg pq.Config, statement, lock, connect time.Duration, asked config.TimeoutOverrides) *Connector {
+	return &Connector{cfg: cfg, statement: statement, lock: lock, connectCeiling: connect, asked: asked}
 }
 
 // Driver implements driver.Connector.
-func (c *Connector) Driver() driver.Driver { return c.inner.Driver() }
+func (c *Connector) Driver() driver.Driver { return &pq.Driver{} }
+
+// holdingDialer remembers the socket it dialled so the attempt that owns it
+// can be ended from outside.
+//
+// This is the cancellation hook the driver does not provide. Its startup
+// handshake is a blocking read on this socket, and closing the socket is what
+// makes that read return. Abandoning the goroutine instead left the socket
+// open after the collection had finished and its connection permit had been
+// given back, so four sequential scrapes against a server that never answers
+// held four connections with a configured limit of one.
+type holdingDialer struct {
+	mtx    sync.Mutex
+	conn   net.Conn
+	closed bool
+}
+
+func (d *holdingDialer) keep(conn net.Conn, err error) (net.Conn, error) {
+	if err != nil {
+		return conn, err
+	}
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
+	if d.closed {
+		// The attempt was already given up on, so this socket is nobody's.
+		_ = conn.Close()
+		return nil, errAttemptAbandoned
+	}
+	d.conn = conn
+	return conn, nil
+}
+
+// abandon closes the socket, which ends the handshake the driver is waiting
+// on. Safe to call more than once and before anything has been dialled.
+func (d *holdingDialer) abandon() {
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
+	d.closed = true
+	if d.conn != nil {
+		_ = d.conn.Close()
+		d.conn = nil
+	}
+}
+
+func (d *holdingDialer) Dial(network, address string) (net.Conn, error) {
+	return d.keep(net.Dial(network, address))
+}
+
+func (d *holdingDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	return d.keep(net.DialTimeout(network, address, timeout))
+}
+
+func (d *holdingDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	return d.keep(dialer.DialContext(ctx, network, address))
+}
+
+// errAttemptAbandoned is returned to the driver when its socket was taken
+// away because the caller's budget ran out.
+var errAttemptAbandoned = errors.New("the connection attempt was abandoned because the request budget expired")
 
 // Connect opens a connection and lowers its ceilings before handing it over.
 //
@@ -112,25 +177,47 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	return conn, nil
 }
 
-// connect opens the connection and gives up when the caller's context does.
+// connect opens the connection, bounded by the caller's budget.
 //
-// The driver bounds its own startup with a whole number of seconds, so a
-// quarter-second request still waited a full second for a server that accepts
-// a socket and never speaks. Worse, the context it is handed does not reach
-// its handshake at all. Running the attempt alongside the context and
-// abandoning it is the only bound that matches what was asked for.
-//
-// An abandoned attempt is closed when it eventually finishes, rather than
-// left to the garbage collector, because until then it is a connection on the
-// server that this process is not counting.
+// The bound has two parts. The driver is given a connect_timeout no longer
+// than what is left, as a real duration rather than a whole number of
+// seconds. And the socket is held by a dialer this function can reach, so
+// when the budget runs out the socket is closed, the handshake ends and the
+// attempt returns. The function waits for that to happen before returning, so
+// nothing it started is still running when its caller releases a connection
+// permit.
 func (c *Connector) connect(ctx context.Context) (driver.Conn, error) {
+	// Nothing to spend. Starting an attempt here would take a connection and
+	// a server backend for a result that cannot be used.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	cfg := c.cfg
+	if c.connectCeiling > 0 && (cfg.ConnectTimeout <= 0 || cfg.ConnectTimeout > c.connectCeiling) {
+		cfg.ConnectTimeout = c.connectCeiling
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 &&
+			(cfg.ConnectTimeout <= 0 || cfg.ConnectTimeout > remaining) {
+			cfg.ConnectTimeout = remaining
+		}
+	}
+
+	inner, err := pq.NewConnectorConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &holdingDialer{}
+	inner.Dialer(dialer)
+
 	type attempt struct {
 		conn driver.Conn
 		err  error
 	}
 	done := make(chan attempt, 1)
 	go func() {
-		conn, err := c.inner.Connect(ctx)
+		conn, err := inner.Connect(ctx)
 		done <- attempt{conn, err}
 	}()
 
@@ -138,16 +225,15 @@ func (c *Connector) connect(ctx context.Context) (driver.Conn, error) {
 	case a := <-done:
 		return a.conn, a.err
 	case <-ctx.Done():
-		go func() {
-			a := <-done
-			// Only a successful attempt has anything to close. A failed one
-			// can carry a typed nil inside a non-nil interface, which is not
-			// nil to compare against and panics when closed. That is the same
-			// shape as the probe cleanup crash, and it bit here too.
-			if a.err == nil && a.conn != nil {
-				_ = a.conn.Close()
-			}
-		}()
+		// End the attempt rather than leave it running, then wait for it.
+		dialer.abandon()
+		a := <-done
+		// A failed attempt can carry a nil connection inside a non-nil
+		// interface, which is not nil to compare against and panics when
+		// closed.
+		if a.err == nil && a.conn != nil {
+			_ = a.conn.Close()
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -175,14 +261,6 @@ func clamp(ctx context.Context, conn driver.Conn, name string, value time.Durati
 		return err
 	}
 	return rows.Close()
-}
-
-// Open returns a database handle whose connections carry the ceilings.
-//
-// It takes the connector rather than building one, so the caller decides how
-// the connection string is parsed and this package stays about the ceilings.
-func Open(inner driver.Connector, statement, lock time.Duration, asked config.TimeoutOverrides) *sql.DB {
-	return sql.OpenDB(Wrap(inner, statement, lock, asked))
 }
 
 // The ceilings every connection in this process gets.
@@ -237,13 +315,5 @@ func OpenDSN(dsn string) (*sql.DB, error) {
 		return nil, err
 	}
 	statement, lock, connect := Defaults()
-	if connect > 0 && (cfg.ConnectTimeout <= 0 || cfg.ConnectTimeout > connect) {
-		cfg.ConnectTimeout = connect
-	}
-
-	connector, err := pq.NewConnectorConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return Open(connector, statement, lock, asked), nil
+	return sql.OpenDB(Wrap(cfg, statement, lock, connect, asked)), nil
 }

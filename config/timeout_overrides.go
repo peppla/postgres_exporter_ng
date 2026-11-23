@@ -56,7 +56,19 @@ var overrideSettings = []string{"statement_timeout", "lock_timeout"}
 
 // optionSetting matches one setting inside an options string, in either of the
 // forms libpq accepts.
-var optionSetting = regexp.MustCompile(`(?:^|\s)(?:-c\s*|--)([a-zA-Z_]+)=(\S+)`)
+//
+// The name may use dashes where the setting uses underscores, and may be in
+// any case, because the server normalises both. Matching only the lowercase
+// underscore spelling let STATEMENT_TIMEOUT and --statement-timeout through,
+// and each of those reaches the session exactly as the canonical spelling
+// does.
+var optionSetting = regexp.MustCompile(`(?:^|\s)(?:-c\s*|--)([a-zA-Z_-]+)=(\S+)`)
+
+// settingName normalises a setting name the way the server does, so the
+// spellings it accepts are all recognised here.
+func settingName(name string) string {
+	return strings.ToLower(strings.ReplaceAll(name, "-", "_"))
+}
 
 // StripTimeoutOverrides removes the statement and lock timeouts from a
 // connection string and reports what it had asked for.
@@ -73,25 +85,27 @@ func StripTimeoutOverrides(in string) (string, TimeoutOverrides, error) {
 		parsed.query = url.Values{}
 	}
 
-	// As connection parameters of their own.
-	for _, name := range overrideSettings {
-		value := parsed.query.Get(name)
-		if value == "" {
+	// As connection parameters of their own, in whatever spelling. The query
+	// is walked rather than asked for each name, because Get matches exactly
+	// and the server does not.
+	for key, values := range parsed.query {
+		name := settingName(key)
+		if !isOverrideSetting(name) || len(values) == 0 || values[0] == "" {
 			continue
 		}
-		ms, perr := durationSettingMS(value)
+		ms, perr := durationSettingMS(values[0])
 		if perr != nil {
-			return "", asked, fmt.Errorf("%s=%q in the connection string: %w", name, value, perr)
+			return "", asked, fmt.Errorf("%s=%q in the connection string: %w", key, values[0], perr)
 		}
 		asked.set(name, ms)
-		parsed.query.Del(name)
+		parsed.query.Del(key)
 	}
 
 	// And inside options, where what is left has to keep working.
 	if options := parsed.query.Get("options"); options != "" {
 		kept := options
 		for _, m := range optionSetting.FindAllStringSubmatch(options, -1) {
-			whole, name, value := m[0], m[1], m[2]
+			whole, name, value := m[0], settingName(m[1]), m[2]
 			if !isOverrideSetting(name) {
 				continue
 			}
