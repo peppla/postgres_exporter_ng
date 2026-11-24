@@ -108,18 +108,24 @@ func stubServer(t *testing.T, expect func(n int, mock sqlmock.Sqlmock)) func() [
 	}
 }
 
-// catalogueOf gives the control connection the version lookup and a catalogue
-// holding the named databases, and every other connection a ping.
+// catalogueOf gives every connection the version lookup and a catalogue holding
+// the named databases.
 //
 // current is the database the connection is on, which the catalogue reports as
 // its own row rather than leaving out. others are the remaining databases on
 // the server.
+//
+// Every connection, not only the first. A fan-out connection reaches neither
+// query, and an unmatched expectation costs nothing here because these mocks
+// are not checked for completeness. Giving them only to the first connection
+// made the set depend on which connection opened first, so two scrapes at once
+// left the loser's control connection without a version lookup: its setup
+// failed, it took the control-failure path, and it recorded nothing. The
+// version cache hid that most of the time, because a connection that opened
+// after the first one cached the version skips the query altogether.
 func catalogueOf(current string, others ...string) func(int, sqlmock.Sqlmock) {
-	return func(n int, mock sqlmock.Sqlmock) {
+	return func(_ int, mock sqlmock.Sqlmock) {
 		mock.ExpectPing()
-		if n > 0 {
-			return
-		}
 		mock.ExpectQuery("SELECT version").WillReturnRows(
 			sqlmock.NewRows([]string{"version"}).AddRow("PostgreSQL 18.0 on x86_64-pc-linux-gnu"))
 		rows := sqlmock.NewRows([]string{"datname", "is_current"}).AddRow(current, true)
