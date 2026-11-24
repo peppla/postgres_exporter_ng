@@ -70,7 +70,7 @@ var (
 	)
 	collectorDatabaseLastSuccessDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_last_success_timestamp_seconds"),
-		"When every database-local collector last ran on this database without error in one scrape, as seconds since the epoch. The per-collector series beside this one answers a narrower question: this says the database as a whole was covered. Absent for a database this process has never covered completely, which is not the same as one it last covered at the epoch. Only a request that selected every database-local collector can set it, because a request that selected some has not shown the rest would have worked. The target label is this process's identity for the connection; it is not stable across restarts.",
+		"When the database-local collectors this request selected last all ran on this database without error in one scrape, as seconds since the epoch. The selection is part of what is remembered, not a label: a request that asks for a subset gets the time that subset last completed, and cannot read or move the time a different selection completed. So two scrape jobs with different collect[] sets each see their own, separated by their own target labels. Absent for a selection this process has never completed here, which is not the same as one completed at the epoch. The target label is this process's identity for the connection; it is not stable across restarts.",
 		[]string{"datname", "target"},
 		nil,
 	)
@@ -490,12 +490,11 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// database this scrape covered.
 	control := sel.controlTarget()
 	controlLocal := control != nil && !control.skipDatabaseLocal
-	// Whether this request asked for every database-local collector the engine
-	// has enabled. A request that named some cannot set the database-level
-	// freshness time, because it has not shown that the rest would have
-	// worked. Compared by count: a request can only narrow the enabled set,
-	// never add to it, so equal counts mean the same set.
-	wholeSet := len(local) == len(DatabaseScopedCollectors())
+	// The selection this request made, which is the context its database-level
+	// freshness belongs to. A narrow request records and reads its own, so it
+	// neither claims a wider selection's coverage nor goes without a time of
+	// its own.
+	selection := selectionOf(local)
 	controlBegin := time.Now()
 	var controlSucceeded atomic.Int32
 	if controlLocal {
@@ -534,10 +533,10 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	if controlLocal {
 		controlTarget, _ := targetid.ID(inst.dsn)
-		if controlFailed == 0 && wholeSet {
-			p.lastSuccess.Record(databaseKey(controlTarget, upName), controlBegin)
+		if controlFailed == 0 {
+			p.lastSuccess.Record(databaseKey(controlTarget, upName, selection), controlBegin)
 		}
-		p.publishDatabaseFreshness(ch, controlTarget, upName)
+		p.publishDatabaseFreshness(ch, controlTarget, upName, selection)
 	}
 
 	if !databaseLocal {
@@ -562,7 +561,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		fanout.Add(1)
 		go func(t dbTarget) {
 			defer fanout.Done()
-			switch p.collectDatabase(ch, t, local, inst.name, wholeSet) {
+			switch p.collectDatabase(ch, t, local, inst.name, selection) {
 			case outcomeDeferred:
 				deferred.Add(1)
 			case outcomeFailed:
@@ -602,13 +601,13 @@ const (
 // A database that cannot be opened reports database_up 0 and nothing else. The
 // alternative is emitting no series for it at all, which reads the same as a
 // database that was never selected.
-func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string, wholeSet bool) databaseOutcome {
+func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server, selection string) databaseOutcome {
 	target, _ := targetid.ID(t.dsn)
 	fail := func(reason string) {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, t.datname, reason)
 		p.publishRetained(ch, local, target, t.datname)
-		p.publishDatabaseFreshness(ch, target, t.datname)
+		p.publishDatabaseFreshness(ch, target, t.datname, selection)
 	}
 	if !p.acquire() {
 		// Deferred, not failed. Nothing was connected to and nothing was
@@ -620,7 +619,7 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
 			server, t.datname, dbselect.ReasonNoPermit)
 		p.publishRetained(ch, local, target, t.datname)
-		p.publishDatabaseFreshness(ch, target, t.datname)
+		p.publishDatabaseFreshness(ch, target, t.datname, selection)
 		return outcomeDeferred
 	}
 	defer p.release()
@@ -658,13 +657,11 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 	wg.Wait()
 	if int(succeeded.Load()) != len(local) {
 		reportIncompleteDatabase(ch, server, t.datname)
-		p.publishDatabaseFreshness(ch, target, t.datname)
+		p.publishDatabaseFreshness(ch, target, t.datname, selection)
 		return outcomeFailed
 	}
-	if wholeSet {
-		p.lastSuccess.Record(databaseKey(target, t.datname), begin)
-	}
-	p.publishDatabaseFreshness(ch, target, t.datname)
+	p.lastSuccess.Record(databaseKey(target, t.datname, selection), begin)
+	p.publishDatabaseFreshness(ch, target, t.datname, selection)
 	return outcomeScraped
 }
 
@@ -698,7 +695,7 @@ func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, 
 			// The connection string does not name it and the connection is
 			// not open, so the database this collector last succeeded on is
 			// the only name there is.
-			if recorded, _, ok := p.lastSuccess.Latest(lastsuccess.EngineCollector, target, name); ok {
+			if recorded, _, ok := p.lastSuccess.Latest(lastsuccess.EngineCollector, lastsuccess.OneCollector, target, name); ok {
 				database = recorded
 			}
 		}
@@ -712,32 +709,44 @@ func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, 
 		p.publishRetainedOne(ch, target, database, name)
 	}
 
-	// The database as a whole, resolved the same way and gated the same way.
-	// A request that selected no database-local collector asked nothing about
-	// database-local freshness, so nothing is said about it.
-	if len(local) == 0 {
+	// The database as a whole, resolved the same way and gated the same way,
+	// and only for the selection this request made. A request that selected no
+	// database-local collector asked nothing about database-local freshness,
+	// and one that selected a different set is not answered by another set's
+	// record.
+	selection := selectionOf(local)
+	if selection == "" {
 		return
 	}
 	database := controlName
 	if database == "" {
-		if recorded, _, ok := p.lastSuccess.Latest(lastsuccess.EngineCollector, target, lastsuccess.WholeDatabase); ok {
+		if recorded, _, ok := p.lastSuccess.Latest(lastsuccess.EngineCollector, lastsuccess.WholeSelection, target, selection); ok {
 			database = recorded
 		}
 	}
 	if database != "" && p.controlSelected(database) {
-		p.publishDatabaseFreshness(ch, target, database)
+		p.publishDatabaseFreshness(ch, target, database, selection)
 	}
 }
 
 // databaseKey is what this engine remembers a complete database collection
-// under: the connection and the database, with no collector, because the
-// record is about the database rather than about one collector in it.
-func databaseKey(target, datname string) lastsuccess.Key {
+// under: the connection, the database, and the selection that completed.
+//
+// The selection is part of the key because a request that asks for some
+// collectors has not shown the rest would have worked. Keyed only by database,
+// one shared record would let a narrow request answer for a wide one: an
+// earlier wide success would be republished under a narrow request that never
+// checked most of it, so the series would look answered while going stale. An
+// installation that runs two collect[] profiles at different intervals never
+// requests the whole enabled set at all, so a rule written against that set
+// leaves it with no time ever.
+func databaseKey(target, datname, selection string) lastsuccess.Key {
 	return lastsuccess.Key{
 		Engine:    lastsuccess.EngineCollector,
+		About:     lastsuccess.WholeSelection,
 		Target:    target,
 		Database:  datname,
-		Collector: lastsuccess.WholeDatabase,
+		Collector: selection,
 	}
 }
 
@@ -748,11 +757,11 @@ func databaseKey(target, datname string) lastsuccess.Key {
 // that is failing now is exactly the one whose last complete collection an
 // operator wants the time of, and a series that disappears then disappears
 // when it matters most.
-func (p PostgresCollector) publishDatabaseFreshness(ch chan<- prometheus.Metric, target, datname string) {
-	if datname == "" {
+func (p PostgresCollector) publishDatabaseFreshness(ch chan<- prometheus.Metric, target, datname, selection string) {
+	if datname == "" || selection == "" {
 		return
 	}
-	if when, ok := p.lastSuccess.At(databaseKey(target, datname)); ok {
+	if when, ok := p.lastSuccess.At(databaseKey(target, datname, selection)); ok {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseLastSuccessDesc, prometheus.GaugeValue,
 			float64(when.UnixNano())/1e9, datname, target)
 	}
@@ -801,6 +810,22 @@ func (p PostgresCollector) byScope() (cluster, local map[string]Collector) {
 		cluster[name] = c
 	}
 	return cluster, local
+}
+
+// selectionOf is the canonical form of the database-local collectors a request
+// selected, which is the context its database-level freshness belongs to.
+//
+// Empty when nothing database-local was selected, which is the one case with no
+// context to record against: such a request asked about no database.
+func selectionOf(local map[string]Collector) string {
+	if len(local) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(local))
+	for name := range local {
+		names = append(names, name)
+	}
+	return lastsuccess.Selection(names)
 }
 
 func (p PostgresCollector) acquire() bool {

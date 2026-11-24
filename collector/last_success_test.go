@@ -171,12 +171,12 @@ func TestLastSuccessSurvivesPathsThatRunNoCollector(t *testing.T) {
 			cancel()
 			p.ctx = cancelled
 			p.connSema = semaphore.NewWeighted(1)
-			p.collectDatabase(ch, dbTarget{datname: "app", dsn: dsn}, local, "127.0.0.1:1", true)
+			p.collectDatabase(ch, dbTarget{datname: "app", dsn: dsn}, local, "127.0.0.1:1", selectionOf(local))
 		}},
 		{"a database that cannot be connected to", func(p PostgresCollector, ch chan<- prometheus.Metric) {
 			// No semaphore, so the permit is free and the connection itself is
 			// what fails.
-			p.collectDatabase(ch, dbTarget{datname: "app", dsn: dsn}, local, "127.0.0.1:1", true)
+			p.collectDatabase(ch, dbTarget{datname: "app", dsn: dsn}, local, "127.0.0.1:1", selectionOf(local))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

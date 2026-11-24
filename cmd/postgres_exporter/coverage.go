@@ -233,7 +233,7 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 			// database the freshness diagnostic belongs to, and dropping the
 			// series exactly when the connection breaks drops it when it
 			// matters most.
-			if database, when, ok := c.lastSuccess.Latest(lastsuccess.EngineQuery, t.identity, c.job); ok {
+			if database, when, ok := c.lastSuccess.Latest(lastsuccess.EngineQuery, lastsuccess.OneCollector, t.identity, c.job); ok {
 				c.databaseLastSuccess.WithLabelValues(t.server, database, t.identity).
 					Set(float64(when.UnixNano()) / 1e9)
 			}

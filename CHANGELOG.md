@@ -63,10 +63,12 @@
   `pg_exporter_database_last_success_timestamp_seconds` and
   `pg_collector_database_last_success_timestamp_seconds`, and the namespaced
   collectors report per collector as well in
-  `pg_collector_last_success_timestamp_seconds`. Only a request that selected
-  every database-local collector sets the collector engine's database-level
-  time, because a request that selected some has not shown the rest would have
-  worked.
+  `pg_collector_last_success_timestamp_seconds`. The collector engine's
+  database-level time belongs to the selection the request made: a scrape that
+  asks for a subset of collectors gets the time that subset last completed, and
+  cannot read or move the time another selection completed. Two scrape jobs
+  with different `collect[]` sets therefore each see their own, separated by
+  their own target labels rather than by a label on the metric.
 
   Read these rather than `pg_up` to tell whether a scrape covered what it
   intended. `pg_up` reports whether connections worked, not whether collection
