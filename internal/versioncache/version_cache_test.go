@@ -140,8 +140,10 @@ func TestGetVersionStopsWaitingWhenTheContextExpires(t *testing.T) {
 	const server = "slow:5432"
 	holding := make(chan struct{})
 	release := make(chan struct{})
+	finished := make(chan struct{})
 
 	go func() {
+		defer close(finished)
 		_, _, _ = GetVersion(context.Background(), nil, server,
 			func(ctx context.Context, _ *sql.DB, _ string) (semver.Version, string, error) {
 				close(holding)
@@ -150,7 +152,14 @@ func TestGetVersionStopsWaitingWhenTheContextExpires(t *testing.T) {
 			})
 	}()
 	<-holding
-	defer close(release)
+
+	// Released, then waited for, as in the test below. This goroutine is
+	// inside GetVersion reading the clock hook, and the next test writes that
+	// hook as it starts.
+	defer func() {
+		close(release)
+		<-finished
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -185,9 +194,19 @@ func TestGetVersionDoesNotSerialiseAcrossServers(t *testing.T) {
 
 	holding := make(chan struct{})
 	release := make(chan struct{})
-	defer close(release)
+	finished := make(chan struct{})
+
+	// Released, then waited for. This goroutine sits inside GetVersion, which
+	// reads the clock hook, and the next test writes that hook as it starts.
+	// A test that returns while the goroutine is still running leaves a race
+	// for whichever test runs next, which is where it gets reported.
+	defer func() {
+		close(release)
+		<-finished
+	}()
 
 	go func() {
+		defer close(finished)
 		_, _, _ = GetVersion(context.Background(), nil, "slow:5432",
 			func(context.Context, *sql.DB, string) (semver.Version, string, error) {
 				close(holding)

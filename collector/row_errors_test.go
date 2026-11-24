@@ -21,6 +21,8 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -28,6 +30,24 @@ import (
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// probeSeq numbers the hosts unseenHost hands out.
+var probeSeq atomic.Int64
+
+// unseenHost returns a connection string for a server nothing has probed.
+//
+// A collector that asks which distribution it is talking to caches the answer
+// for the life of the process, by host and port. A test reusing a host is
+// answered from that cache instead of asking, so the expectation standing
+// ready for the probe is never reached and the collector's first real query is
+// matched against it. The result is a row error reported as a query mismatch,
+// on the second run and not the first.
+//
+// A counter rather than the test's name, because -count runs the same name
+// several times in one process.
+func unseenHost(role string) string {
+	return fmt.Sprintf("postgres://u:p@%s-%d:5432/d", role, probeSeq.Add(1))
+}
 
 // errRowFailure stands in for a query that dies partway through its rows: a
 // cancelled scrape, a dropped connection, a server shutting down.
@@ -150,7 +170,7 @@ func TestCollectorsReportRowErrors(t *testing.T) {
 				},
 			},
 			build: factory(NewPGStatWalReceiverCollector),
-			dsn:   "postgres://u:p@walreceiver-rows:5432/d",
+			dsn:   unseenHost("walreceiver-rows"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,7 +251,7 @@ func TestWalReceiverProbeReportsRowErrors(t *testing.T) {
 
 	ch, wait := drainMetrics()
 	err = factory(NewPGStatWalReceiverCollector)().Update(context.Background(),
-		&instance{db: db, dsn: "postgres://u:p@walreceiver-probe:5432/d"}, ch)
+		&instance{db: db, dsn: unseenHost("walreceiver-probe")}, ch)
 	wait()
 
 	if !errors.Is(err, errRowFailure) {
