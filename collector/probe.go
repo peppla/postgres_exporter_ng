@@ -104,7 +104,10 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	wg.Add(len(pc.collectors))
 	for name, c := range pc.collectors {
 		go func(name string, c Collector) {
-			execute(pc.ctx, name, c, pc.instance, ch, pc.logger, "")
+			// No store: the probe endpoint collects one target named in the
+			// request, so there is nothing for a process-owned record to
+			// belong to between requests.
+			execute(pc.ctx, name, c, pc.instance, ch, pc.logger, "", nil)
 			wg.Done()
 		}(name, c)
 	}

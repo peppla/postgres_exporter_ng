@@ -27,6 +27,8 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -58,6 +60,12 @@ var (
 		prometheus.BuildFQName(namespace, "scrape", "collector_duration_seconds"),
 		"postgres_exporter: Duration of a collector scrape. datname is the database a database-local collector ran against, and is empty for a cluster-wide collector.",
 		[]string{"collector", "datname"},
+		nil,
+	)
+	collectorLastSuccessDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "last_success_timestamp_seconds"),
+		"When this collector last ran on this database without error, as seconds since the epoch. Absent for a collector this process has never run successfully there, which is not the same as one that last succeeded at the epoch. The target label is this process's identity for the connection; it is not stable across restarts. datname is empty for a cluster-wide collector.",
+		[]string{"collector", "datname", "target"},
 		nil,
 	)
 	scrapeSuccessDesc = prometheus.NewDesc(
@@ -209,6 +217,10 @@ type PostgresCollector struct {
 
 	connSema *semaphore.Weighted
 	ctx      context.Context
+
+	// lastSuccess outlives one scrape: how long a collector has been failing
+	// on a database cannot be answered from the scrape that is failing.
+	lastSuccess *lastsuccess.Store
 }
 
 type Option func(*PostgresCollector) error
@@ -327,6 +339,15 @@ func WithConnectionsSemaphore(sem *semaphore.Weighted) Option {
 	}
 }
 
+// WithLastSuccess sets the process-owned record of when each collector last
+// ran without error on each database.
+func WithLastSuccess(store *lastsuccess.Store) Option {
+	return func(c *PostgresCollector) error {
+		c.lastSuccess = store
+		return nil
+	}
+}
+
 // WithDatabaseSelection sets which databases the database-local collectors run
 // against. Both lists remember whether they were configured, because an
 // explicitly empty include list selects no databases and an omitted one means
@@ -352,6 +373,7 @@ func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collectorDatabaseErrorDesc
 	ch <- collectorDeferredDesc
 	ch <- collectorDeferredDatabaseDesc
+	ch <- collectorLastSuccessDesc
 }
 
 // Collect implements the prometheus.Collector interface.
@@ -384,6 +406,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		// scrape that collected nothing was indistinguishable from one that
 		// was never configured to collect.
 		p.reportControlDeferral(ch, inst.name, controlName, databaseLocal)
+		p.retainedForControl(ch, inst.dsn, controlName, cluster, local)
 		return
 	}
 	// Set up the database connection for the collector.
@@ -392,6 +415,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "err", err)
 		p.release()
 		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonConnect, databaseLocal)
+		p.retainedForControl(ch, inst.dsn, controlName, cluster, local)
 		return
 	}
 
@@ -419,7 +443,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	for name, c := range cluster {
 		go func(name string, c Collector) {
 			defer wg.Done()
-			execute(p.ctx, name, c, inst, ch, p.logger, "")
+			execute(p.ctx, name, c, inst, ch, p.logger, "", p.lastSuccess)
 		}(name, c)
 	}
 
@@ -431,7 +455,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		for name, c := range local {
 			go func(name string, c Collector) {
 				defer wg.Done()
-				execute(p.ctx, name, c, inst, ch, p.logger, control.datname)
+				execute(p.ctx, name, c, inst, ch, p.logger, control.datname, p.lastSuccess)
 			}(name, c)
 		}
 	}
@@ -485,9 +509,11 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 // database that was never selected.
 // It returns whether the database was deferred rather than attempted.
 func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) (deferred bool) {
+	target, _ := targetid.ID(t.dsn)
 	fail := func(reason string) {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, t.datname, reason)
+		p.publishRetained(ch, local, target, t.datname)
 	}
 	if !p.acquire() {
 		// Deferred, not failed. Nothing was connected to and nothing was
@@ -498,6 +524,7 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
 			server, t.datname, dbselect.ReasonNoPermit)
+		p.publishRetained(ch, local, target, t.datname)
 		return true
 	}
 	defer p.release()
@@ -519,11 +546,73 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 	for name, c := range local {
 		go func(name string, c Collector) {
 			defer wg.Done()
-			execute(p.ctx, name, c, dbInst, ch, p.logger, t.datname)
+			execute(p.ctx, name, c, dbInst, ch, p.logger, t.datname, p.lastSuccess)
 		}(name, c)
 	}
 	wg.Wait()
 	return false
+}
+
+// retainedForControl publishes what the control connection's collectors last
+// did, for a scrape that never opened it.
+//
+// The cluster-wide collectors describe the server and carry no database, and
+// the database-local ones would have run on the control database, so the two
+// are published under the names they were recorded under.
+func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, controlName string, cluster, local map[string]Collector) {
+	target, _ := targetid.ID(dsn)
+
+	// Cluster-wide collectors describe the server. They are selected
+	// independently of the database lists and recorded with no database.
+	p.publishRetained(ch, cluster, target, "")
+
+	for name := range local {
+		database := controlName
+		if database == "" {
+			// The connection string does not name it and the connection is
+			// not open, so the database this collector last succeeded on is
+			// the only name there is.
+			if recorded, _, ok := p.lastSuccess.Latest(lastsuccess.EngineCollector, target, name); ok {
+				database = recorded
+			}
+		}
+		// Selection as it stands now, not as it stood when the success was
+		// recorded. A database the configuration no longer selects is not part
+		// of this scrape's answer, and its state is kept for a request that
+		// selects it again.
+		if database == "" || !p.controlSelected(database) {
+			continue
+		}
+		p.publishRetainedOne(ch, target, database, name)
+	}
+}
+
+// publishRetained publishes what these collectors last did on this database,
+// for a path that never reached them.
+//
+// A connection that fails, or work with no permit, runs no collector, and a
+// series that disappears then disappears exactly when an operator wants to
+// know how long this has been going on. Nothing is published for a collector
+// that has never succeeded here, and nothing is recorded: this says what was
+// already known.
+func (p PostgresCollector) publishRetained(ch chan<- prometheus.Metric, collectors map[string]Collector, target, datname string) {
+	for name := range collectors {
+		p.publishRetainedOne(ch, target, datname, name)
+	}
+}
+
+// publishRetainedOne publishes what one collector last did on one database.
+func (p PostgresCollector) publishRetainedOne(ch chan<- prometheus.Metric, target, datname, name string) {
+	key := lastsuccess.Key{
+		Engine:    lastsuccess.EngineCollector,
+		Target:    target,
+		Database:  datname,
+		Collector: name,
+	}
+	if when, ok := p.lastSuccess.At(key); ok {
+		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
+			float64(when.UnixNano())/1e9, name, datname, target)
+	}
 }
 
 // byScope splits the enabled collectors by where they run.
@@ -677,7 +766,8 @@ func boolToFloat(b bool) float64 {
 
 // execute runs one collector and reports whether it worked. datname is the
 // database it ran against, empty for a cluster-wide collector.
-func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string) {
+func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string, lastSuccess *lastsuccess.Store) {
+	target, _ := targetid.ID(instance.dsn)
 	begin := time.Now()
 	err := c.Update(ctx, instance, ch)
 	duration := time.Since(begin)
@@ -696,6 +786,23 @@ func execute(ctx context.Context, name string, c Collector, instance *instance, 
 	}
 	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, duration.Seconds(), name, datname)
 	ch <- prometheus.MustNewConstMetric(scrapeSuccessDesc, prometheus.GaugeValue, success, name, datname)
+
+	// When this collector last worked here, which the success above cannot
+	// say: it reports this scrape, and the question is how long a failure has
+	// been going on.
+	key := lastsuccess.Key{
+		Engine:    lastsuccess.EngineCollector,
+		Target:    target,
+		Database:  datname,
+		Collector: name,
+	}
+	if err == nil {
+		lastSuccess.Record(key, begin)
+	}
+	if when, ok := lastSuccess.At(key); ok {
+		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
+			float64(when.UnixNano())/1e9, name, datname, target)
+	}
 }
 
 // collectorFlagAction generates a new action function for the given collector

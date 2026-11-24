@@ -24,6 +24,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -310,7 +311,7 @@ func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, target *scrapeTarget) 
 		// every database, not only the ones a query restricts itself to. Asked
 		// once: after the first success the store knows the name, and asking
 		// again would be a round trip per scrape for an answer already held.
-		remembered, _, known := e.lastSuccess.Latest(target.identity, e.collectorName)
+		remembered, _, known := e.lastSuccess.Latest(lastsuccess.EngineQuery, target.identity, e.collectorName)
 		if forSelection || serverCachesANamespace(server) || !known {
 			var name string
 			if err := server.db.QueryRowContext(e.ctx, "SELECT current_database()").Scan(&name); err != nil {

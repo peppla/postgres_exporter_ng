@@ -120,13 +120,13 @@ func TestLatestAnswersForATargetWhoseDatabaseIsUnknown(t *testing.T) {
 	older := time.Now().Add(-time.Hour)
 	newer := time.Now()
 
-	s.Record(Key{Target: "1", Database: "app", Collector: "exporter"}, older)
-	s.Record(Key{Target: "1", Database: "reporting", Collector: "exporter"}, newer)
+	s.Record(Key{Engine: EngineQuery, Target: "1", Database: "app", Collector: "exporter"}, older)
+	s.Record(Key{Engine: EngineQuery, Target: "1", Database: "reporting", Collector: "exporter"}, newer)
 	// Another job and another target, neither of which this may answer with.
-	s.Record(Key{Target: "1", Database: "app", Collector: "custom_query.lr"}, newer)
-	s.Record(Key{Target: "2", Database: "other", Collector: "exporter"}, newer)
+	s.Record(Key{Engine: EngineQuery, Target: "1", Database: "app", Collector: "custom_query.lr"}, newer)
+	s.Record(Key{Engine: EngineQuery, Target: "2", Database: "other", Collector: "exporter"}, newer)
 
-	database, when, ok := s.Latest("1", "exporter")
+	database, when, ok := s.Latest(EngineQuery, "1", "exporter")
 	if !ok {
 		t.Fatal("a target with recorded successes reports none")
 	}
@@ -137,10 +137,10 @@ func TestLatestAnswersForATargetWhoseDatabaseIsUnknown(t *testing.T) {
 		t.Errorf("the latest success is at %s, want %s", when, newer)
 	}
 
-	if _, _, ok := s.Latest("3", "exporter"); ok {
+	if _, _, ok := s.Latest(EngineQuery, "3", "exporter"); ok {
 		t.Error("a target with no successes reported one")
 	}
-	if _, _, ok := s.Latest("1", "custom_query.hr"); ok {
+	if _, _, ok := s.Latest(EngineQuery, "1", "custom_query.hr"); ok {
 		t.Error("a job with no successes reported another job's")
 	}
 }

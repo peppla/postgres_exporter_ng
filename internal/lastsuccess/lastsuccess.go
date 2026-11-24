@@ -36,15 +36,28 @@ import (
 // host and port, because several targets share a host and port and a last
 // success recorded against one of them is not true of the others.
 //
-// Collector is the job: the built-in exporter, each custom-query resolution,
-// and the namespaced collectors are separate collections of the same database,
-// and they succeed and fail independently. One store serves all of them, so
-// without this an hourly job's success answers for a failing five-second one.
+// Collector is the job within an engine: the built-in exporter and each
+// custom-query resolution on one side, each namespaced collector on the other.
+// One store serves all of them, so without the engine and the job an hourly
+// job's success answers for a failing five-second one.
 type Key struct {
+	// Engine separates the two metric engines, which collect the same
+	// databases over the same connections and succeed and fail independently.
+	Engine    string
 	Target    string
 	Database  string
 	Collector string
 }
+
+// The engines, as Key.Engine.
+const (
+	// EngineQuery is the custom-query engine, whose jobs are the built-in
+	// exporter and each resolution.
+	EngineQuery = "query"
+	// EngineCollector is the namespaced collectors, whose jobs are the
+	// collectors themselves.
+	EngineCollector = "collector"
+)
 
 // Store remembers the last success for each key.
 //
@@ -99,7 +112,7 @@ func (s *Store) At(key Key) (time.Time, bool) {
 // failed has no server to ask. The database that last succeeded over this
 // connection is the one the diagnostic belongs to, and losing the series at
 // exactly the moment the connection breaks would lose it when it matters.
-func (s *Store) Latest(target, collector string) (string, time.Time, bool) {
+func (s *Store) Latest(engine, target, collector string) (string, time.Time, bool) {
 	if s == nil {
 		return "", time.Time{}, false
 	}
@@ -110,7 +123,7 @@ func (s *Store) Latest(target, collector string) (string, time.Time, bool) {
 	var newest time.Time
 	var found bool
 	for key, t := range s.seen {
-		if key.Target != target || key.Collector != collector {
+		if key.Engine != engine || key.Target != target || key.Collector != collector {
 			continue
 		}
 		if !found || t.After(newest) {

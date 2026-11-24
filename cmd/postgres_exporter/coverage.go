@@ -233,7 +233,7 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 			// database the freshness diagnostic belongs to, and dropping the
 			// series exactly when the connection breaks drops it when it
 			// matters most.
-			if database, when, ok := c.lastSuccess.Latest(t.identity, c.job); ok {
+			if database, when, ok := c.lastSuccess.Latest(lastsuccess.EngineQuery, t.identity, c.job); ok {
 				c.databaseLastSuccess.WithLabelValues(t.server, database, t.identity).
 					Set(float64(when.UnixNano()) / 1e9)
 			}
@@ -278,7 +278,12 @@ func (c *coverageMetrics) setDatabaseOutcome(ref databaseRef, reason string) {
 // keyFor is what this set of metrics remembers a success under: the
 // connection, the database, and the job collecting them.
 func (c *coverageMetrics) keyFor(ref databaseRef) lastsuccess.Key {
-	return lastsuccess.Key{Target: ref.identity, Database: ref.datname, Collector: c.job}
+	return lastsuccess.Key{
+		Engine:    lastsuccess.EngineQuery,
+		Target:    ref.identity,
+		Database:  ref.datname,
+		Collector: c.job,
+	}
 }
 
 // setDatabaseDeferred records one database the scrape never started work on.
