@@ -25,6 +25,8 @@
 package lastsuccess
 
 import (
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -40,13 +42,52 @@ import (
 // custom-query resolution on one side, each namespaced collector on the other.
 // One store serves all of them, so without the engine and the job an hourly
 // job's success answers for a failing five-second one.
+//
+// About says what the record is about, because a database-level record and a
+// collector-level one can otherwise write the same key. A request selecting
+// exactly one collector has a selection equal to that collector's name, so the
+// two would overwrite each other. Its zero value is the collector level, so
+// keys written before this field existed keep their meaning.
 type Key struct {
 	// Engine separates the two metric engines, which collect the same
 	// databases over the same connections and succeed and fail independently.
-	Engine    string
+	Engine string
+	// About is the collector level by default, where Collector names one
+	// collector, or the database level, where Collector holds the canonical
+	// selection that completed.
+	About     Level
 	Target    string
 	Database  string
 	Collector string
+}
+
+// Level is what a record is about.
+type Level int
+
+const (
+	// OneCollector is one collector on one database. The zero value.
+	OneCollector Level = iota
+	// WholeSelection is every database-local collector one request selected,
+	// on one database. Collector then holds that selection, canonically.
+	WholeSelection
+)
+
+// Selection is the canonical form of a set of collector names, for Key.Collector
+// at the WholeSelection level.
+//
+// Sorted, so the same collectors in another order are the same context and
+// read the record the first request wrote. Built from the names rather than
+// from a count, so an enabled set that gains or loses a collector cannot reuse
+// a record written for a different set.
+//
+// One record per distinct selection per database, which is bounded by how many
+// collect[] profiles are scraped. Bounding it is part of the bounded-state
+// work rather than a cap here.
+func Selection(names []string) string {
+	sorted := make([]string, len(names))
+	copy(sorted, names)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
 }
 
 // The engines, as Key.Engine.
@@ -112,7 +153,11 @@ func (s *Store) At(key Key) (time.Time, bool) {
 // failed has no server to ask. The database that last succeeded over this
 // connection is the one the diagnostic belongs to, and losing the series at
 // exactly the moment the connection breaks would lose it when it matters.
-func (s *Store) Latest(engine, target, collector string) (string, time.Time, bool) {
+// about is matched as well as the job. Without it a database-level record
+// could answer a question about one collector, which is the collision Key.About
+// exists to prevent, and matching three fields out of four would reintroduce it
+// here after the key had closed it.
+func (s *Store) Latest(engine string, about Level, target, collector string) (string, time.Time, bool) {
 	if s == nil {
 		return "", time.Time{}, false
 	}
@@ -123,7 +168,7 @@ func (s *Store) Latest(engine, target, collector string) (string, time.Time, boo
 	var newest time.Time
 	var found bool
 	for key, t := range s.seen {
-		if key.Engine != engine || key.Target != target || key.Collector != collector {
+		if key.Engine != engine || key.About != about || key.Target != target || key.Collector != collector {
 			continue
 		}
 		if !found || t.After(newest) {

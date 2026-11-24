@@ -58,7 +58,17 @@
   knows nothing about the collectors inside it. A collector that fails on an
   open connection is now reported as `pg_collector_database_error` with
   `reason="scrape"`, beside a `pg_collector_database_up` that stays 1, because
-  the connection is not what went wrong.
+  the connection is not what went wrong. Each engine also reports when a
+  database was last collected without error, in
+  `pg_exporter_database_last_success_timestamp_seconds` and
+  `pg_collector_database_last_success_timestamp_seconds`, and the namespaced
+  collectors report per collector as well in
+  `pg_collector_last_success_timestamp_seconds`. The collector engine's
+  database-level time belongs to the selection the request made: a scrape that
+  asks for a subset of collectors gets the time that subset last completed, and
+  cannot read or move the time another selection completed. Two scrape jobs
+  with different `collect[]` sets therefore each see their own, separated by
+  their own target labels rather than by a label on the metric.
 
   Read these rather than `pg_up` to tell whether a scrape covered what it
   intended. `pg_up` reports whether connections worked, not whether collection

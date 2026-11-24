@@ -126,7 +126,7 @@ func TestLatestAnswersForATargetWhoseDatabaseIsUnknown(t *testing.T) {
 	s.Record(Key{Engine: EngineQuery, Target: "1", Database: "app", Collector: "custom_query.lr"}, newer)
 	s.Record(Key{Engine: EngineQuery, Target: "2", Database: "other", Collector: "exporter"}, newer)
 
-	database, when, ok := s.Latest(EngineQuery, "1", "exporter")
+	database, when, ok := s.Latest(EngineQuery, OneCollector, "1", "exporter")
 	if !ok {
 		t.Fatal("a target with recorded successes reports none")
 	}
@@ -137,10 +137,34 @@ func TestLatestAnswersForATargetWhoseDatabaseIsUnknown(t *testing.T) {
 		t.Errorf("the latest success is at %s, want %s", when, newer)
 	}
 
-	if _, _, ok := s.Latest(EngineQuery, "3", "exporter"); ok {
+	if _, _, ok := s.Latest(EngineQuery, OneCollector, "3", "exporter"); ok {
 		t.Error("a target with no successes reported one")
 	}
-	if _, _, ok := s.Latest(EngineQuery, "1", "custom_query.hr"); ok {
+	if _, _, ok := s.Latest(EngineQuery, OneCollector, "1", "custom_query.hr"); ok {
 		t.Error("a job with no successes reported another job's")
+	}
+}
+
+// TestSelectionIsSortedAndJoined pins the canonical form directly.
+//
+// The collector package builds it from a map, whose order is random, so a test
+// that goes through one can pass with the names already in order. This passes
+// them out of order on purpose.
+func TestSelectionIsSortedAndJoined(t *testing.T) {
+	if got := Selection([]string{"stat_user_tables", "pg_database", "stat_user_indexes"}); got != "pg_database,stat_user_indexes,stat_user_tables" {
+		t.Errorf("Selection returned %q, want the names sorted and joined", got)
+	}
+	if got := Selection([]string{"b", "a"}); got != Selection([]string{"a", "b"}) {
+		t.Error("the same two names in two orders are two different selections")
+	}
+	if got := Selection(nil); got != "" {
+		t.Errorf("Selection(nil) is %q, want none", got)
+	}
+	// The caller's slice is not reordered under it: the collector package
+	// passes a slice it goes on to use.
+	names := []string{"b", "a"}
+	Selection(names)
+	if names[0] != "b" {
+		t.Error("Selection sorted the caller's slice in place")
 	}
 }

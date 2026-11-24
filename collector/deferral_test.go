@@ -93,7 +93,7 @@ func TestADeferredDatabaseIsNotAFailure(t *testing.T) {
 
 	var outcome databaseOutcome
 	published := publishedByName(func(ch chan<- prometheus.Metric) {
-		outcome = p.collectDatabase(ch, target, map[string]Collector{}, "198.51.100.9:5432")
+		outcome = p.collectDatabase(ch, target, map[string]Collector{}, "198.51.100.9:5432", "")
 	})
 
 	if outcome != outcomeDeferred {
