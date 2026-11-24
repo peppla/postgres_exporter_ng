@@ -329,3 +329,30 @@ func TestFairnessOverChurnIsBounded(t *testing.T) {
 		t.Errorf("z waited %d scrapes between turns, want no more than 2", longestWait)
 	}
 }
+
+// TestTheInputOrderDoesNotDecideWhoIsSkipped is the collector engine's own
+// input, where the configured connection database comes first and the rest
+// follow in sorted order, so the list as a whole is not sorted.
+//
+// Against a rule that chose the first name after the one chosen last time,
+// a_review was never chosen: the first name after postgres is z_review, and
+// after z_review the rule wrapped to the front, which is postgres again. Six
+// short-budget requests through the engine attempted z_review, postgres,
+// z_review, postgres, z_review and postgres, and a_review was deferred on all
+// six.
+func TestTheInputOrderDoesNotDecideWhoIsSkipped(t *testing.T) {
+	s := New()
+	k := Key{Engine: "collector", Target: "1", Profile: "all"}
+	members := []string{"postgres", "a_review", "z_review"}
+
+	first := map[string]int{}
+	for call := 0; call < len(members); call++ {
+		first[members[s.Next(k, members)]]++
+	}
+
+	for _, name := range members {
+		if first[name] != 1 {
+			t.Errorf("%s came first %d times in %d calls, want once: %v", name, first[name], len(members), first)
+		}
+	}
+}

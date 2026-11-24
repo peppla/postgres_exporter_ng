@@ -584,9 +584,14 @@ func TestUnattemptedWorkIsNamedNotAttempted(t *testing.T) {
 func targetsForDSN(hostport string, names ...string) []scrapeTarget {
 	out := make([]scrapeTarget, 0, len(names))
 	for _, n := range names {
+		dsn := "postgresql://u:p@" + hostport + "/" + n + "?sslmode=disable"
 		out = append(out, scrapeTarget{
-			dsn:         "postgresql://u:p@" + hostport + "/" + n + "?sslmode=disable",
-			databaseRef: databaseRef{server: hostport, datname: n},
+			dsn: dsn,
+			// identity as the engine assigns it. Without it every target here
+			// shares the empty string, which is exactly the collision the
+			// schedule has to avoid, so a fixture missing it would hide the
+			// thing these tests are for.
+			databaseRef: databaseRef{server: hostport, datname: n, identity: identityOf(dsn)},
 		})
 	}
 	return out
@@ -998,15 +1003,19 @@ func TestWorkThatNeverReachedTheLimiterNamesTheDeadline(t *testing.T) {
 	}
 }
 
-// TestTheQueryEngineRotatesPerServer covers the schedule this engine keeps.
+// TestEveryTargetInTheRequestGetsATurn covers the schedule this engine keeps.
 //
-// One call can carry targets discovered from several seed DSNs, so a single
-// order over the whole list would let one server's membership move another
-// server's turn. Each server's group is rotated by its own schedule and the
-// servers keep the order they first appear in.
-func TestTheQueryEngineRotatesPerServer(t *testing.T) {
+// One schedule over everything the request selected, across servers as well as
+// within them. An earlier version grouped by server and rotated inside each
+// group, which keeps the first server ahead of every other on every request:
+// the groups' own schedules advance and nothing moves between them, so a later
+// server is never attempted when the first consumes the budget.
+func TestEveryTargetInTheRequestGetsATurn(t *testing.T) {
 	store := rotation.New()
-	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
+	e := NewExporter([]string{
+		"postgresql://u:p@127.0.0.1:1/a?sslmode=disable",
+		"postgresql://u:p@127.0.0.1:2/x?sslmode=disable",
+	},
 		WithContext(context.Background()),
 		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
 		WithRotation(store),
@@ -1016,34 +1025,28 @@ func TestTheQueryEngineRotatesPerServer(t *testing.T) {
 	targets := append(targetsForDSN("127.0.0.1:1", "a", "b", "c"),
 		targetsForDSN("127.0.0.1:2", "x", "y")...)
 
-	firstOf := map[string][]string{}
-	for scrape := 0; scrape < 3; scrape++ {
+	firstOf := map[string]int{}
+	for scrape := 0; scrape < len(targets); scrape++ {
 		got := e.rotateTargets(targets)
 		if len(got) != len(targets) {
 			t.Fatalf("scrape %d returned %d of %d targets: a rotation must not drop one", scrape, len(got), len(targets))
 		}
 
-		// The servers keep the order they first appear in, and each group holds
-		// the same databases it did.
-		seen := map[string][]string{}
+		// Every target still there, whatever the order.
+		seen := map[string]bool{}
 		for _, target := range got {
-			seen[target.server] = append(seen[target.server], target.datname)
+			seen[target.dsn] = true
 		}
-		if len(seen["127.0.0.1:1"]) != 3 || len(seen["127.0.0.1:2"]) != 2 {
-			t.Fatalf("scrape %d regrouped the targets: %v", scrape, seen)
+		if len(seen) != len(targets) {
+			t.Fatalf("scrape %d returned %d distinct targets of %d", scrape, len(seen), len(targets))
 		}
-		firstOf["127.0.0.1:1"] = append(firstOf["127.0.0.1:1"], seen["127.0.0.1:1"][0])
-		firstOf["127.0.0.1:2"] = append(firstOf["127.0.0.1:2"], seen["127.0.0.1:2"][0])
+		firstOf[got[0].dsn]++
 	}
 
-	// Three scrapes over three databases: each came first once.
-	if got := firstOf["127.0.0.1:1"]; got[0] == got[1] || got[1] == got[2] || got[0] == got[2] {
-		t.Errorf("the three-database server offered %v first, want three different databases", got)
-	}
-	// Two databases over three scrapes alternate, so the schedule moved rather
-	// than one server's turn being spent by the other's.
-	if got := firstOf["127.0.0.1:2"]; got[0] == got[1] {
-		t.Errorf("the two-database server offered %v first, want its own turn to move", got)
+	// As many scrapes as there are targets, so each has been first once.
+	if len(firstOf) != len(targets) {
+		t.Errorf("over %d scrapes only %d of the %d targets was ever offered the first attempt: %v",
+			len(targets), len(firstOf), len(targets), firstOf)
 	}
 }
 
@@ -1131,5 +1134,76 @@ func TestTheDatabaseOfferedTheFirstAttemptChangesBetweenScrapes(t *testing.T) {
 			break
 		}
 		seen[name] = true
+	}
+}
+
+// TestTwoConnectionsToOneDatabaseBothGetATurn is the collision a host and port
+// cannot see.
+//
+// Two configured connections differing only in role, over the same endpoint and
+// the same database. Keyed and named by host, port and database they are the
+// same member, so the first target matching that name is chosen every time and
+// the other never gets a turn. Both are always returned, so this is starvation
+// rather than a dropped target.
+func TestTwoConnectionsToOneDatabaseBothGetATurn(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{"postgresql://role_a@127.0.0.1:1/app?sslmode=disable"},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := []scrapeTarget{}
+	for _, role := range []string{"role_a", "role_b"} {
+		dsn := "postgresql://" + role + "@127.0.0.1:1/app?sslmode=disable"
+		targets = append(targets, scrapeTarget{
+			dsn:         dsn,
+			databaseRef: databaseRef{server: "127.0.0.1:1", datname: "app", identity: identityOf(dsn)},
+		})
+	}
+
+	firstOf := map[string]int{}
+	for call := 0; call < 12; call++ {
+		got := e.rotateTargets(targets)
+		if len(got) != len(targets) {
+			t.Fatalf("call %d returned %d of %d targets", call, len(got), len(targets))
+		}
+		firstOf[got[0].dsn]++
+	}
+
+	if len(firstOf) != len(targets) {
+		t.Errorf("over twelve calls only %d of the two connections was ever first: %v", len(firstOf), firstOf)
+	}
+}
+
+// TestASecondServerGetsATurn is the other half. Rotating inside each server's
+// own group moves nothing between servers, so when the first server's attempt
+// consumes the budget the second is never attempted.
+func TestASecondServerGetsATurn(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{
+		"postgresql://u:p@host_a:5432/app?sslmode=disable",
+		"postgresql://u:p@host_b:5432/app?sslmode=disable",
+	},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := append(targetsForDSN("host_a:5432", "app"), targetsForDSN("host_b:5432", "app")...)
+
+	firstOf := map[string]int{}
+	for call := 0; call < 12; call++ {
+		got := e.rotateTargets(targets)
+		if len(got) != len(targets) {
+			t.Fatalf("call %d returned %d of %d targets", call, len(got), len(targets))
+		}
+		firstOf[got[0].server]++
+	}
+
+	if len(firstOf) != 2 {
+		t.Errorf("over twelve calls only %v was ever first, so a later server never gets an opportunity", firstOf)
 	}
 }

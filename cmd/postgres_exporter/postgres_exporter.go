@@ -900,15 +900,30 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	}
 }
 
-// rotateTargets puts each server's targets in the order its schedule says,
-// keeping the servers in the order they first appear.
+// rotateTargets puts this request's targets in the order its schedule says.
 //
-// Grouped by server because the schedule is about one server's selected set.
-// The key's target is the server fingerprint, which is this engine's own
-// identity for a connection and is what its labels carry, and the profile is
-// the registry this exporter was built for, which is what distinguishes one
-// scrape job's selection from another's. The engine field keeps this apart
-// from the collector engine's schedule for the same server.
+// One schedule over everything the request selected, not one per server. Two
+// earlier shapes were wrong and both starve a target rather than drop one.
+//
+// Grouping by server and keeping the groups in the order they first appear
+// leaves the same server ahead of every other on every request. Rotating inside
+// a group moves nothing between groups, so when the first server's attempt
+// consumes the budget a later server is never attempted, however often its own
+// single-member schedule advances. Measured on one target each at two hosts:
+// twelve calls, the same host first every time.
+//
+// Naming the members by database, and keying the schedule by the host and port,
+// collapses two configured connections that differ only in role, credentials or
+// search_path and happen to reach the same database. They supply the same member
+// name, and the first index matching the chosen name is always the same target,
+// so the other never gets a turn. Measured on role_a and role_b over one
+// endpoint and database: twelve calls, role_a first every time. The public
+// server label is a host and port by construction and cannot tell those apart.
+//
+// So the members are the per-target identities this process assigns per
+// connection string, which differ for two roles over one database and for two
+// databases over one connection, and the schedule belongs to the request's
+// configured set and its profile.
 //
 // A rotation and not a selection: every target is still returned, so a database
 // that gets no attempt is still reported as deferred by name.
@@ -917,28 +932,32 @@ func (e *Exporter) rotateTargets(targets []scrapeTarget) []scrapeTarget {
 		return targets
 	}
 
-	servers := make([]string, 0, 1)
-	byServer := map[string][]scrapeTarget{}
+	members := make([]string, 0, len(targets))
 	for _, t := range targets {
-		if _, seen := byServer[t.server]; !seen {
-			servers = append(servers, t.server)
-		}
-		byServer[t.server] = append(byServer[t.server], t)
+		members = append(members, t.identity)
 	}
 
+	key := rotation.Key{Engine: "query", Target: e.scheduleTarget(), Profile: e.collectorName}
 	out := make([]scrapeTarget, 0, len(targets))
-	for _, server := range servers {
-		group := byServer[server]
-		members := make([]string, 0, len(group))
-		for _, t := range group {
-			members = append(members, t.datname)
-		}
-		key := rotation.Key{Engine: "query", Target: server, Profile: e.collectorName}
-		for _, i := range rotation.Order(e.rotation.Next(key, members), len(group)) {
-			out = append(out, group[i])
-		}
+	for _, i := range rotation.Order(e.rotation.Next(key, members), len(targets)) {
+		out = append(out, targets[i])
 	}
 	return out
+}
+
+// scheduleTarget identifies the configured set this request works over.
+//
+// The seed connection strings, as the identities this process assigns them, so
+// two exporters configured with different sets keep their own schedules and the
+// same set keeps one across requests. Identities rather than the strings
+// themselves, because a connection string carries a password.
+func (e *Exporter) scheduleTarget() string {
+	ids := make([]string, 0, len(e.dsn))
+	for _, dsn := range e.dsn {
+		ids = append(ids, identityOf(dsn))
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
 }
 
 // scrapeTargets runs the per-database fan-out and returns how many targets

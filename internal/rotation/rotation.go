@@ -97,11 +97,17 @@ func New() *Store {
 // Next picks which of the current members is offered the first attempt, and
 // moves the schedule on.
 //
-// members is the selected set in the order the engine walks it, which is sorted
-// by name. The successor of the last database chosen is taken from the members
-// present now, so a database added or removed between scrapes moves who comes
-// next without putting the schedule back to the beginning and without stepping
-// over a database that stayed selected.
+// members is the selected set, named so that no two entries in one call are the
+// same, in whatever order the caller walks it. The order of the input does not
+// decide who is chosen: what decides is which members still have a turn
+// outstanding from earlier calls, and those keep their places. An earlier
+// version did assume the input was sorted and chose the first name after the
+// one chosen last, which silently skipped a database when the caller put the
+// configured connection database first and so handed in a list that was not
+// sorted at all.
+//
+// A member that leaves the selection loses its place. One that joins, or that
+// has already had its turn this cycle, goes behind the ones still waiting.
 //
 // Two requests overlapping on one schedule are served one after the other and
 // get different databases, because the choice and the record of it happen
