@@ -50,11 +50,20 @@ type Key struct {
 	Profile string
 }
 
-// Store holds one sequence per schedule, for the life of the process.
+// Store holds one schedule per key, for the life of the process.
 //
 // It belongs to the process rather than to a request, because a request that
 // ends takes its own idea of where it got to with it, and the whole point is
 // for the next request to start somewhere else.
+//
+// What it remembers is the name of the database offered the first attempt, not
+// a count. A counter reduced by the size of the current set is not continuity:
+// with the selected set alternating between two sizes, the counter advances
+// every scrape while the position it lands on cycles through a subset of the
+// members, so a database selected every time can go indefinitely without ever
+// being offered the first attempt. Measured on a set alternating between two
+// and four members: over thirty-two scrapes one database that was selected
+// throughout came first not once.
 //
 // It holds one small entry per schedule, so it grows with the number of
 // distinct collect[] profiles scraped against a target rather than with the
@@ -62,35 +71,65 @@ type Key struct {
 // it shares with the last-success store, and bounded cleanup covers both.
 type Store struct {
 	mu sync.Mutex
-	at map[Key]uint64
+	// last is the database this schedule offered the first attempt to.
+	last map[Key]string
 }
 
 // New returns an empty store.
 func New() *Store {
-	return &Store{at: map[Key]uint64{}}
+	return &Store{last: map[Key]string{}}
 }
 
-// Take hands this scrape its starting offset and moves the schedule on.
+// Next picks which of the current members is offered the first attempt, and
+// moves the schedule on.
 //
-// Each call gets a different value, so two requests overlapping on one schedule
-// start in different places rather than both attempting the same databases and
-// leaving the same ones out.
+// members is the selected set in the order the engine walks it, which is sorted
+// by name. The successor of the last database chosen is taken from the members
+// present now, so a database added or removed between scrapes moves who comes
+// next without putting the schedule back to the beginning and without stepping
+// over a database that stayed selected.
 //
-// The sequence counts and is never reduced to the size of the selected set, so
-// discovery adding or removing a database changes which database an offset
-// lands on without putting the schedule back to the beginning. It also does not
-// depend on how much of the work finished: a scrape that completed nothing has
-// still used its turn, and leaving the schedule where it was is how the same
-// databases keep being offered first.
-func (s *Store) Take(k Key) uint64 {
-	if s == nil {
+// Two requests overlapping on one schedule are served one after the other and
+// get different databases, because the choice and the record of it happen
+// together under the lock. More overlapping requests than there are members
+// will still repeat a database, which is the set being smaller than the
+// concurrency rather than the schedule failing.
+//
+// Nothing here is told how much of the work finished. A scrape that completed
+// nothing has still used its turn, because leaving the schedule where it was is
+// how the same databases keep being offered first.
+func (s *Store) Next(k Key, members []string) int {
+	if len(members) == 0 {
 		return 0
 	}
+	if s == nil {
+		// No schedule, so the sorted order every scrape. This is the shape
+		// that starves the tail of a set that does not fit the budget, so
+		// every shipped request path is given the process's store.
+		return 0
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	at := s.at[k]
-	s.at[k] = at + 1
-	return at
+
+	// The first member after the one chosen last time. With no record, or with
+	// the last one at or after the end of the current set, this is the first
+	// member, which is also what a fresh process does.
+	chosen := 0
+	if last, ok := s.last[k]; ok {
+		chosen = len(members)
+		for i, name := range members {
+			if name > last {
+				chosen = i
+				break
+			}
+		}
+		if chosen == len(members) {
+			chosen = 0
+		}
+	}
+	s.last[k] = members[chosen]
+	return chosen
 }
 
 // Len is how many schedules are held, for the tests that bound this.
@@ -100,20 +139,22 @@ func (s *Store) Len() int {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.at)
+	return len(s.last)
 }
 
-// Order returns the positions 0 to n-1 rotated so that the offset comes first.
+// Order returns the positions 0 to n-1 rotated so that start comes first.
 //
 // A rotation rather than a subset: every selected database is still visited, so
 // the ones that get no attempt are still reported as deferred by name. Leaving
 // one out here would make a selected database vanish from the output, which
 // reads the same as a database nobody selected.
-func Order(offset uint64, n int) []int {
+func Order(start, n int) []int {
 	if n <= 0 {
 		return nil
 	}
-	start := int(offset % uint64(n))
+	if start < 0 || start >= n {
+		start = 0
+	}
 	out := make([]int, 0, n)
 	for i := 0; i < n; i++ {
 		out = append(out, (start+i)%n)

@@ -610,7 +610,16 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// every scrape. The order is a rotation and not a selection: every database
 	// here is still visited, and the ones that get no attempt are still named
 	// as deferred.
-	order := rotation.Order(p.rotation.Take(p.rotationKey(inst.dsn, selection)), len(pending))
+	//
+	// The schedule is given the names, not a count, because it remembers which
+	// database it chose rather than how many scrapes have been. A database that
+	// stays selected while others come and go is otherwise stepped over
+	// indefinitely.
+	members := make([]string, 0, len(pending))
+	for _, t := range pending {
+		members = append(members, t.datname)
+	}
+	order := rotation.Order(p.rotation.Next(p.rotationKey(inst.dsn, selection), members), len(pending))
 	rotated := make([]dbTarget, 0, len(pending))
 	for _, i := range order {
 		rotated = append(rotated, pending[i])

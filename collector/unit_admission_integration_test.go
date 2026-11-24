@@ -47,8 +47,10 @@ import (
 // controlName is the database every case here connects to, and controlUp is
 // its own database_up entry rather than whichever database published last.
 const (
-	controlName = "postgres"
-	controlUp   = "pg_collector_database_up/" + controlName + "/"
+	controlName   = "postgres"
+	controlUp     = "pg_collector_database_up/" + controlName + "/"
+	attempted     = "pg_collector_databases_attempted//"
+	deferredCount = "pg_collector_databases_deferred//"
 )
 
 func liveDSN(t *testing.T) string {
@@ -353,11 +355,18 @@ func TestTheFanOutPathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 }
 
 // TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked is the same
-// boundary on the other path, the control connection inside Collect.
+// boundary for the configured connection database, through the whole engine:
+// admission, the baseline connection, the catalogue read, the scope split and
+// the rotated fan-out. There is no separate control-local path any more, so
+// what this covers is that database taking its turn like the others.
 //
-// This one goes through the whole engine: admission, the connection, the
-// catalogue read and the scope split, which is what a test calling the shared
-// runner cannot show.
+// There are two different boundaries for it and this one is the later. The
+// earlier is the baseline connection succeeding and the database's own
+// admission then finding no time left, which gives a deferred database that
+// keeps the connection observation, up 1, and attempts nothing. The predicate
+// below therefore requires an attempt as well as an open connection and no
+// collector run, because without that it stops at the earlier boundary and
+// then asserts things only the later one produces.
 func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 	dsn := liveDSN(t)
 	collectorScopes["stat_fixture_live"] = scopeDatabase
@@ -398,17 +407,41 @@ func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T)
 		t.Fatalf("the healthy run did not report the control connection as up: %v", healthy)
 	}
 
+	// The earlier boundary has to be reachable too, and it has its own
+	// assertions. Finding it first is also what shows the predicate below is
+	// choosing between two real outcomes rather than taking the only one there
+	// is.
+	earlier := int64(-1)
+	for n := int64(1); n <= atRun.Load()+8; n++ {
+		p, ran, _ := run(n)
+		if p[controlUp].value == 1 && ran.Load() == 0 && p[attempted].value == 0 {
+			earlier = n
+			if p[deferredCount].value != 1 {
+				t.Errorf("the baseline connection worked and no local attempt started, and %v databases are deferred, want 1: %v",
+					p[deferredCount].value, p)
+			}
+			if _, found := p["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonDeadline]; found {
+				t.Error("nothing was attempted and the database reports an incomplete attempt")
+			}
+			break
+		}
+	}
+	if earlier < 0 {
+		t.Fatalf("the baseline connection and a database never attempted is not reachable, searching up to %d context reads", atRun.Load()+8)
+	}
+	t.Logf("the earlier boundary, a baseline connection whose local turn never started, is at context read %d", earlier)
+
 	var published map[string]MetricResult
 	boundary := int64(-1)
 	for n := int64(1); n <= atRun.Load()+8; n++ {
 		p, ran, _ := run(n)
-		if p[controlUp].value == 1 && ran.Load() == 0 {
+		if p[controlUp].value == 1 && ran.Load() == 0 && p[attempted].value == 1 {
 			published, boundary = p, n
 			break
 		}
 	}
 	if boundary < 0 {
-		t.Fatalf("no boundary between a control connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
+		t.Fatalf("no boundary between a local connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
 	}
 	t.Logf("the scrape ends at context read %d, after the control connection is open and before its collectors start", boundary)
 	if published["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonDeadline].value != 1 {
