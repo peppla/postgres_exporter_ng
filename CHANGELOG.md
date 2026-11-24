@@ -47,11 +47,18 @@
   `_selected`, `_attempted`, `_scraped`, `_failed`, `_deferred` and
   `_excluded`, and per database `pg_exporter_database_selected`,
   `_scrape_success`, `_scrape_error`, `_deferred` and `_excluded`. The
-  namespaced collectors publish a smaller set of their own:
-  `pg_collector_databases_discovered`, `_selected`, `_excluded` and
-  `_deferred`, `pg_collector_database_discovery_success`, and per database
-  `pg_collector_database_up`, `_error` and `_deferred`. They do not yet have
-  the attempted and completed counts.
+  namespaced collectors publish their own set:
+  `pg_collector_databases_discovered`, `_selected`, `_attempted`, `_scraped`,
+  `_failed`, `_deferred` and `_excluded`,
+  `pg_collector_database_discovery_success`, and per database
+  `pg_collector_database_up`, `_error` and `_deferred`. On that engine a
+  database counts as covered only when every database-local collector selected
+  for it ran without error, which is stricter than the custom-query engine's
+  count of the same name: that one reports a scrape that returned no error and
+  knows nothing about the collectors inside it. A collector that fails on an
+  open connection is now reported as `pg_collector_database_error` with
+  `reason="scrape"`, beside a `pg_collector_database_up` that stays 1, because
+  the connection is not what went wrong.
 
   Read these rather than `pg_up` to tell whether a scrape covered what it
   intended. `pg_up` reports whether connections worked, not whether collection
