@@ -267,3 +267,65 @@ func TestANilStoreHasNoRotation(t *testing.T) {
 		t.Errorf("a nil store holds %d schedules", got)
 	}
 }
+
+// TestANewcomerEveryScrapeDoesNotStarveASelectedDatabase is the churn case.
+//
+// The set is exactly two members every scrape, so nothing here depends on a
+// growing number of databases competing for capacity. One member stays
+// selected throughout. The other is replaced each scrape by a newcomer whose
+// name sorts after the previous one and before the member that stays.
+//
+// Choosing the first current name after the one chosen last time picks the
+// newcomer every scrape, so the member that is always selected never comes
+// first and, with one worker and a budget the first attempt consumes, is never
+// attempted at all.
+func TestANewcomerEveryScrapeDoesNotStarveASelectedDatabase(t *testing.T) {
+	s := New()
+	k := Key{Engine: "collector", Target: "1", Profile: "all"}
+
+	firstOf := map[string]int{}
+	for call := 0; call < 32; call++ {
+		members := []string{fmt.Sprintf("a%04d", call), "z"}
+		firstOf[members[s.Next(k, members)]]++
+	}
+
+	if firstOf["z"] == 0 {
+		t.Errorf("z was selected on every one of 32 scrapes and never came first: %v", firstOf)
+	}
+}
+
+// TestFairnessOverChurnIsBounded says how long a selected database can wait.
+//
+// Not just that it comes first eventually, which an unbounded wait also
+// satisfies. With two members and a newcomer every scrape, the one that stays
+// has to come first about half the time, because it is the only member with a
+// turn outstanding whenever it is not the one just served.
+func TestFairnessOverChurnIsBounded(t *testing.T) {
+	const scrapes = 40
+
+	s := New()
+	k := Key{Engine: "collector", Target: "1", Profile: "all"}
+
+	firstOf := map[string]int{}
+	longestWait, since := 0, 0
+	for call := 0; call < scrapes; call++ {
+		members := []string{fmt.Sprintf("a%04d", call), "z"}
+		chosen := members[s.Next(k, members)]
+		firstOf[chosen]++
+		if chosen == "z" {
+			if since > longestWait {
+				longestWait = since
+			}
+			since = 0
+			continue
+		}
+		since++
+	}
+
+	if firstOf["z"] < scrapes/2-1 {
+		t.Errorf("z came first %d times in %d scrapes, want about half: %v", firstOf["z"], scrapes, firstOf)
+	}
+	if longestWait > 2 {
+		t.Errorf("z waited %d scrapes between turns, want no more than 2", longestWait)
+	}
+}

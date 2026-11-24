@@ -56,28 +56,42 @@ type Key struct {
 // ends takes its own idea of where it got to with it, and the whole point is
 // for the next request to start somewhere else.
 //
-// What it remembers is the name of the database offered the first attempt, not
-// a count. A counter reduced by the size of the current set is not continuity:
-// with the selected set alternating between two sizes, the counter advances
-// every scrape while the position it lands on cycles through a subset of the
-// members, so a database selected every time can go indefinitely without ever
-// being offered the first attempt. Measured on a set alternating between two
-// and four members: over thirty-two scrapes one database that was selected
-// throughout came first not once.
+// What it remembers is which databases are still waiting for their turn in the
+// current cycle, in the order they will get it. Two simpler things were tried
+// and both starve a database that stays selected while the set around it
+// changes.
 //
-// It holds one small entry per schedule, so it grows with the number of
-// distinct collect[] profiles scraped against a target rather than with the
-// number of databases. Nothing removes an entry while the process runs, which
-// it shares with the last-success store, and bounded cleanup covers both.
+// A counter reduced by the size of the current set advances every scrape while
+// the position it lands on cycles through a subset of the members. On a set
+// alternating between two and four members, one database selected throughout
+// came first not once in thirty-two scrapes.
+//
+// Remembering the last database chosen and taking the first current name after
+// it fixes that and fails another: with exactly two members every scrape, one
+// that stays and one replaced each time by a newcomer sorting between the
+// previous choice and the one that stays, the newcomer is chosen every time.
+// Thirty-two scrapes, thirty-two newcomers, and the member selected throughout
+// came first not once. The set size never changed, so it is not about a growing
+// number of databases competing for capacity.
+//
+// What both miss is that a database already waiting has an outstanding turn,
+// and a database arriving later must not take it. So the waiting list is what
+// is kept, newcomers join the back of it, and departures leave it.
+//
+// One entry per schedule, holding at most as many names as the profile selects,
+// so it grows with the distinct collect[] profiles scraped against a target
+// times the databases each selects. Nothing removes an entry while the process
+// runs, which it shares with the last-success store, and bounded cleanup covers
+// both.
 type Store struct {
 	mu sync.Mutex
-	// last is the database this schedule offered the first attempt to.
-	last map[Key]string
+	// waiting is the databases yet to have their turn this cycle, in order.
+	waiting map[Key][]string
 }
 
 // New returns an empty store.
 func New() *Store {
-	return &Store{last: map[Key]string{}}
+	return &Store{waiting: map[Key][]string{}}
 }
 
 // Next picks which of the current members is offered the first attempt, and
@@ -112,24 +126,44 @@ func (s *Store) Next(k Key, members []string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// The first member after the one chosen last time. With no record, or with
-	// the last one at or after the end of the current set, this is the first
-	// member, which is also what a fresh process does.
-	chosen := 0
-	if last, ok := s.last[k]; ok {
-		chosen = len(members)
-		for i, name := range members {
-			if name > last {
-				chosen = i
-				break
-			}
-		}
-		if chosen == len(members) {
-			chosen = 0
+	selected := make(map[string]struct{}, len(members))
+	for _, name := range members {
+		selected[name] = struct{}{}
+	}
+
+	// Whoever is still waiting and is still selected, in the order they were
+	// going to be served. A database that left the selection leaves the list
+	// with it.
+	waiting := make([]string, 0, len(members))
+	stillWaiting := make(map[string]struct{}, len(members))
+	for _, name := range s.waiting[k] {
+		if _, ok := selected[name]; ok {
+			waiting = append(waiting, name)
+			stillWaiting[name] = struct{}{}
 		}
 	}
-	s.last[k] = members[chosen]
-	return chosen
+
+	// Then everyone else, at the back. A database that has just arrived, or
+	// that had its turn earlier in the cycle, goes behind the ones with a turn
+	// outstanding. Taking the members in their own order keeps this
+	// deterministic, and that order is the sorted one.
+	for _, name := range members {
+		if _, ok := stillWaiting[name]; !ok {
+			waiting = append(waiting, name)
+		}
+	}
+
+	// The front of the list has waited longest. It is served and the rest keep
+	// their places, so the next scrape carries on rather than starting again.
+	chosen := waiting[0]
+	s.waiting[k] = waiting[1:]
+
+	for i, name := range members {
+		if name == chosen {
+			return i
+		}
+	}
+	return 0
 }
 
 // Len is how many schedules are held, for the tests that bound this.
@@ -139,7 +173,7 @@ func (s *Store) Len() int {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.last)
+	return len(s.waiting)
 }
 
 // Order returns the positions 0 to n-1 rotated so that start comes first.
