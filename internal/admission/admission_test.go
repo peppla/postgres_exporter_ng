@@ -37,9 +37,9 @@ func TestAnExpiredDeadlineStopsWorkWithNoLimiter(t *testing.T) {
 
 // TestACancelledScrapeIsNotADeadline keeps the two apart.
 //
-// A cancelled scrape has not spent its time. A request whose client has gone
-// away is cancelled with its whole budget unused, so reporting it as a deadline
-// describes a budget that was never reached.
+// A cancelled scrape was stopped from outside rather than reaching its own
+// deadline, so reporting it as a deadline names a limit that was never
+// reached.
 func TestACancelledScrapeIsNotADeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -193,7 +193,8 @@ func (c *cancelAfterFirstCheck) Err() error {
 	return c.Context.Err()
 }
 
-// TestAvailabilityIsObservedRatherThanInferred is ChatGPT's round 162 finding.
+// TestAvailabilityIsObservedRatherThanInferred covers a limiter that was
+// entirely free being reported as a full one.
 //
 // Acquire fails only when the context ends, and it reads the context before it
 // looks at capacity, so it can fail without looking at capacity at all. An
@@ -230,10 +231,10 @@ func TestAvailabilityIsObservedRatherThanInferred(t *testing.T) {
 // the context it wraps, whose Done channel is closed throughout.
 //
 // It stages the same instant as cancelAfterFirstCheck, for a deadline rather
-// than a cancellation. Both are needed: with only the cancellation staging, the
-// observation below can be removed from Admit and every test still passes,
+// than a cancellation. Both are needed: with only the cancellation staging,
+// Admit's availability observation can be removed and every test still passes,
 // because the cancellation branch in the wait path returns the right answer
-// for the wrong reason. The mutation found that.
+// for the wrong reason.
 type deadlineAfterFirstCheck struct {
 	context.Context
 	calls int
@@ -248,7 +249,7 @@ func (c *deadlineAfterFirstCheck) Err() error {
 }
 
 // TestAFreeLimiterIsNotReportedAsFullWhenTimeRunsOut is the deadline half of
-// round 162's finding.
+// the same case.
 //
 // The limiter has a permit free the whole way through. Acquire reads the
 // context before it looks at capacity, so it returns the deadline error

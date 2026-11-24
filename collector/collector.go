@@ -154,7 +154,7 @@ var (
 	)
 	collectorDeferredDatabaseDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_deferred"),
-		"1 for each selected database this scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one, scrape_deadline for work the scrape ran out of time to start with no such shortage observed, and scrape_cancelled for work the scrape was cancelled before starting. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it for database-local work, because that connection is what cluster-wide collection runs on. So this can name one more database than databases_deferred counts, in the same way database_up can. Reasons are a closed set, never an error message. A deferral is not an error and is not counted in database_error.",
+		"1 for each selected database this scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one, scrape_deadline for work the scrape ran out of time to start, and scrape_cancelled for work the scrape was cancelled before starting. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it for database-local work, because that connection is what cluster-wide collection runs on. So this can name one more database than databases_deferred counts, in the same way database_up can. Reasons are a closed set, never an error message. A deferral is not an error and is not counted in database_error.",
 		[]string{"server", "datname", "reason"},
 		nil,
 	)

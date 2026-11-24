@@ -75,10 +75,10 @@ func fullLimitEngine(t *testing.T, collectors map[string]Collector) PostgresColl
 // connection permit free.
 //
 // A real deadline, not a cancellation. An earlier version of this fixture
-// cancelled the context instead, which is a different thing: a cancelled
-// scrape has not spent its time. Two versions of this file in a row named a
-// cause they were not staging, which is why each case below pins the reason
-// rather than only the outcome.
+// cancelled the context instead. The code reports the two apart, so a fixture
+// that stages one cannot stand in for the other. Two versions of this file in
+// a row named a cause they were not staging, which is why each case below pins
+// the reason rather than only the outcome.
 func expiredScrapeEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
 	t.Helper()
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))

@@ -29,13 +29,15 @@ const (
 	// asked, and none arrived before the scrape's time ran out.
 	NoPermit
 
-	// Deadline means the scrape's time ran out, and no shortage of connection
-	// permits was observed for this work.
+	// Deadline means the scrape's time ran out before this work was admitted.
+	// It can follow a wait for a connection permit, because a permit granted
+	// at the moment the time ran out is given back and reported here, so it
+	// does not mean permits were plentiful.
 	Deadline
 
-	// Cancelled means the scrape was cancelled. It says nothing about time
-	// remaining: a request whose client has gone away is cancelled with its
-	// whole budget unspent.
+	// Cancelled means the scrape was cancelled rather than reaching its own
+	// deadline. Cancellation can arrive at any point in a scrape, so this says
+	// nothing about how much of the budget was spent.
 	Cancelled
 )
 
@@ -89,9 +91,10 @@ func Admit(ctx context.Context, sema *semaphore.Weighted) (Permit, Decision) {
 		//
 		// So the two are reported apart on how the context ended. Time running
 		// out while this work waited for a permit it had already been refused
-		// is what NoPermit describes. Cancellation is not about the budget: it
-		// arrives with any amount of time left, and the work would have had
-		// its permit had the scrape continued.
+		// is what NoPermit describes. Cancellation is what Cancelled
+		// describes, and the observed fact is only that the scrape was
+		// cancelled while admission was pending. Whether a permit would have
+		// arrived is not known.
 		if errors.Is(err, context.Canceled) {
 			return Permit{}, Cancelled
 		}

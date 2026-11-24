@@ -118,9 +118,9 @@
   time or was cancelled named a connection limit that may have been entirely
   free. Whether a permit was available is now observed rather than read back
   out of that error. The reasons are `no_connection_permit` for work no permit
-  was available to, `scrape_deadline` for work whose time ran out with no such
-  shortage observed, and `scrape_cancelled` for work the scrape was cancelled
-  before starting, which happens with any amount of time left. A permit granted
+  was available to, `scrape_deadline` for work whose time ran out before it was
+  admitted, and `scrape_cancelled` for work the scrape was cancelled before
+  starting. A permit granted
   at the same moment the scrape ends is given back rather than held through
   work that cannot run.
 * [CHANGE] Database selection written in both the configuration file and a

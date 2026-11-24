@@ -503,8 +503,8 @@ func admissionCases(t *testing.T) []struct {
 	t.Cleanup(cancelWaiting)
 
 	// A real deadline, not a cancellation. An earlier version of this cancelled
-	// the context and called it an expired deadline, which is a different
-	// thing: a cancelled scrape has not spent its time.
+	// the context and called it an expired deadline. The code reports the two
+	// apart, so a fixture that stages one cannot stand in for the other.
 	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	t.Cleanup(cancelExpired)
 
