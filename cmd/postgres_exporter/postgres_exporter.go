@@ -899,9 +899,7 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 	// A fixed number of workers, each taking the next database as it finishes
 	// the last. Reaching that number is not a reason to leave a database out:
 	// every target is visited, and what stops one short is its own admission
-	// check against the scrape's deadline. One goroutine per target is what
-	// this replaced, which put the process at 1004 goroutines for a thousand
-	// targets while the only connection permit was held.
+	// check against the scrape's deadline.
 	fanout.Run(len(targets), e.dbWorkers, func(i int) {
 		{
 			target := targets[i]

@@ -600,9 +600,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 // A fixed number of workers, each taking the next database as it finishes the
 // last. Reaching that number is not a reason to leave a database out: every
 // database here is visited, and what stops one short is its own admission check
-// against the scrape's deadline. One goroutine per database is what this
-// replaced, which put the process at 1007 goroutines for a thousand databases
-// while the only connection permit was held.
+// against the scrape's deadline.
 //
 // Split out of Collect so this can be tested, which it could not be while it
 // sat behind a control connection a test has no way to open. The query engine's

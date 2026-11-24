@@ -1,11 +1,8 @@
 // Package fanout runs a fixed number of goroutines over a list of work items.
 //
-// Both engines fan out across the databases a scrape selected, and both used to
-// start one goroutine per database. Those goroutines then queued on the
-// connection limiter, so the limit bounded open connections and not the work
-// waiting behind them. With the only permit held and a thousand databases
-// selected, the process stood at a thousand and seven goroutines against a
-// baseline of three.
+// Both engines fan out across the databases a scrape selected. A goroutine per
+// database queues on the connection limiter, so the limit bounds open
+// connections and not the work waiting behind them.
 //
 // Here the goroutine count comes from the connection limit instead, and each
 // worker takes the next database as it finishes the last one. The limit on

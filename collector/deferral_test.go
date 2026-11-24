@@ -399,8 +399,8 @@ func TestFewerWorkersThanDatabasesStillCoversThemAll(t *testing.T) {
 // engine rather than for the pool on its own.
 //
 // Every permit is held, so each worker parks in the limiter while the remaining
-// databases wait for a worker. One goroutine per database is what this
-// replaced, which stood at 1007 goroutines for a thousand databases.
+// databases wait for a worker. A goroutine per database would show four hundred
+// of them waiting here.
 func TestManyDatabasesBehindHeldPermitsStayBounded(t *testing.T) {
 	const databases, workers = 400, 4
 

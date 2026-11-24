@@ -827,8 +827,8 @@ func manyNames(n int) []string {
 	return out
 }
 
-// TestEveryDatabaseIsVisitedWithFewerWorkersThanDatabases is the first half of
-// ChatGPT's acceptance check for the bounded pool.
+// TestEveryDatabaseIsVisitedWithFewerWorkersThanDatabases covers the width of
+// the fan-out against the size of the selected set.
 //
 // Running fewer workers than databases must not cap how many databases a scrape
 // covers. These targets point somewhere that will not answer, so each one ends
@@ -873,13 +873,12 @@ func TestEveryDatabaseIsVisitedWithFewerWorkersThanDatabases(t *testing.T) {
 	}
 }
 
-// TestManyDatabasesBehindAHeldPermitStayBounded is the second half of that
-// check, and the measurement ChatGPT took of the unbounded version.
+// TestManyDatabasesBehindAHeldPermitStayBounded is the goroutine bound.
 //
-// The only permit is held throughout, so every worker parks in the limiter.
-// One goroutine per database put the process at a thousand and seven of them
-// for a thousand databases. Here the count has to come from the worker number
-// instead, and every database that never started has to be deferred and named.
+// The permits are held throughout, so every worker parks in the limiter. The
+// goroutine count has to come from the worker number rather than from the size
+// of the selected set, and every database that never started has to be deferred
+// and named.
 func TestManyDatabasesBehindAHeldPermitStayBounded(t *testing.T) {
 	const databases, workers = 500, 4
 

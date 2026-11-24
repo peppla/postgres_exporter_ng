@@ -58,12 +58,8 @@ func TestConcurrencyIsCappedByTheWorkerCount(t *testing.T) {
 	}
 }
 
-// TestWorkerCountDoesNotGrowWithTheWorkCount is ChatGPT's acceptance check for
-// the bounded pool, in the small.
-//
-// One goroutine per item is what this replaced, so the measurement that matters
-// is the goroutine count while the work is held, at two sizes that differ by two
-// orders of magnitude.
+// TestWorkerCountDoesNotGrowWithTheWorkCount measures the goroutine count while
+// the work is held, at two sizes two orders of magnitude apart.
 func TestWorkerCountDoesNotGrowWithTheWorkCount(t *testing.T) {
 	const workers = 4
 
@@ -117,10 +113,9 @@ func TestWorkerCountDoesNotGrowWithTheWorkCount(t *testing.T) {
 // the rest to be finished by workers that moved on, rather than waiting.
 //
 // The assertion is what was true when the slow item was released, not what was
-// true at the end. An earlier version checked only that all fifty items
-// eventually finished, which a strided slice per worker also satisfies: the
-// items behind the slow one finish after the watchdog gives up and releases it.
-// That mutation passed every test in this file.
+// true at the end. A strided slice per worker also finishes all fifty items,
+// because the ones behind the slow item finish once the watchdog gives up and
+// releases it, so the end state does not tell the two apart.
 func TestAWorkerTakesTheNextItemWhenItFinishes(t *testing.T) {
 	const items, workers = 50, 4
 
