@@ -109,6 +109,12 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 			// several databases, so its selected set had the same database
 			// offered the first attempt every time.
 			WithRotation(stores.Rotation),
+			// Without this the freshness series still appeared, because the
+			// time of a success is published from the success itself. What was
+			// lost was every earlier time: a request that could not connect
+			// published no freshness at all, where it should report when each
+			// database last worked. That is what the store is for.
+			WithLastSuccess(stores.LastSuccess),
 		}
 
 		// Both engines on this endpoint open through the same clamping

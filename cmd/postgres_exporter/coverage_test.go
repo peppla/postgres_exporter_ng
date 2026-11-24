@@ -1207,3 +1207,77 @@ func TestASecondServerGetsATurn(t *testing.T) {
 		t.Errorf("over twelve calls only %v was ever first, so a later server never gets an opportunity", firstOf)
 	}
 }
+
+// TestHealthAnswersForWorkThatNeverStarted covers the rule that decides pg_up
+// and pg_exporter_last_scrape_error.
+//
+// The case that was wrong: a role that cannot log in. Discovery's connection
+// fails, so the fan-out has only the seed and defers it, and the fan-out's own
+// counts are all zero. Reading only those reported the server as up and the
+// scrape as clean, while the server log recorded the refused login.
+func TestHealthAnswersForWorkThatNeverStarted(t *testing.T) {
+	for _, c := range []struct {
+		name                                  string
+		targets, deferred, connErrors, errors int
+		d                                     discovery
+		wantUp, wantFailed                    float64
+	}{
+		{
+			name: "a login that was refused, with nothing attempted after it",
+			// What ChatGPT measured: 1/0/0/0/1, discovery_success 0.
+			targets: 1, deferred: 1,
+			d:      discovery{ok: false, connectFailures: 1},
+			wantUp: 0, wantFailed: 1,
+		},
+		{
+			name:    "every target failed at the connection",
+			targets: 2, connErrors: 2, errors: 2,
+			d:      discovery{ok: true},
+			wantUp: 0, wantFailed: 1,
+		},
+		{
+			name:    "one target connected and another did not",
+			targets: 2, connErrors: 1, errors: 1,
+			d:      discovery{ok: true},
+			wantUp: 1, wantFailed: 1,
+		},
+		{
+			name:    "a query failed on a connection that worked",
+			targets: 1, errors: 1,
+			d:      discovery{ok: true},
+			wantUp: 1, wantFailed: 1,
+		},
+		{
+			name: "everything was deferred and nothing tried to connect",
+			// Nothing observed the server either way, so this says nothing
+			// about it. The deferral is what reports the shortfall.
+			targets: 3, deferred: 3,
+			d:      discovery{ok: true},
+			wantUp: 1, wantFailed: 0,
+		},
+		{
+			name:    "a healthy scrape",
+			targets: 3,
+			d:       discovery{ok: true},
+			wantUp:  1, wantFailed: 0,
+		},
+		{
+			name: "discovery's catalogue query failed on a connection that worked",
+			// Not a connection failure, so the server is up, but the scrape
+			// did not do what it meant to.
+			targets: 1,
+			d:       discovery{ok: false},
+			wantUp:  1, wantFailed: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up, failed := health(c.targets, c.deferred, c.connErrors, c.errors, c.d)
+			if up != c.wantUp {
+				t.Errorf("pg_up is %v, want %v", up, c.wantUp)
+			}
+			if failed != c.wantFailed {
+				t.Errorf("last_scrape_error is %v, want %v", failed, c.wantFailed)
+			}
+		})
+	}
+}

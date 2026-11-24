@@ -14,6 +14,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -110,6 +111,14 @@ type discovery struct {
 	// notIncluded counts databases a non-empty include list left out.
 	notIncluded int
 	ok          bool
+	// connectFailures counts the seeds whose connection itself did not work,
+	// as against a catalogue query that failed on a connection that did.
+	//
+	// Kept apart because the two say different things to an operator. A
+	// scrape that could not log in used to report the server as up, because
+	// the fan-out after it attempted nothing and so reported no failure of
+	// its own, and nothing carried what discovery had already seen.
+	connectFailures int
 }
 
 func (e *Exporter) discoverDatabaseDSNs() discovery {
@@ -159,6 +168,10 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 
 		catalog, err := e.getDatabaseNames(dsn)
 		if err != nil {
+			var connectErr *ErrorConnectToServer
+			if errors.As(err, &connectErr) {
+				d.connectFailures++
+			}
 			// Discovery failed for this seed. The DSN list keeps the seed
 			// alone, so coverage silently collapsed to one database -- which
 			// is exactly what ok=false exists to stop being silent.
@@ -243,7 +256,10 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 	server, err := e.GetServer(e.ctx, dsn)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error opening connection to database", "dsn", loggableDSN(dsn), "err", err)
-		return nil, err
+		// Typed, so the caller can tell a connection that did not work from a
+		// catalogue query that failed on one that did. scrapeDSN reports the
+		// same distinction for the same reason.
+		return nil, &ErrorConnectToServer{fmt.Sprintf("Error opening connection to database (%s): %s", loggableDSN(dsn), err.Error())}
 	}
 	defer server.Close()
 

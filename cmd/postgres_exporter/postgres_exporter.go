@@ -885,19 +885,40 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	e.coverage.setOutcome(len(d.targets), errorsCount, deferredCount)
 
+	up, failed := health(len(d.targets), deferredCount, connectionErrorsCount, errorsCount, d)
+	e.psqlUp.Set(up)
+	e.error.Set(failed)
+}
+
+// health is what this scrape says about the server and about itself.
+//
+// Split out because it has to answer for work the fan-out never started as well
+// as work it did, and those two came from different places: the fan-out's own
+// counts, and what discovery saw before the fan-out began. Reading only the
+// first is how a scrape that could not log in at all reported the server as up.
+//
+// up is 1 when something connected, 0 when something tried to connect and
+// nothing succeeded, and 1 when nothing tried, because work that never started
+// says nothing about the server either way. failed is 1 when anything went
+// wrong, discovery included.
+func health(targets, deferred, connectionErrors, errors int, d discovery) (up, failed float64) {
+	// A target that was attempted and did not fail at the connection is one
+	// that connected.
+	connected := targets - deferred - connectionErrors
+
 	switch {
-	case connectionErrorsCount >= len(d.targets):
-		e.psqlUp.Set(0)
+	case connected > 0:
+		up = 1
+	case connectionErrors > 0 || d.connectFailures > 0:
+		up = 0
 	default:
-		e.psqlUp.Set(1) // Didn't fail, can mark connection as up for this scrape.
+		up = 1
 	}
 
-	switch errorsCount {
-	case 0:
-		e.error.Set(0)
-	default:
-		e.error.Set(1)
+	if errors > 0 || !d.ok {
+		failed = 1
 	}
+	return up, failed
 }
 
 // rotateTargets puts this request's targets in the order its schedule says.
