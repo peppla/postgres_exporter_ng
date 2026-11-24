@@ -123,6 +123,7 @@ not any collector succeeded.
 | `pg_collector_database_deferred` | gauge | boolean | 15-19 | One per database this scrape did not start work on, labelled `reason` with `no_connection_permit`. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it, so it can name one more database than `databases_deferred` counts, in the same way `database_up` can. A deferral is not an error and is never counted in `database_error`. |
 | `pg_scrape_collector_success` | gauge | boolean | 15-19 | Whether one collector finished on one database. `datname` is empty for a cluster collector, which Prometheus treats as absent. |
 | `pg_scrape_collector_duration_seconds` | gauge | seconds | 15-19 | How long one collector took on one database. |
+| `pg_collector_last_success_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When this collector last ran on this database without error. Absent for a collector this process has never run successfully there, which is not the same as one that last succeeded at the epoch. Published on the paths that run no collector too, so a database that cannot be connected to keeps the time it last worked, and omitted for a database the configuration no longer selects while that state is kept for a request that selects it again. The `target` label is this process's identity for the connection; it is not stable across restarts. |
 
 ## database
 
