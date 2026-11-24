@@ -49,6 +49,19 @@ type Key struct {
 	Collector string
 }
 
+// WholeDatabase is Key.Collector for a record about a database rather than
+// about one collector in it: every database-local collector the engine has,
+// run without error on that database in one scrape.
+//
+// No collector has an empty name, so this cannot collide with one. It is kept
+// as a named constant because an empty string in a key field otherwise reads
+// as a field nobody filled in.
+//
+// A request that selected only some collectors does not record it. Such a
+// request has not shown that the rest would have worked, and a database-level
+// time written from a narrow request would claim it had.
+const WholeDatabase = ""
+
 // The engines, as Key.Engine.
 const (
 	// EngineQuery is the custom-query engine, whose jobs are the built-in
