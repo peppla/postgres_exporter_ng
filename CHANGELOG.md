@@ -110,6 +110,19 @@
   longer counts work that never started, and `databases_attempted` and
   `databases_deferred` say how much did and did not. An alert on failures no
   longer fires because the exporter was busy.
+* [BUGFIX] A database the exporter did not start work on says which of three
+  things stopped it, where it used to say `reason="no_connection_permit"` for
+  all of them. The connection limiter reports an expired deadline, a
+  cancellation and a genuine wait for capacity with the same error, and the
+  exporter read that error as the limit being full, so a scrape that ran out of
+  time or was cancelled named a connection limit that may have been entirely
+  free. Whether a permit was available is now observed rather than read back
+  out of that error. The reasons are `no_connection_permit` for work no permit
+  was available to, `scrape_deadline` for work whose time ran out before it was
+  admitted, and `scrape_cancelled` for work the scrape was cancelled before
+  starting. A permit granted
+  at the same moment the scrape ends is given back rather than held through
+  work that cannot run.
 * [CHANGE] Database selection written in both the configuration file and a
   deprecated flag is refused at startup instead of being resolved at scrape
   time. The exporter exits rather than starting and serving a response with no

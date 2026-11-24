@@ -54,9 +54,30 @@ const (
 	// database, and a deferral says the exporter ran out of room.
 	ReasonNotAttempted = "not_attempted"
 
-	// ReasonNoPermit is a deferral for want of a connection permit, which is
-	// the only reason anything is deferred today.
+	// ReasonNoPermit is a deferral for work that waited for a connection
+	// permit and did not get one.
 	ReasonNoPermit = "no_connection_permit"
+
+	// ReasonDeadline is a deferral for work the scrape ran out of time to
+	// start. Nothing was contacted, so this is about the exporter's own clock
+	// rather than the database. It does not mean connection permits were
+	// plentiful, because work that waited for one and was granted it as the
+	// time ran out is reported here.
+	//
+	// Separate from ReasonNoPermit because they are different observations,
+	// not because either one prescribes a change. The deadline comes from the
+	// timeout header, the fallback, the caps and the parent context together,
+	// so neither reason on its own says which control to look at.
+	ReasonDeadline = "scrape_deadline"
+
+	// ReasonCancelled is a deferral for work the scrape was cancelled before
+	// starting, or while it waited for a connection permit.
+	//
+	// Separate from ReasonDeadline because the scrape was stopped from outside
+	// rather than reaching its own limit, and reporting it as a deadline would
+	// name a limit that was never reached. Cancellation can arrive at any
+	// point, so it says nothing about how much of the budget was spent.
+	ReasonCancelled = "scrape_cancelled"
 )
 
 // List is a configured list of database names that remembers whether it was

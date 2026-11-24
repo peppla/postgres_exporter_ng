@@ -29,6 +29,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/percona/postgres_exporter/internal/dbselect"
@@ -36,24 +37,98 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// cancelledEngine is an engine whose every connection permit request fails,
-// which is what a scrape at its connection limit does.
+// deferralEngine builds an engine around one context and one connection limit.
 //
 // The collectors are the caller's, because what the engine reports depends on
 // which scopes were selected. An engine with no collectors at all asked for no
 // database-local work, so every case about a deferred database has to select
 // a database-scoped one.
-func cancelledEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func deferralEngine(ctx context.Context, sema *semaphore.Weighted, collectors map[string]Collector) PostgresCollector {
 	return PostgresCollector{
 		Collectors: collectors,
 		logger:     log.NewNopLogger(),
 		ctx:        ctx,
-		connSema:   semaphore.NewWeighted(1),
+		connSema:   sema,
 		instance:   &instance{dsn: "postgresql://probe@198.51.100.9:5432/app", name: "198.51.100.9:5432"},
 	}
+}
+
+// fullLimitEngine is an engine whose only connection permit is taken, so work
+// that asks for one waits and the wait ends without it.
+//
+// The permit is held for the whole test and the context carries a short
+// deadline, which is how this ends in a running exporter: the work queues
+// behind other databases and the scrape runs out of time while it waits.
+func fullLimitEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
+	t.Helper()
+	sema := semaphore.NewWeighted(1)
+	if !sema.TryAcquire(1) {
+		t.Fatal("the fixture could not take the only permit")
+	}
+	t.Cleanup(func() { sema.Release(1) })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	t.Cleanup(cancel)
+	return deferralEngine(ctx, sema, collectors)
+}
+
+// expiredScrapeEngine is an engine whose deadline has already passed, with a
+// connection permit free.
+//
+// A real deadline, not a cancellation. An earlier version of this fixture
+// cancelled the context instead. The code reports the two apart, so a fixture
+// that stages one cannot stand in for the other. Two versions of this file in
+// a row named a cause they were not staging, which is why each case below pins
+// the reason rather than only the outcome.
+func expiredScrapeEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancel)
+	return deferralEngine(ctx, semaphore.NewWeighted(1), collectors)
+}
+
+// cancelledScrapeEngine is an engine whose scrape was cancelled, with a
+// connection permit free and time still on the clock.
+func cancelledScrapeEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	cancel()
+	t.Cleanup(cancel)
+	return deferralEngine(ctx, semaphore.NewWeighted(1), collectors)
+}
+
+// The ways a scrape stops before it starts a database, and the label each one
+// publishes.
+//
+// Every case below runs against all of them. A deferral that names the wrong
+// cause is worse than one that names none, because it describes a constraint
+// the exporter did not meet.
+var deferralCauses = []struct {
+	name   string
+	engine func(*testing.T, map[string]Collector) PostgresCollector
+	reason string
+}{
+	{"a full connection limit", fullLimitEngine, dbselect.ReasonNoPermit},
+	{"a deadline that had passed", expiredScrapeEngine, dbselect.ReasonDeadline},
+	{"a deadline that had passed with no limit configured", unlimitedExpiredEngine, dbselect.ReasonDeadline},
+	{"a cancelled scrape", cancelledScrapeEngine, dbselect.ReasonCancelled},
+}
+
+// unlimitedExpiredEngine is an engine with no connection limit at all, whose
+// scrape has run out of time.
+//
+// This is the case that had no coverage. With no limiter to ask, the engine
+// did not read the context, so work was started after the deadline had passed,
+// its connection failed on the dead context, and the database was reported as
+// one the exporter could not connect to.
+//
+// main always constructs a limiter, so the shipped binary does not take this
+// path. NewPostgresCollector is exported and the limiter is an option, so
+// something embedding this package does.
+func unlimitedExpiredEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancel)
+	return deferralEngine(ctx, nil, collectors)
 }
 
 // publishedByName runs a collector function and returns what reached the
@@ -88,37 +163,41 @@ func familyName(m prometheus.Metric) string {
 
 // TestADeferredDatabaseIsNotAFailure covers the per-database fan-out.
 func TestADeferredDatabaseIsNotAFailure(t *testing.T) {
-	p := cancelledEngine(t, map[string]Collector{})
-	target := dbTarget{datname: "app", dsn: "postgresql://probe@198.51.100.9:5432/app"}
+	for _, cause := range deferralCauses {
+		t.Run(cause.name, func(t *testing.T) {
+			p := cause.engine(t, map[string]Collector{})
+			target := dbTarget{datname: "app", dsn: "postgresql://probe@198.51.100.9:5432/app"}
 
-	var outcome databaseOutcome
-	published := publishedByName(func(ch chan<- prometheus.Metric) {
-		outcome = p.collectDatabase(ch, target, map[string]Collector{}, "198.51.100.9:5432", "")
-	})
+			var outcome databaseOutcome
+			published := publishedByName(func(ch chan<- prometheus.Metric) {
+				outcome = p.collectDatabase(ch, target, map[string]Collector{}, "198.51.100.9:5432", "")
+			})
 
-	if outcome != outcomeDeferred {
-		t.Errorf("a database with no connection permit was reported to its caller as %v, want deferred", outcome)
-	}
-	deferred, ok := published["pg_collector_database_deferred"]
-	if !ok {
-		t.Fatalf("no deferral was published: %v", published)
-	}
-	if deferred.labels["reason"] != dbselect.ReasonNoPermit {
-		t.Errorf("the deferral reason is %q, want %q", deferred.labels["reason"], dbselect.ReasonNoPermit)
-	}
-	if deferred.labels["datname"] != "app" {
-		t.Errorf("the deferral names %q", deferred.labels["datname"])
-	}
-	if _, ok := published["pg_collector_database_error"]; ok {
-		t.Error("a deferral was published as an error, so an alert on failures fires for a busy exporter")
-	}
-	// Still not reached, which is what database_up says.
-	up, ok := published["pg_collector_database_up"]
-	if !ok {
-		t.Fatal("no database_up was published for a deferred database, so it reads as a database nobody selected")
-	}
-	if up.value != 0 {
-		t.Errorf("database_up is %v for a database nothing connected to", up.value)
+			if outcome != outcomeDeferred {
+				t.Errorf("a database the scrape had no room for was reported to its caller as %v, want deferred", outcome)
+			}
+			deferred, ok := published["pg_collector_database_deferred"]
+			if !ok {
+				t.Fatalf("no deferral was published: %v", published)
+			}
+			if deferred.labels["reason"] != cause.reason {
+				t.Errorf("the deferral reason is %q, want %q", deferred.labels["reason"], cause.reason)
+			}
+			if deferred.labels["datname"] != "app" {
+				t.Errorf("the deferral names %q", deferred.labels["datname"])
+			}
+			if _, ok := published["pg_collector_database_error"]; ok {
+				t.Error("a deferral was published as an error, so an alert on failures fires for a busy exporter")
+			}
+			// Still not reached, which is what database_up says.
+			up, ok := published["pg_collector_database_up"]
+			if !ok {
+				t.Fatal("no database_up was published for a deferred database, so it reads as a database nobody selected")
+			}
+			if up.value != 0 {
+				t.Errorf("database_up is %v for a database nothing connected to", up.value)
+			}
+		})
 	}
 }
 
@@ -129,41 +208,49 @@ func TestADeferredDatabaseIsNotAFailure(t *testing.T) {
 // A database-scoped collector is selected, so this scrape did mean to cover a
 // database and the counts say so.
 func TestADeferredControlConnectionIsNotAFailure(t *testing.T) {
-	withScopedCollector(t, "deferral_test_local", scopeDatabase)
-	p := cancelledEngine(t, map[string]Collector{"deferral_test_local": quietCollector{}})
+	for _, cause := range deferralCauses {
+		t.Run(cause.name, func(t *testing.T) {
+			withScopedCollector(t, "deferral_test_local", scopeDatabase)
+			p := cause.engine(t, map[string]Collector{"deferral_test_local": quietCollector{}})
 
-	published := publishedByName(func(ch chan<- prometheus.Metric) {
-		p.Collect(ch)
-	})
+			published := publishedByName(func(ch chan<- prometheus.Metric) {
+				p.Collect(ch)
+			})
 
-	if _, ok := published["pg_collector_database_deferred"]; !ok {
-		t.Fatalf("no deferral was published: %v", published)
-	}
-	if _, ok := published["pg_collector_database_error"]; ok {
-		t.Error("a deferred control connection was published as an error")
-	}
-	count, ok := published["pg_collector_databases_deferred"]
-	if !ok {
-		t.Fatal("no deferral count was published")
-	}
-	if count.value != 1 {
-		t.Errorf("the deferral count is %v, want the one database this engine meant to cover", count.value)
-	}
-	// The set it meant to cover is still reported, because a shortfall with no
-	// record of the intent is indistinguishable from no shortfall.
-	if _, ok := published["pg_collector_databases_selected"]; !ok {
-		t.Error("nothing was published about what this scrape intended to cover")
-	}
-	if _, ok := published["pg_collector_databases_discovered"]; ok {
-		t.Error("a discovered total was published although the catalogue was never read")
-	}
-	// Database-local work was selected and its set could not be determined,
-	// which is what the discovery status is for.
-	status, ok := published["pg_collector_database_discovery_success"]
-	if !ok {
-		t.Error("nothing was said about a set of databases this scrape wanted and could not get")
-	} else if status.value != 0 {
-		t.Errorf("discovery_success is %v when no connection was available to read the catalogue", status.value)
+			deferred, ok := published["pg_collector_database_deferred"]
+			if !ok {
+				t.Fatalf("no deferral was published: %v", published)
+			}
+			if deferred.labels["reason"] != cause.reason {
+				t.Errorf("the deferral reason is %q, want %q", deferred.labels["reason"], cause.reason)
+			}
+			if _, ok := published["pg_collector_database_error"]; ok {
+				t.Error("a deferred control connection was published as an error")
+			}
+			count, ok := published["pg_collector_databases_deferred"]
+			if !ok {
+				t.Fatal("no deferral count was published")
+			}
+			if count.value != 1 {
+				t.Errorf("the deferral count is %v, want the one database this engine meant to cover", count.value)
+			}
+			// The set it meant to cover is still reported, because a shortfall with no
+			// record of the intent is indistinguishable from no shortfall.
+			if _, ok := published["pg_collector_databases_selected"]; !ok {
+				t.Error("nothing was published about what this scrape intended to cover")
+			}
+			if _, ok := published["pg_collector_databases_discovered"]; ok {
+				t.Error("a discovered total was published although the catalogue was never read")
+			}
+			// Database-local work was selected and its set could not be determined,
+			// which is what the discovery status is for.
+			status, ok := published["pg_collector_database_discovery_success"]
+			if !ok {
+				t.Error("nothing was said about a set of databases this scrape wanted and could not get")
+			} else if status.value != 0 {
+				t.Errorf("discovery_success is %v when no connection was available to read the catalogue", status.value)
+			}
+		})
 	}
 }
 
@@ -175,46 +262,50 @@ func TestADeferredControlConnectionIsNotAFailure(t *testing.T) {
 // is said about a set of databases. The two describe different things here,
 // which the help text says.
 func TestAClusterOnlyDeferralSelectsNoDatabase(t *testing.T) {
-	withScopedCollector(t, "deferral_test_cluster", scopeCluster)
-	p := cancelledEngine(t, map[string]Collector{"deferral_test_cluster": quietCollector{}})
+	for _, cause := range deferralCauses {
+		t.Run(cause.name, func(t *testing.T) {
+			withScopedCollector(t, "deferral_test_cluster", scopeCluster)
+			p := cause.engine(t, map[string]Collector{"deferral_test_cluster": quietCollector{}})
 
-	published := publishedByName(func(ch chan<- prometheus.Metric) {
-		p.Collect(ch)
-	})
+			published := publishedByName(func(ch chan<- prometheus.Metric) {
+				p.Collect(ch)
+			})
 
-	deferred, ok := published["pg_collector_database_deferred"]
-	if !ok {
-		t.Fatalf("the deferred connection was not named: %v", published)
-	}
-	if deferred.labels["reason"] != dbselect.ReasonNoPermit {
-		t.Errorf("the deferral reason is %q", deferred.labels["reason"])
-	}
-	count, ok := published["pg_collector_databases_deferred"]
-	if !ok {
-		t.Fatal("no deferral count was published")
-	}
-	if count.value != 0 {
-		t.Errorf("the deferral count is %v, want none: no database-local work was selected", count.value)
-	}
-	selected, ok := published["pg_collector_databases_selected"]
-	if !ok {
-		t.Fatal("nothing was published about what this scrape intended to cover")
-	}
-	if selected.value != 0 {
-		t.Errorf("a cluster-only scrape reported %v databases selected", selected.value)
-	}
-	if _, ok := published["pg_collector_database_discovery_success"]; ok {
-		t.Error("a cluster-only deferral reports discovery status despite no discovery requested")
-	}
-	if _, ok := published["pg_collector_database_error"]; ok {
-		t.Error("a deferral was published as an error")
+			deferred, ok := published["pg_collector_database_deferred"]
+			if !ok {
+				t.Fatalf("the deferred connection was not named: %v", published)
+			}
+			if deferred.labels["reason"] != cause.reason {
+				t.Errorf("the deferral reason is %q, want %q", deferred.labels["reason"], cause.reason)
+			}
+			count, ok := published["pg_collector_databases_deferred"]
+			if !ok {
+				t.Fatal("no deferral count was published")
+			}
+			if count.value != 0 {
+				t.Errorf("the deferral count is %v, want none: no database-local work was selected", count.value)
+			}
+			selected, ok := published["pg_collector_databases_selected"]
+			if !ok {
+				t.Fatal("nothing was published about what this scrape intended to cover")
+			}
+			if selected.value != 0 {
+				t.Errorf("a cluster-only scrape reported %v databases selected", selected.value)
+			}
+			if _, ok := published["pg_collector_database_discovery_success"]; ok {
+				t.Error("a cluster-only deferral reports discovery status despite no discovery requested")
+			}
+			if _, ok := published["pg_collector_database_error"]; ok {
+				t.Error("a deferral was published as an error")
+			}
+		})
 	}
 }
 
 // TestDeferralReasonsAreAClosedSet keeps the label from becoming an error
 // string, which is how a bounded label set becomes unbounded.
 func TestDeferralReasonsAreAClosedSet(t *testing.T) {
-	for _, reason := range []string{dbselect.ReasonNoPermit, dbselect.ReasonNotAttempted} {
+	for _, reason := range []string{dbselect.ReasonNoPermit, dbselect.ReasonNotAttempted, dbselect.ReasonDeadline, dbselect.ReasonCancelled} {
 		if strings.ContainsAny(reason, " .:\"") {
 			t.Errorf("%q does not look like a closed-set value", reason)
 		}

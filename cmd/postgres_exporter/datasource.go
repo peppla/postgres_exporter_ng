@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/admission"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
@@ -36,7 +37,26 @@ const (
 	reasonConnect      = dbselect.ReasonConnect
 	reasonScrape       = dbselect.ReasonScrape
 	reasonNotAttempted = dbselect.ReasonNotAttempted
+	reasonNoPermit     = dbselect.ReasonNoPermit
+	reasonDeadline     = dbselect.ReasonDeadline
+	reasonCancelled    = dbselect.ReasonCancelled
 )
+
+// deferralReason is the bounded label for work that was not admitted.
+//
+// Called only where the decision is not admission.Admitted. Admitted work is not
+// deferred, and giving it a reason anyway would publish a database as deferred
+// while it was being scraped.
+func deferralReason(d admission.Decision) string {
+	switch d {
+	case admission.Cancelled:
+		return reasonCancelled
+	case admission.Deadline:
+		return reasonDeadline
+	default:
+		return reasonNoPermit
+	}
+}
 
 // databaseRef identifies one database for reporting: which server, and which
 // database on it.

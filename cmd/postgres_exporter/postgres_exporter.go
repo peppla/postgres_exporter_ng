@@ -30,6 +30,7 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/internal/admission"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
@@ -888,28 +889,32 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 		go func() {
 			defer wg.Done()
 
-			if e.connSema != nil {
-				if err := e.connSema.Acquire(e.ctx, 1); err != nil {
-					level.Warn(logger).Log("msg", "Failed to acquire semaphore", "err", err)
-					// This database is not scraped, so it must not be
-					// counted as one that was: returning silently here would
-					// publish a database that was never attempted as
-					// successfully covered, which is the false claim these
-					// metrics exist to prevent.
-					//
-					// Deferred rather than failed. Nothing was tried, so
-					// nothing is known to be wrong with this database, and
-					// the two call for different responses: a failure points
-					// at the database and a deferral points at the budget.
-					// It is deliberately not a connection error either,
-					// because nothing was connected to, so pg_up keeps the
-					// meaning it had.
-					deferredCount.Add(1)
-					e.coverage.setDatabaseDeferred(target.databaseRef, dbselect.ReasonNoPermit)
-					return
-				}
-				defer e.connSema.Release(1)
+			// Admission is checked whether or not a connection limit is
+			// configured, and the decision says which of the two ran out. The
+			// limiter answers an expired deadline and a full limit with the
+			// same error, so reading that error alone reported every expired
+			// scrape as a connection limit.
+			permit, decision := admission.Admit(e.ctx, e.connSema)
+			if decision != admission.Admitted {
+				// This database is not scraped, so it must not be counted as
+				// one that was: returning silently here would publish a
+				// database that was never attempted as successfully covered,
+				// which is the false claim these metrics exist to prevent.
+				//
+				// Deferred rather than failed. Nothing was tried, so nothing
+				// is known to be wrong with this database, and the two call
+				// for different responses: a failure points at the database
+				// and a deferral points at the budget. It is not a connection
+				// error either, because nothing was connected to, so pg_up
+				// keeps the meaning it had.
+				reason := deferralReason(decision)
+				level.Warn(logger).Log("msg", "Deferred a database",
+					"datname", target.datname, "reason", reason)
+				deferredCount.Add(1)
+				e.coverage.setDatabaseDeferred(target.databaseRef, reason)
+				return
 			}
+			defer permit.Release()
 			if err := e.scrapeDSN(ch, &target); err != nil {
 				errorsCount.Add(1)
 

@@ -24,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -474,45 +473,98 @@ func TestUnreachableDatabasesAreNamed(t *testing.T) {
 // names attached. Work that never started must not be reported as covered, and
 // must say that it never started rather than that it failed to connect: the
 // two call for different responses.
+// The ways a scrape runs out of room before it starts a database, and the
+// label each one has to publish.
+//
+// The cases with a limiter are what the shipped binary does, where one is
+// always configured. Before this change every one of them reported
+// no_connection_permit, so an expired or cancelled scrape named a limit that
+// may have been entirely free.
+//
+// The third case had no coverage at all. With no limiter the engine did not
+// read the context, so every database was attempted after the deadline had
+// passed and the scrape reported a server it could not connect to. main always
+// constructs a limiter, so this path is reached through NewExporter rather
+// than by running the exporter.
+func admissionCases(t *testing.T) []struct {
+	name   string
+	ctx    context.Context
+	sema   *semaphore.Weighted
+	reason string
+} {
+	t.Helper()
+
+	full := semaphore.NewWeighted(1)
+	if !full.TryAcquire(1) {
+		t.Fatal("the fixture could not take the only permit")
+	}
+	t.Cleanup(func() { full.Release(1) })
+	waiting, cancelWaiting := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	t.Cleanup(cancelWaiting)
+
+	// A real deadline, not a cancellation. An earlier version of this cancelled
+	// the context and called it an expired deadline. The code reports the two
+	// apart, so a fixture that stages one cannot stand in for the other.
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancelExpired)
+
+	cancelled, cancelNow := context.WithTimeout(context.Background(), time.Hour)
+	cancelNow()
+	t.Cleanup(cancelNow)
+
+	return []struct {
+		name   string
+		ctx    context.Context
+		sema   *semaphore.Weighted
+		reason string
+	}{
+		{"a full connection limit", waiting, full, reasonNoPermit},
+		{"a deadline that had passed", expired, semaphore.NewWeighted(1), reasonDeadline},
+		{"a deadline that had passed with no limit configured", expired, nil, reasonDeadline},
+		{"a cancelled scrape", cancelled, semaphore.NewWeighted(1), reasonCancelled},
+	}
+}
+
 func TestUnattemptedWorkIsNamedNotAttempted(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // every Acquire now fails immediately
+	for _, admission := range admissionCases(t) {
+		t.Run(admission.name, func(t *testing.T) {
+			targets := targetsForDSN("127.0.0.1:1", "one", "two")
+			e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
+				WithContext(admission.ctx),
+				WithConnectionsSemaphore(admission.sema),
+			)
+			e.coverage.setSelection(true, true, 2, targets, nil, 0)
 
-	targets := targetsForDSN("127.0.0.1:1", "one", "two")
-	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
-		WithContext(ctx),
-		WithConnectionsSemaphore(semaphore.NewWeighted(1)),
-	)
-	e.coverage.setSelection(true, true, 2, targets, nil, 0)
+			ch, stop := drain()
+			failed, connFailures, deferred := e.scrapeTargets(ch, targets)
+			stop()
 
-	ch, stop := drain()
-	failed, connFailures, deferred := e.scrapeTargets(ch, targets)
-	stop()
-
-	if deferred != len(targets) {
-		t.Fatalf("%d of %d targets were deferred, want all of them", deferred, len(targets))
-	}
-	if failed != 0 {
-		t.Errorf("%d targets failed: nothing was tried, so nothing is known to be wrong with them", failed)
-	}
-	if connFailures != 0 {
-		t.Errorf("%d connection failures: nothing was connected to, so pg_up must keep its meaning", connFailures)
-	}
-	g := series(t, e.coverage)
-	for _, name := range []string{"one", "two"} {
-		if g["pg_exporter_database_deferred{datname="+name+",reason="+dbselect.ReasonNoPermit+",server=127.0.0.1:1}"] != 1 {
-			t.Errorf("%s was never attempted but is not reported as deferred: %v", name, g)
-		}
-		if g["pg_exporter_database_scrape_success{datname="+name+",server=127.0.0.1:1}"] != 0 {
-			t.Errorf("%s was never attempted but is reported as a success", name)
-		}
-		// Not an error. A deferral says the exporter ran out of room, and an
-		// alert on the error series must not fire for it.
-		for _, reason := range []string{reasonConnect, reasonScrape, reasonNotAttempted} {
-			if _, found := g["pg_exporter_database_scrape_error{datname="+name+",reason="+reason+",server=127.0.0.1:1}"]; found {
-				t.Errorf("%s was deferred and carries a %s error series", name, reason)
+			if deferred != len(targets) {
+				t.Fatalf("%d of %d targets were deferred, want all of them", deferred, len(targets))
 			}
-		}
+			if failed != 0 {
+				t.Errorf("%d targets failed: nothing was tried, so nothing is known to be wrong with them", failed)
+			}
+			if connFailures != 0 {
+				t.Errorf("%d connection failures: nothing was connected to, so pg_up must keep its meaning", connFailures)
+			}
+			g := series(t, e.coverage)
+			for _, name := range []string{"one", "two"} {
+				if g["pg_exporter_database_deferred{datname="+name+",reason="+admission.reason+",server=127.0.0.1:1}"] != 1 {
+					t.Errorf("%s was never attempted but is not reported as deferred for %s: %v", name, admission.reason, g)
+				}
+				if g["pg_exporter_database_scrape_success{datname="+name+",server=127.0.0.1:1}"] != 0 {
+					t.Errorf("%s was never attempted but is reported as a success", name)
+				}
+				// Not an error. A deferral says the exporter ran out of room,
+				// and an alert on the error series must not fire for it.
+				for _, reason := range []string{reasonConnect, reasonScrape, reasonNotAttempted} {
+					if _, found := g["pg_exporter_database_scrape_error{datname="+name+",reason="+reason+",server=127.0.0.1:1}"]; found {
+						t.Errorf("%s was deferred and carries a %s error series", name, reason)
+					}
+				}
+			}
+		})
 	}
 }
 
