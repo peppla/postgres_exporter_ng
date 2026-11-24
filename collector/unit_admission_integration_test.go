@@ -519,8 +519,12 @@ func TestCollectOffersADifferentDatabaseFirstEachScrape(t *testing.T) {
 	collectorScopes["stat_fixture_order"] = scopeDatabase
 	t.Cleanup(func() { delete(collectorScopes, "stat_fixture_order") })
 
-	// Three databases including the configured one. review_order_b and
-	// review_order_c are created here and dropped afterwards.
+	// Three databases including the configured one, with one name sorting
+	// before it and one after. Names that all sort after the configured
+	// database are the arrangement that missed the real failure: a rule
+	// choosing the first name after the one chosen last skips a database whose
+	// name comes before the configured one, and a fixture with no such database
+	// cannot see it.
 	admin, err := newInstance(dsn)
 	if err != nil {
 		t.Fatalf("building the admin instance: %s", err)
@@ -529,7 +533,7 @@ func TestCollectOffersADifferentDatabaseFirstEachScrape(t *testing.T) {
 		t.Fatalf("connecting: %s", err)
 	}
 	t.Cleanup(func() { admin.Close() })
-	for _, name := range []string{"review_order_b", "review_order_c"} {
+	for _, name := range []string{"a_review_order", "z_review_order"} {
 		if _, err := admin.getDB().Exec("CREATE DATABASE " + name); err != nil {
 			t.Skipf("cannot create %s, so this server cannot stage the case: %s", name, err)
 		}
@@ -539,7 +543,7 @@ func TestCollectOffersADifferentDatabaseFirstEachScrape(t *testing.T) {
 	}
 
 	store := rotation.New()
-	selected := []string{controlName, "review_order_b", "review_order_c"}
+	selected := []string{controlName, "a_review_order", "z_review_order"}
 
 	firstOf := make([]string, 0, len(selected))
 	for scrape := 0; scrape < len(selected); scrape++ {
