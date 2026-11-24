@@ -143,10 +143,12 @@ func TestOnARealConnectionTheHealthyCaseRunsAndTheEndedCaseDoesNot(t *testing.T)
 // against the server, rather than the function it calls.
 //
 // The healthy run proves the path reaches real SQL on a database the fan-out
-// opened for itself. The ended run proves the same path stops before any SQL
-// and reports the database as an incomplete attempt with the budget as its
-// cause, keeping database_up at 1 because the connection is not what went
-// wrong.
+// opened for itself. The ended run is the earlier boundary, the database's own
+// admission check: the scrape's time is gone before the database is reached, so
+// nothing is connected to and the database is deferred rather than attempted.
+// The boundary this component protects, where the connection opens and the
+// collectors are then deferred, is in
+// TestTheFanOutPathDefersUnitsAfterItsConnectionWorked.
 func TestTheOtherDatabasePathReachesItsCollectors(t *testing.T) {
 	dsn := liveDSN(t)
 
