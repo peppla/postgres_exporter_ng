@@ -143,20 +143,26 @@ before the file can go.
 
 The `stat_wal_receiver` collector needs `written_lsn`, the lag in bytes and
 the lag in seconds. The lag figures are the ones that matter, since they are
-what an operator reads, and the built-in collector publishes positions without
-differencing them. That change touches the same query as an open correction to
-the collector's column order, so it waits for that to land rather than being
-written twice.
+what an operator reads, and the collector publishes positions without
+differencing them. That is an open coverage item with nothing in front of it:
+the column-order correction its query also needed merged in PR #14 and is in
+this base.
 
 `stat_wal_receiver` and `postmaster` shipped disabled and are enabled now. A
 replacement that is off is not a replacement.
 
-`pg_custom_stat_subscription_received_lsn` has never been published. The file
-selects `received_lsn` without converting it, and a `pg_lsn` reaches the query
-engine as the string `0/1FDF5FA0`, which it cannot parse into a number. It logs
-one line at info level and publishes nothing. Measured against PostgreSQL 18
-rather than read off the code. The collector converts it in SQL, so
-`pg_stat_subscription_received_lsn_bytes` is a metric that exists.
+`pg_custom_stat_subscription_received_lsn` has never published a usable
+position. The file selects `received_lsn` without converting it, and a `pg_lsn`
+reaches the query engine as the string `0/1FDF5FA0`, which it cannot parse into
+a number, so every real position is dropped with one line at info level.
+Measured against PostgreSQL 18 rather than read off the code.
+
+The family does reach the wire, though, in one case: a NULL received position
+reaches `dbToFloat64(nil)`, which returns NaN, so a subscription whose worker
+has not received anything publishes a NaN sample. A NaN is not a position
+either, and it is worse than an absent series because it looks like a
+measurement. The collector converts the position in SQL and omits the sample
+where there is none.
 
 ## The legacy engine's own built-in maps
 

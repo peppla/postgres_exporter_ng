@@ -526,8 +526,9 @@ Logical replication subscriptions, from the subscriber's side.
 
 The query file this replaces selected `received_lsn` without converting it,
 and a `pg_lsn` reaches the query engine as a string such as `0/1FDF5FA0`,
-which the engine cannot parse into a number. It logged one line at info level
-and published nothing, so that metric has never existed. Measured against
+which the engine cannot parse into a number, so no real position was ever
+published. A NULL position did reach the wire, as a NaN, because the engine
+turns a NULL in a column mapped as a gauge into one. Measured against
 PostgreSQL 18 rather than read off the code.
 
 | | |
