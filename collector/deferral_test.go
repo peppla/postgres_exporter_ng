@@ -27,6 +27,8 @@ package collector
 
 import (
 	"context"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -43,12 +45,19 @@ import (
 // which scopes were selected. An engine with no collectors at all asked for no
 // database-local work, so every case about a deferred database has to select
 // a database-scoped one.
-func deferralEngine(ctx context.Context, sema *semaphore.Weighted, collectors map[string]Collector) PostgresCollector {
+// workers is how many databases the fan-out works on at once, which in a
+// running exporter is the connection limit. The fixtures below pass it
+// explicitly so a case that stages a full limiter stages the width that goes
+// with it: with fewer workers than databases, the later databases are reached
+// after the scrape's time has gone and meet the deadline rather than the
+// shortage, which is a different reason.
+func deferralEngine(ctx context.Context, sema *semaphore.Weighted, workers int, collectors map[string]Collector) PostgresCollector {
 	return PostgresCollector{
 		Collectors: collectors,
 		logger:     log.NewNopLogger(),
 		ctx:        ctx,
 		connSema:   sema,
+		dbWorkers:  workers,
 		instance:   &instance{dsn: "postgresql://probe@198.51.100.9:5432/app", name: "198.51.100.9:5432"},
 	}
 }
@@ -68,7 +77,7 @@ func fullLimitEngine(t *testing.T, collectors map[string]Collector) PostgresColl
 	t.Cleanup(func() { sema.Release(1) })
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	t.Cleanup(cancel)
-	return deferralEngine(ctx, sema, collectors)
+	return deferralEngine(ctx, sema, 1, collectors)
 }
 
 // expiredScrapeEngine is an engine whose deadline has already passed, with a
@@ -83,7 +92,7 @@ func expiredScrapeEngine(t *testing.T, collectors map[string]Collector) Postgres
 	t.Helper()
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	t.Cleanup(cancel)
-	return deferralEngine(ctx, semaphore.NewWeighted(1), collectors)
+	return deferralEngine(ctx, semaphore.NewWeighted(1), 1, collectors)
 }
 
 // cancelledScrapeEngine is an engine whose scrape was cancelled, with a
@@ -93,7 +102,7 @@ func cancelledScrapeEngine(t *testing.T, collectors map[string]Collector) Postgr
 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 	cancel()
 	t.Cleanup(cancel)
-	return deferralEngine(ctx, semaphore.NewWeighted(1), collectors)
+	return deferralEngine(ctx, semaphore.NewWeighted(1), 1, collectors)
 }
 
 // The ways a scrape stops before it starts a database, and the label each one
@@ -128,7 +137,7 @@ func unlimitedExpiredEngine(t *testing.T, collectors map[string]Collector) Postg
 	t.Helper()
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	t.Cleanup(cancel)
-	return deferralEngine(ctx, nil, collectors)
+	return deferralEngine(ctx, nil, 1, collectors)
 }
 
 // publishedByName runs a collector function and returns what reached the
@@ -308,6 +317,149 @@ func TestDeferralReasonsAreAClosedSet(t *testing.T) {
 	for _, reason := range []string{dbselect.ReasonNoPermit, dbselect.ReasonNotAttempted, dbselect.ReasonDeadline, dbselect.ReasonCancelled} {
 		if strings.ContainsAny(reason, " .:\"") {
 			t.Errorf("%q does not look like a closed-set value", reason)
+		}
+	}
+}
+
+// fanOutTargets builds n database targets at one address.
+func fanOutTargets(hostport string, n int) []dbTarget {
+	out := make([]dbTarget, 0, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("db%03d", i)
+		out = append(out, dbTarget{
+			datname: name,
+			dsn:     "postgresql://probe@" + hostport + "/" + name + "?sslmode=disable",
+		})
+	}
+	return out
+}
+
+// publishedPerDatabase collects what the fan-out wrote, grouped by the database
+// each series names.
+func publishedPerDatabase(emit func(ch chan<- prometheus.Metric)) map[string]map[string]MetricResult {
+	ch := make(chan prometheus.Metric, 1<<16)
+	emit(ch)
+	close(ch)
+	out := map[string]map[string]MetricResult{}
+	for m := range ch {
+		r := readMetric(m)
+		name := r.labels["datname"]
+		if out[name] == nil {
+			out[name] = map[string]MetricResult{}
+		}
+		out[name][familyName(m)] = r
+	}
+	return out
+}
+
+// TestFewerWorkersThanDatabasesStillCoversThemAll is half of the acceptance
+// check for the bounded pool.
+//
+// Running fewer workers than databases must not cap how many databases a scrape
+// reaches. The permits are free and the clock is not the constraint, so every
+// database here is reached and ends as a connection failure against a closed
+// port. The failure is the point: it means the database was reached rather than
+// quietly left out.
+func TestFewerWorkersThanDatabasesStillCoversThemAll(t *testing.T) {
+	const databases, workers = 9, 3
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	t.Cleanup(cancel)
+	p := deferralEngine(ctx, semaphore.NewWeighted(workers), workers, map[string]Collector{})
+	targets := fanOutTargets("127.0.0.1:1", databases)
+
+	var failed, deferred int
+	published := publishedPerDatabase(func(ch chan<- prometheus.Metric) {
+		failed, deferred = p.collectDatabases(ch, targets, map[string]Collector{}, "127.0.0.1:1", "")
+	})
+
+	if deferred != 0 {
+		t.Errorf("%d databases were deferred, and neither a permit nor the clock was the constraint", deferred)
+	}
+	if failed != databases {
+		t.Fatalf("%d of %d databases were reached, so the worker count capped the set", failed, databases)
+	}
+
+	// Counted is not the same as named. A count that adds up while a database
+	// has no series of its own is the shortfall the per-database series exist
+	// to prevent.
+	for _, target := range targets {
+		series := published[target.datname]
+		if _, ok := series["pg_collector_database_error"]; !ok {
+			t.Errorf("%s is in the failed count and has no error series of its own", target.datname)
+		}
+		if series["pg_collector_database_error"].labels["reason"] != dbselect.ReasonConnect {
+			t.Errorf("%s failed with reason %q, want %q", target.datname,
+				series["pg_collector_database_error"].labels["reason"], dbselect.ReasonConnect)
+		}
+	}
+}
+
+// TestManyDatabasesBehindHeldPermitsStayBounded is the goroutine bound, for the
+// engine rather than for the pool on its own.
+//
+// Every permit is held, so each worker parks in the limiter while the remaining
+// databases wait for a worker. A goroutine per database would show four hundred
+// of them waiting here.
+func TestManyDatabasesBehindHeldPermitsStayBounded(t *testing.T) {
+	const databases, workers = 400, 4
+
+	held := semaphore.NewWeighted(workers)
+	if !held.TryAcquire(workers) {
+		t.Fatal("the fixture could not take the permits")
+	}
+	t.Cleanup(func() { held.Release(workers) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	t.Cleanup(cancel)
+	p := deferralEngine(ctx, held, workers, map[string]Collector{})
+	targets := fanOutTargets("127.0.0.1:1", databases)
+
+	ch := make(chan prometheus.Metric, 1<<16)
+	base := runtime.NumGoroutine()
+	type result struct{ failed, deferred int }
+	out := make(chan result, 1)
+	go func() {
+		f, d := p.collectDatabases(ch, targets, map[string]Collector{}, "127.0.0.1:1", "")
+		out <- result{f, d}
+	}()
+
+	// Sampled while the workers are parked in the limiter, which is where a
+	// goroutine per database would show four hundred of them waiting.
+	time.Sleep(100 * time.Millisecond)
+	peak := runtime.NumGoroutine() - base
+
+	got := <-out
+	close(ch)
+
+	if peak > workers+4 {
+		t.Errorf("%d goroutines above the baseline while %d databases waited on %d workers",
+			peak, databases, workers)
+	}
+	if got.deferred != databases {
+		t.Fatalf("%d of %d databases were deferred, want all of them: the rest were dropped", got.deferred, databases)
+	}
+	if got.failed != 0 {
+		t.Errorf("%d databases failed: nothing was tried, so nothing is known to be wrong with them", got.failed)
+	}
+
+	// Every one of them named, with a reason from the closed set.
+	reasons := map[string]int{}
+	named := 0
+	for m := range ch {
+		r := readMetric(m)
+		if familyName(m) != "pg_collector_database_deferred" {
+			continue
+		}
+		reasons[r.labels["reason"]]++
+		named++
+	}
+	if named != databases {
+		t.Errorf("%d deferral series for %d deferred databases", named, databases)
+	}
+	for reason := range reasons {
+		if reason != dbselect.ReasonNoPermit && reason != dbselect.ReasonDeadline {
+			t.Errorf("a deferral was reported with reason %q, which is outside the closed set", reason)
 		}
 	}
 }

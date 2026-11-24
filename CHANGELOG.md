@@ -1,5 +1,25 @@
 ## [Unreleased]
 
+* [ENHANCEMENT] The per-database fan-out runs a fixed number of workers instead
+  of one goroutine per selected database. Both engines used to start a goroutine
+  for every database and let it queue on the connection limiter, so the limit
+  bounded open connections and not the work waiting behind them. With the only
+  permit held and a thousand databases selected, the process stood at 1007
+  goroutines against a baseline of 3. The number of workers is the configured
+  connection limit, because a worker's first act is to ask for a permit. It is
+  not a limit on how many databases a scrape covers: each worker takes the next
+  database as it finishes the last, and what stops a scrape short is its
+  deadline.
+* [CHANGE] A database the scrape ran out of time to reach now reports
+  `reason="scrape_deadline"` where it used to report
+  `reason="no_connection_permit"`. With a goroutine per database every database
+  asked the limiter at once, so a scrape that ran out of time while the limiter
+  was busy named the permit for all of them. With a bounded fan-out only the
+  databases a worker reached ask for a permit, and the ones reached after the
+  time had gone never ask. Each reason now describes what that database met. A
+  saturated connection limit still shows as `no_connection_permit`, on the
+  databases that asked, so the two causes remain distinguishable within one
+  scrape.
 * [ENHANCEMENT] Add PostgreSQL 18 support:
   * Add parallel worker activity metrics
   * Add vacuum/analyze timing metrics

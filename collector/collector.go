@@ -28,6 +28,7 @@ import (
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/admission"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/fanout"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -247,7 +248,13 @@ type PostgresCollector struct {
 	includeDatabases dbselect.List
 
 	connSema *semaphore.Weighted
-	ctx      context.Context
+	// dbWorkers is how many databases the fan-out works on at once. It is the
+	// connection limit, because a worker's first act is to ask for a permit
+	// and there is nothing for a worker beyond that limit to do but queue.
+	// Travelling with the semaphore rather than beside it keeps the two from
+	// disagreeing, which would put the goroutines back.
+	dbWorkers int
+	ctx       context.Context
 
 	// lastSuccess outlives one scrape: how long a collector has been failing
 	// on a database cannot be answered from the scrape that is failing.
@@ -362,10 +369,21 @@ func WithContext(ctx context.Context) Option {
 	}
 }
 
-// WithConnectionsSemaphore sets the semaphore for limiting the number of connections to the database instance.
-func WithConnectionsSemaphore(sem *semaphore.Weighted) Option {
+// WithConnectionsSemaphore sets the limit on open connections to the server,
+// as the semaphore that issues the permits and the number of them there are.
+//
+// The count is taken here rather than configured separately. A second key would
+// be a second thing to get wrong, and a fan-out wider than the connection limit
+// has nothing to do with the extra width but wait.
+//
+// A count below one means one database at a time. Configuration validation
+// refuses a connection limit below one, so that is reachable only through this
+// API, and a caller who passes nothing gets slow collection rather than silent
+// unbounded growth.
+func WithConnectionsSemaphore(sem *semaphore.Weighted, connections int64) Option {
 	return func(c *PostgresCollector) error {
 		c.connSema = sem
+		c.dbWorkers = int(connections)
 		return nil
 	}
 }
@@ -556,30 +574,48 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	var deferred, failed atomic.Int32
-	fanout := sync.WaitGroup{}
+	// The databases this fan-out opens a connection for. The control database
+	// is not among them: its database-local collectors ran above, on the
+	// connection that was already open.
+	pending := make([]dbTarget, 0, len(sel.targets))
 	for _, t := range sel.targets {
 		if t.control || t.skipDatabaseLocal {
 			continue
 		}
-		fanout.Add(1)
-		go func(t dbTarget) {
-			defer fanout.Done()
-			switch p.collectDatabase(ch, t, local, inst.name, selection) {
-			case outcomeDeferred:
-				deferred.Add(1)
-			case outcomeFailed:
-				failed.Add(1)
-			}
-		}(t)
+		pending = append(pending, t)
 	}
-	fanout.Wait()
+	failed, deferred := p.collectDatabases(ch, pending, local, inst.name, selection)
 
 	// After the fan-out, because it is the only point where the numbers are
 	// known. Published even when they are zero, so that a scrape which
 	// deferred nothing says so rather than leaving a reader to wonder whether
 	// the series is missing or the exporter kept up.
-	p.reportOutcome(ch, inst.name, selected, int(failed.Load())+controlFailed, int(deferred.Load()))
+	p.reportOutcome(ch, inst.name, selected, failed+controlFailed, deferred)
+}
+
+// collectDatabases runs the database-local work across the databases the
+// fan-out opens a connection for, and returns how many failed and how many were
+// deferred without being started.
+//
+// A fixed number of workers, each taking the next database as it finishes the
+// last. Reaching that number is not a reason to leave a database out: every
+// database here is visited, and what stops one short is its own admission check
+// against the scrape's deadline.
+//
+// Split out of Collect so this can be tested, which it could not be while it
+// sat behind a control connection a test has no way to open. The query engine's
+// scrapeTargets was split out of its scrape for the same reason.
+func (p PostgresCollector) collectDatabases(ch chan<- prometheus.Metric, pending []dbTarget, local map[string]Collector, server, selection string) (failed, deferred int) {
+	var deferredCount, failedCount atomic.Int32
+	fanout.Run(len(pending), p.dbWorkers, func(i int) {
+		switch p.collectDatabase(ch, pending[i], local, server, selection) {
+		case outcomeDeferred:
+			deferredCount.Add(1)
+		case outcomeFailed:
+			failedCount.Add(1)
+		}
+	})
+	return int(failedCount.Load()), int(deferredCount.Load())
 }
 
 // databaseOutcome is what one database's database-local work came to. Every

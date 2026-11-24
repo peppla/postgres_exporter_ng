@@ -287,7 +287,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 	// other.
 	opts := []ExporterOpt{
 		AutoDiscoverDatabases(*autoDiscoverDatabases),
-		WithConnectionsSemaphore(connSema),
+		WithConnectionsSemaphore(connSema, limits.Connections),
 		WithContext(ctx),
 		// The cache belongs to the process. An exporter is built per request,
 		// so one it owned would be empty on arrival and discarded on the way
@@ -391,7 +391,7 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			dsn,
 			filters.postgresCollectors(),
 			collector.WithContext(ctx),
-			collector.WithConnectionsSemaphore(connSema),
+			collector.WithConnectionsSemaphore(connSema, limits.Connections),
 			collector.WithLastSuccess(lastSuccess),
 			// Built-in monitoring's own set, resolved at startup. Never
 			// intersected with the legacy engine's, which builds its own from

@@ -101,7 +101,7 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 			ExcludeDatabases(excludeDatabases),
 			IncludeDatabases(*includeDatabases),
 			WithContext(ctx),
-			WithConnectionsSemaphore(connSema),
+			WithConnectionsSemaphore(connSema, limits.Connections),
 		}
 
 		// Both engines on this endpoint open through the same clamping
