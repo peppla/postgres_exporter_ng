@@ -244,7 +244,7 @@ func main() {
 		http.Handle("/", landingPage)
 	}
 
-	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema, limits, collectionGate))
+	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema, limits, collectionGate, stores))
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *webConfig.WebListenAddresses)
 	// A backstop under the per-request write deadline. A handler sets its own

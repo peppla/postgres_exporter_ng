@@ -29,7 +29,7 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semaphore.Weighted, limits budget.Limits, gate *semaphore.Weighted) http.HandlerFunc {
+func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semaphore.Weighted, limits budget.Limits, gate *semaphore.Weighted, stores Stores) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The probe collects, so it spends the same budget as /metrics. It
 		// used to take neither the admission slot nor a deadline, so the
@@ -102,6 +102,13 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 			IncludeDatabases(*includeDatabases),
 			WithContext(ctx),
 			WithConnectionsSemaphore(connSema, limits.Connections),
+			// This endpoint builds an exporter for each request, so anything
+			// it needs to remember between requests has to come from the
+			// process. Without the schedule its rotation pointer was nil,
+			// which is no rotation at all, and discovery here can offer
+			// several databases, so its selected set had the same database
+			// offered the first attempt every time.
+			WithRotation(stores.Rotation),
 		}
 
 		// Both engines on this endpoint open through the same clamping
