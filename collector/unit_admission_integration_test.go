@@ -30,6 +30,7 @@ package collector
 import (
 	"context"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -196,4 +197,234 @@ func TestTheOtherDatabasePathReachesItsCollectors(t *testing.T) {
 			t.Errorf("nothing was tried and the database reports %q", wrong)
 		}
 	}
+}
+
+// endsAtACountedCheck is a context that is live until a stated boundary and
+// ended after it, in Err and in Done together.
+//
+// A wrapper that only overrides Err is not enough here: an already expired
+// parent has a closed Done channel, so the connection setup fails at the ping
+// and the collectors are never reached. The boundary has to move both.
+//
+// The boundary is the nth read of Err. The tests below do not assume a value
+// for n: the number of reads the path makes before its collectors is not stable
+// between runs, because the connection pool does not do the same work twice.
+// They search for an n where the run shows a connection that opened and a
+// collector that never started, which is the boundary itself, and they fail if
+// no such n exists within the search. Below the window the connection fails at
+// the ping, and above it the collector runs.
+type endsAtACountedCheck struct {
+	context.Context
+	n     int64
+	calls atomic.Int64
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newCountedCheck(parent context.Context, n int64) *endsAtACountedCheck {
+	return &endsAtACountedCheck{Context: parent, n: n, done: make(chan struct{})}
+}
+
+func (c *endsAtACountedCheck) Err() error {
+	if c.calls.Add(1) <= c.n {
+		return nil
+	}
+	c.once.Do(func() { close(c.done) })
+	return context.DeadlineExceeded
+}
+
+func (c *endsAtACountedCheck) Done() <-chan struct{} { return c.done }
+
+func (c *endsAtACountedCheck) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+// at returns how many reads of Err have happened so far.
+func (c *endsAtACountedCheck) at() int64 { return c.calls.Load() }
+
+// reportingCollector records the context read count at the moment it starts, so
+// a calibration run can say where the collectors begin.
+type reportingCollector struct {
+	ran   *atomic.Int32
+	atRun *atomic.Int64
+	ctx   *endsAtACountedCheck
+	err   error
+}
+
+func (c reportingCollector) Update(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+	c.ran.Add(1)
+	c.atRun.Store(c.ctx.at())
+	if c.err != nil {
+		return c.err
+	}
+	var one int
+	return inst.getDB().QueryRowContext(ctx, "SELECT 1").Scan(&one)
+}
+
+// TestTheFanOutPathDefersUnitsAfterItsConnectionWorked is round 180's boundary,
+// on the path the fan-out takes for a database it opened for itself.
+//
+// The connection is opened and the database is reached, and the scrape's time
+// then goes before its collectors start. That makes an attempt that did not
+// finish, not a database nothing was tried on, so the database is failed rather
+// than deferred, keeps database_up 1, and names the budget as the cause.
+func TestTheFanOutPathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
+	dsn := liveDSN(t)
+	collectorScopes["stat_fixture_live"] = scopeDatabase
+	t.Cleanup(func() { delete(collectorScopes, "stat_fixture_live") })
+
+	target := dbTarget{datname: "postgres", dsn: dsn}
+	store := lastsuccess.New()
+
+	run := func(n int64, err error) (databaseOutcome, map[string]MetricResult, *atomic.Int32, *atomic.Int64) {
+		var ran atomic.Int32
+		var atRun atomic.Int64
+		ctx := newCountedCheck(context.Background(), n)
+		local := map[string]Collector{"stat_fixture_live": reportingCollector{ran: &ran, atRun: &atRun, ctx: ctx, err: err}}
+		p := PostgresCollector{
+			Collectors:  local,
+			logger:      log.NewNopLogger(),
+			ctx:         ctx,
+			connSema:    semaphore.NewWeighted(2),
+			dbWorkers:   2,
+			lastSuccess: store,
+			instance:    &instance{dsn: dsn, name: "live"},
+		}
+		var outcome databaseOutcome
+		published := publishedByFamilyAndReason(func(ch chan<- prometheus.Metric) {
+			outcome = p.collectDatabase(ch, target, local, "live", selectionOf(local))
+		})
+		return outcome, published, &ran, &atRun
+	}
+
+	// The healthy run first, with the boundary out of reach. It records the
+	// last-success times the deferred run below has to keep, and it is the
+	// premise for every assertion here: the collector has somewhere to run.
+	healthy, healthySeries, healthyRan, atRun := run(1<<40, nil)
+	if healthy != outcomeScraped || healthyRan.Load() != 1 {
+		t.Fatalf("the healthy run came to %v with %d collector runs, want scraped with 1", healthy, healthyRan.Load())
+	}
+	if healthySeries["pg_collector_database_up/"].value != 1 {
+		t.Fatalf("the healthy run did not report the connection as up: %v", healthySeries)
+	}
+
+	// Find the boundary rather than assume it. Too low and the connection
+	// fails at the ping, too high and the collector runs, and the window
+	// between is what this test is about.
+	var outcome databaseOutcome
+	var published map[string]MetricResult
+	boundary := int64(-1)
+	for n := int64(1); n <= atRun.Load()+8; n++ {
+		o, p, ran, _ := run(n, nil)
+		if p["pg_collector_database_up/"].value == 1 && ran.Load() == 0 {
+			outcome, published, boundary = o, p, n
+			break
+		}
+	}
+	if boundary < 0 {
+		t.Fatalf("no boundary between a connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
+	}
+	t.Logf("the scrape ends at context read %d, after the connection is open and before the collector starts", boundary)
+	if outcome != outcomeFailed {
+		t.Errorf("a database whose connection worked and whose collectors were deferred came to %v, want an attempt that did not finish", outcome)
+	}
+	if published["pg_collector_database_error/"+dbselect.ReasonDeadline].value != 1 {
+		t.Errorf("the database does not name the budget as the cause: %v", published)
+	}
+	if _, found := published["pg_collector_database_error/"+dbselect.ReasonScrape]; found {
+		t.Error("no collector failed and the database reports a collector failure")
+	}
+	if _, found := published["pg_collector_database_deferred/"+dbselect.ReasonDeadline]; found {
+		t.Error("the database is counted as both an attempt that did not finish and a database nothing was tried on")
+	}
+	if _, found := published["pg_scrape_collector_deferred/"+dbselect.ReasonDeadline]; !found {
+		t.Errorf("the collector that never started is not named: %v", published)
+	}
+	if _, found := published["pg_collector_last_success_timestamp_seconds/"]; !found {
+		t.Errorf("the deferred collector lost the time it last worked, which the healthy run recorded: %v", published)
+	}
+}
+
+// TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked is the same
+// boundary on the other path, the control connection inside Collect.
+//
+// This one goes through the whole engine: admission, the connection, the
+// catalogue read and the scope split, which is what a test calling the shared
+// runner cannot show.
+func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
+	dsn := liveDSN(t)
+	collectorScopes["stat_fixture_live"] = scopeDatabase
+	t.Cleanup(func() { delete(collectorScopes, "stat_fixture_live") })
+
+	store := lastsuccess.New()
+	run := func(n int64) (map[string]MetricResult, *atomic.Int32, *atomic.Int64) {
+		var ran atomic.Int32
+		var atRun atomic.Int64
+		ctx := newCountedCheck(context.Background(), n)
+		local := map[string]Collector{"stat_fixture_live": reportingCollector{ran: &ran, atRun: &atRun, ctx: ctx}}
+		p := PostgresCollector{
+			Collectors:  local,
+			logger:      log.NewNopLogger(),
+			ctx:         ctx,
+			connSema:    semaphore.NewWeighted(4),
+			dbWorkers:   4,
+			lastSuccess: store,
+			instance:    &instance{dsn: dsn, name: "live"},
+		}
+		published := publishedByFamilyAndReason(func(ch chan<- prometheus.Metric) {
+			p.Collect(ch)
+		})
+		return published, &ran, &atRun
+	}
+
+	healthy, healthyRan, atRun := run(1 << 40)
+	if healthyRan.Load() < 1 {
+		t.Fatalf("the healthy run never reached a collector: %v", healthy)
+	}
+	if healthy["pg_collector_database_up/"].value != 1 {
+		t.Fatalf("the healthy run did not report the control connection as up: %v", healthy)
+	}
+
+	var published map[string]MetricResult
+	boundary := int64(-1)
+	for n := int64(1); n <= atRun.Load()+8; n++ {
+		p, ran, _ := run(n)
+		if p["pg_collector_database_up/"].value == 1 && ran.Load() == 0 {
+			published, boundary = p, n
+			break
+		}
+	}
+	if boundary < 0 {
+		t.Fatalf("no boundary between a control connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
+	}
+	t.Logf("the scrape ends at context read %d, after the control connection is open and before its collectors start", boundary)
+	if published["pg_collector_database_error/"+dbselect.ReasonDeadline].value != 1 {
+		t.Errorf("the control database does not name the budget as the cause: %v", published)
+	}
+	if _, found := published["pg_collector_database_error/"+dbselect.ReasonScrape]; found {
+		t.Error("no control collector failed and the control database reports a collector failure")
+	}
+	if _, found := published["pg_scrape_collector_deferred/"+dbselect.ReasonDeadline]; !found {
+		t.Errorf("the control collector that never started is not named: %v", published)
+	}
+	if published["pg_collector_databases_failed/"].value != 1 {
+		t.Errorf("databases_failed is %v, want 1 for the control database's unfinished attempt: %v",
+			published["pg_collector_databases_failed/"].value, published)
+	}
+	if published["pg_collector_databases_deferred/"].value != 0 {
+		t.Errorf("databases_deferred is %v, want 0: the control database was attempted",
+			published["pg_collector_databases_deferred/"].value)
+	}
+}
+
+// publishedByFamilyAndReason keys what was published by family and reason, so a
+// family carrying two reasons at once keeps both.
+func publishedByFamilyAndReason(emit func(ch chan<- prometheus.Metric)) map[string]MetricResult {
+	ch := make(chan prometheus.Metric, 4096)
+	emit(ch)
+	close(ch)
+	out := map[string]MetricResult{}
+	for m := range ch {
+		r := readMetric(m)
+		out[familyName(m)+"/"+r.labels["reason"]] = r
+	}
+	return out
 }

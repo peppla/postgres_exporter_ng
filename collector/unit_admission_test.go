@@ -294,3 +294,64 @@ func publishedByReason(emit func(ch chan<- prometheus.Metric)) map[string]Metric
 	}
 	return out
 }
+
+// deferringEngine is a prometheus.Collector that declares what
+// PostgresCollector declares and emits a per-collector deferral.
+//
+// It exists so a pedantic registry can compare the two. A descriptor the engine
+// emits and does not declare passes an ordinary registry and fails Gather on a
+// pedantic one, so nothing in the shipped handler reports it.
+type deferringEngine struct {
+	p     PostgresCollector
+	local map[string]Collector
+	ctx   context.Context
+}
+
+func (d deferringEngine) Describe(ch chan<- *prometheus.Desc) { d.p.Describe(ch) }
+
+func (d deferringEngine) Collect(ch chan<- prometheus.Metric) {
+	runLocalCollectors(d.ctx, d.local, &instance{dsn: "postgresql://probe@198.51.100.9:5432/app"},
+		ch, log.NewNopLogger(), "app", lastsuccess.New())
+}
+
+// TestTheDeferralDescriptorIsDeclared is the check that would have caught
+// scrapeDeferredDesc missing from Describe.
+//
+// A pedantic registry refuses a metric whose descriptor was never declared.
+// Without it the omission is invisible: an ordinary registry gathers the series
+// and nothing says the engine is emitting something it never announced.
+func TestTheDeferralDescriptorIsDeclared(t *testing.T) {
+	var ran atomic.Int32
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancel)
+
+	engine := deferringEngine{
+		p:     PostgresCollector{logger: log.NewNopLogger()},
+		local: localCollectors(1, &ran, nil),
+		ctx:   expired,
+	}
+
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(engine); err != nil {
+		t.Fatalf("registering: %s", err)
+	}
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gathering a deferral through a pedantic registry: %s", err)
+	}
+
+	// The premise. A gather that produced nothing would pass the check above
+	// without having exercised the descriptor at all.
+	found := false
+	for _, f := range families {
+		if f.GetName() == "pg_scrape_collector_deferred" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the deferral series was not gathered, so this proves nothing: %d families", len(families))
+	}
+	if ran.Load() != 0 {
+		t.Error("the collector ran, so the gathered series is not a deferral")
+	}
+}

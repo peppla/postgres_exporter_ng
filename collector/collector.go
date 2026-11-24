@@ -419,6 +419,7 @@ func WithDatabaseSelection(exclude, include dbselect.List) Option {
 func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- scrapeDurationDesc
 	ch <- scrapeSuccessDesc
+	ch <- scrapeDeferredDesc
 	ch <- collectorDatabaseUpDesc
 	ch <- collectorDiscoveredDesc
 	ch <- collectorSelectedDesc
