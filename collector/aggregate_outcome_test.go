@@ -115,16 +115,16 @@ func stubServer(t *testing.T, expect func(n int, mock sqlmock.Sqlmock)) func() [
 // its own row rather than leaving out. others are the remaining databases on
 // the server.
 //
-// Every connection, not only the first. A fan-out connection reaches neither
-// query, and an unmatched expectation costs nothing here because these mocks
-// are not checked for completeness. Giving them only to the first connection
-// made the set depend on which connection opened first, so two scrapes at once
-// left the loser's control connection without a version lookup: its setup
-// failed, it took the control-failure path, and it recorded nothing. The
-// version cache hid that most of the time, because a connection that opened
-// after the first one cached the version skips the query altogether.
+// Every connection gets both, matched out of order. The version lookup is
+// optional, because the engine caches it per server and only the first
+// connection in a process runs it. The catalogue read is required of a control
+// connection and is never reached by a fan-out one. Matched in order, a
+// skipped version lookup puts the catalogue read against the wrong
+// expectation, which fails it and sends the engine down its control fallback
+// with nothing in the fixture to say so.
 func catalogueOf(current string, others ...string) func(int, sqlmock.Sqlmock) {
 	return func(_ int, mock sqlmock.Sqlmock) {
+		mock.MatchExpectationsInOrder(false)
 		mock.ExpectPing()
 		mock.ExpectQuery("SELECT version").WillReturnRows(
 			sqlmock.NewRows([]string{"version"}).AddRow("PostgreSQL 18.0 on x86_64-pc-linux-gnu"))
@@ -218,6 +218,39 @@ func engineOn(collectors map[string]Collector, exclude, include dbselect.List) P
 		excludeDatabases: exclude,
 		includeDatabases: include,
 		instance:         &instance{dsn: "postgresql://probe@198.51.100.9:5432/app", name: "198.51.100.9:5432"},
+	}
+}
+
+// TestRepeatedScrapesDiscoverEveryDatabase holds the fixture itself honest.
+//
+// The engine looks up the server version once per process and caches it, so a
+// second scrape does not run that query. A fixture that insists on it anyway
+// pushes every later query one expectation out of step, the catalogue read
+// fails, and the engine falls back to the connected database. That fallback is
+// correct behaviour on a real failure and wrong as a test result: coverage
+// silently drops to one database while a case that only reads the connected
+// database's series still passes.
+func TestRepeatedScrapesDiscoverEveryDatabase(t *testing.T) {
+	stubServer(t, catalogueOf("app", "other"))
+	withScopedCollector(t, "outcome_local", scopeDatabase)
+
+	for _, pass := range []string{"first", "second"} {
+		t.Run(pass, func(t *testing.T) {
+			out := collectEngine(t, engineOn(
+				map[string]Collector{"outcome_local": quietCollector{}},
+				dbselect.Absent(), dbselect.Absent()))
+
+			if got := gaugeValue(t, out["pg_collector_database_discovery_success"]); got != 1 {
+				t.Errorf("discovery_success is %v, so the catalogue was not read", got)
+			}
+			if got := gaugeValue(t, out["pg_collector_databases_discovered"]); got != 2 {
+				t.Errorf("discovered is %v, want both fixture databases", got)
+			}
+			got := outcomeOf(t, out)
+			if want := (outcome{selected: 2, attempted: 2, scraped: 2}); got != want {
+				t.Errorf("the %s scrape reported %s", pass, got)
+			}
+		})
 	}
 }
 

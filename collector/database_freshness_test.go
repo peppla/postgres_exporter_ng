@@ -404,10 +404,16 @@ func TestADatabaseThatCannotBeReachedKeepsItsTime(t *testing.T) {
 // process state. Under the race detector this says the two write their own
 // records and neither waits on the other to finish to get it right.
 func TestConcurrentSelectionsDoNotCrossRecords(t *testing.T) {
-	stubServer(t, catalogueOf("app"))
+	stubServer(t, catalogueOf("app", "other"))
 	withScopedCollector(t, "freshness_local_a", scopeDatabase)
 	withScopedCollector(t, "freshness_local_b", scopeDatabase)
 	store := lastsuccess.New()
+
+	type result struct {
+		selection string
+		metrics   map[string][]*dto.Metric
+	}
+	results := make(chan result, 2)
 
 	var wg sync.WaitGroup
 	for _, name := range []string{"freshness_local_a", "freshness_local_b"} {
@@ -415,18 +421,44 @@ func TestConcurrentSelectionsDoNotCrossRecords(t *testing.T) {
 		go func(name string) {
 			defer wg.Done()
 			ch := make(chan prometheus.Metric, 64)
+			collected := map[string][]*dto.Metric{}
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				for range ch {
+				for metric := range ch {
+					pb := &dto.Metric{}
+					if err := metric.Write(pb); err != nil {
+						continue
+					}
+					collected[familyOf(metric)] = append(collected[familyOf(metric)], pb)
 				}
 			}()
 			engineRemembering(map[string]Collector{name: quietCollector{}}, store).Collect(ch)
 			close(ch)
 			<-done
+			results <- result{selection: name, metrics: collected}
 		}(name)
 	}
 	wg.Wait()
+	close(results)
+
+	// Each request covered both databases. Checked per request, because a
+	// catalogue read that failed would fall back to the connected database and
+	// still leave a record under the right selection, which is what a check of
+	// the store alone would accept.
+	for r := range results {
+		if got := gaugeValue(t, r.metrics["pg_collector_database_discovery_success"]); got != 1 {
+			t.Errorf("the %s profile reports discovery_success %v", r.selection, got)
+		}
+		got := outcomeOf(t, r.metrics)
+		if want := (outcome{selected: 2, attempted: 2, scraped: 2}); got != want {
+			t.Errorf("the %s profile reported %s", r.selection, got)
+		}
+		if len(freshnessByDatabase(r.metrics)) != 2 {
+			t.Errorf("the %s profile published %d database times, want one per database",
+				r.selection, len(freshnessByDatabase(r.metrics)))
+		}
+	}
 
 	target, _ := targetid.ID("postgresql://probe@198.51.100.9:5432/app")
 	for _, selection := range []string{"freshness_local_a", "freshness_local_b"} {
