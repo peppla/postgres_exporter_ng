@@ -3568,7 +3568,7 @@ func (s *IntegrationSuite) TestReplicationCollectorsAgainstServer(c *C) {
 	limits := budget.Defaults()
 	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		Filters{EnablePostgresCollector: true}, limits, querycache.New(),
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
 		dbselect.Absent(), dbselect.Absent())
 	c.Assert(err, IsNil)
 	families, err := registry.Gather()
@@ -3691,7 +3691,7 @@ func (s *IntegrationSuite) TestPublicationCollectorCoversEveryDatabase(c *C) {
 	limits := budget.Defaults()
 	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		Filters{EnablePostgresCollector: true}, limits, querycache.New(),
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
 		dbselect.Absent(), dbselect.Absent())
 	c.Assert(err, IsNil)
 	families, err := registry.Gather()
