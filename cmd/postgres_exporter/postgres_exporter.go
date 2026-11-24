@@ -24,7 +24,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +31,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/internal/admission"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/fanout"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/versioncache"
@@ -486,7 +486,11 @@ type Exporter struct {
 	// servers contains metrics map and query overrides.
 	// servers *Servers
 
-	connSema  *semaphore.Weighted
+	connSema *semaphore.Weighted
+	// dbWorkers is how many databases the fan-out works on at once. It is the
+	// connection limit, because a worker's first act is to ask for a permit
+	// and there is nothing for a worker beyond that limit to do but queue.
+	dbWorkers int
 	ctx       context.Context
 	masterDSN string
 }
@@ -529,10 +533,20 @@ func WithContext(ctx context.Context) ExporterOpt {
 	}
 }
 
-// WithConnectionsSemaphore sets the semaphore for limiting the number of connections to the database instance.
-func WithConnectionsSemaphore(sem *semaphore.Weighted) ExporterOpt {
+// WithConnectionsSemaphore sets the limit on open connections to the server,
+// as the semaphore that issues the permits and the number of them there are.
+//
+// The count is taken here rather than configured separately, so that the width
+// of the fan-out and the number of permits cannot drift apart.
+//
+// A count below one means one database at a time. Configuration validation
+// refuses a connection limit below one, so that is reachable only through this
+// API, and a caller who passes nothing gets slow collection rather than silent
+// unbounded growth.
+func WithConnectionsSemaphore(sem *semaphore.Weighted, connections int64) ExporterOpt {
 	return func(e *Exporter) {
 		e.connSema = sem
+		e.dbWorkers = int(connections)
 	}
 }
 
@@ -881,13 +895,16 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 	var errorsCount atomic.Int32
 	var connectionErrorsCount atomic.Int32
 	var deferredCount atomic.Int32
-	var wg sync.WaitGroup
 
-	for _, target := range targets {
-		target := target
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	// A fixed number of workers, each taking the next database as it finishes
+	// the last. Reaching that number is not a reason to leave a database out:
+	// every target is visited, and what stops one short is its own admission
+	// check against the scrape's deadline. One goroutine per target is what
+	// this replaced, which put the process at 1004 goroutines for a thousand
+	// targets while the only connection permit was held.
+	fanout.Run(len(targets), e.dbWorkers, func(i int) {
+		{
+			target := targets[i]
 
 			// Admission is checked whether or not a connection limit is
 			// configured, and the decision says which of the two ran out. The
@@ -929,10 +946,8 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				return
 			}
 			e.coverage.setDatabaseOutcome(target.databaseRef, "")
-		}()
-	}
-
-	wg.Wait()
+		}
+	})
 
 	return int(errorsCount.Load()), int(connectionErrorsCount.Load()), int(deferredCount.Load())
 }

@@ -19,6 +19,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -289,7 +291,7 @@ func TestCoverageCountsUnacquiredWorkAsDeferred(t *testing.T) {
 	}
 	e := NewExporter(dsns,
 		WithContext(ctx),
-		WithConnectionsSemaphore(semaphore.NewWeighted(1)),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
 	)
 
 	ch := make(chan prometheus.Metric, 1024)
@@ -487,18 +489,25 @@ func TestUnreachableDatabasesAreNamed(t *testing.T) {
 // constructs a limiter, so this path is reached through NewExporter rather
 // than by running the exporter.
 func admissionCases(t *testing.T) []struct {
-	name   string
-	ctx    context.Context
-	sema   *semaphore.Weighted
-	reason string
+	name    string
+	ctx     context.Context
+	sema    *semaphore.Weighted
+	workers int64
+	reason  string
 } {
 	t.Helper()
 
-	full := semaphore.NewWeighted(1)
-	if !full.TryAcquire(1) {
-		t.Fatal("the fixture could not take the only permit")
+	// Every permit held, and as many of them as there are workers, so that
+	// each target reaches the limiter and is refused. With fewer permits than
+	// targets the later targets never ask, and what they meet is the deadline
+	// rather than the shortage, which is a different reason and has a case of
+	// its own below.
+	const bothTargets = 2
+	full := semaphore.NewWeighted(bothTargets)
+	if !full.TryAcquire(bothTargets) {
+		t.Fatal("the fixture could not take the permits")
 	}
-	t.Cleanup(func() { full.Release(1) })
+	t.Cleanup(func() { full.Release(bothTargets) })
 	waiting, cancelWaiting := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	t.Cleanup(cancelWaiting)
 
@@ -513,15 +522,16 @@ func admissionCases(t *testing.T) []struct {
 	t.Cleanup(cancelNow)
 
 	return []struct {
-		name   string
-		ctx    context.Context
-		sema   *semaphore.Weighted
-		reason string
+		name    string
+		ctx     context.Context
+		sema    *semaphore.Weighted
+		workers int64
+		reason  string
 	}{
-		{"a full connection limit", waiting, full, reasonNoPermit},
-		{"a deadline that had passed", expired, semaphore.NewWeighted(1), reasonDeadline},
-		{"a deadline that had passed with no limit configured", expired, nil, reasonDeadline},
-		{"a cancelled scrape", cancelled, semaphore.NewWeighted(1), reasonCancelled},
+		{"a full connection limit", waiting, full, bothTargets, reasonNoPermit},
+		{"a deadline that had passed", expired, semaphore.NewWeighted(1), 1, reasonDeadline},
+		{"a deadline that had passed with no limit configured", expired, nil, 1, reasonDeadline},
+		{"a cancelled scrape", cancelled, semaphore.NewWeighted(1), 1, reasonCancelled},
 	}
 }
 
@@ -531,7 +541,7 @@ func TestUnattemptedWorkIsNamedNotAttempted(t *testing.T) {
 			targets := targetsForDSN("127.0.0.1:1", "one", "two")
 			e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
 				WithContext(admission.ctx),
-				WithConnectionsSemaphore(admission.sema),
+				WithConnectionsSemaphore(admission.sema, admission.workers),
 			)
 			e.coverage.setSelection(true, true, 2, targets, nil, 0)
 
@@ -804,5 +814,186 @@ func TestLastSuccessSurvivesANameTheScrapeCannotResolve(t *testing.T) {
 	}
 	if want := float64(when.UnixNano()) / 1e9; value != want {
 		t.Errorf("the last success reads %v, want the recorded %v", value, want)
+	}
+}
+
+// manyNames builds n database names, for a fan-out with more databases than
+// workers.
+func manyNames(n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, fmt.Sprintf("db%03d", i))
+	}
+	return out
+}
+
+// TestEveryDatabaseIsVisitedWithFewerWorkersThanDatabases is the first half of
+// ChatGPT's acceptance check for the bounded pool.
+//
+// Running fewer workers than databases must not cap how many databases a scrape
+// covers. These targets point somewhere that will not answer, so each one ends
+// as a connection failure, which is the outcome being counted here: every
+// database was reached and reported on, rather than silently left out.
+func TestEveryDatabaseIsVisitedWithFewerWorkersThanDatabases(t *testing.T) {
+	// Three times as many databases as workers. Each connection attempt to a
+	// closed port costs about a second here, so the figures are kept small:
+	// the question is whether the worker count caps the set, which nine
+	// databases answer as well as a thousand.
+	const databases, workers = 9, 3
+
+	names := manyNames(databases)
+	targets := targetsForDSN("127.0.0.1:1", names...)
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/db000?sslmode=disable"},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(workers), workers),
+	)
+	e.coverage.setSelection(true, true, databases, targets, nil, 0)
+
+	ch, stop := drain()
+	failed, connFailures, deferred := e.scrapeTargets(ch, targets)
+	stop()
+
+	if deferred != 0 {
+		t.Errorf("%d databases were deferred, and the budget was not the constraint here", deferred)
+	}
+	if failed != databases || connFailures != databases {
+		t.Fatalf("%d failed and %d of those were connection failures, want %d of each: every database has to be reached",
+			failed, connFailures, databases)
+	}
+
+	g := series(t, e.coverage)
+	missing := 0
+	for _, name := range names {
+		if g["pg_exporter_database_scrape_error{datname="+name+",reason="+reasonConnect+",server=127.0.0.1:1}"] != 1 {
+			missing++
+		}
+	}
+	if missing != 0 {
+		t.Errorf("%d of %d databases carry no outcome series, so the worker count capped the set", missing, databases)
+	}
+}
+
+// TestManyDatabasesBehindAHeldPermitStayBounded is the second half of that
+// check, and the measurement ChatGPT took of the unbounded version.
+//
+// The only permit is held throughout, so every worker parks in the limiter.
+// One goroutine per database put the process at a thousand and seven of them
+// for a thousand databases. Here the count has to come from the worker number
+// instead, and every database that never started has to be deferred and named.
+func TestManyDatabasesBehindAHeldPermitStayBounded(t *testing.T) {
+	const databases, workers = 500, 4
+
+	held := semaphore.NewWeighted(workers)
+	if !held.TryAcquire(workers) {
+		t.Fatal("the fixture could not take the permits")
+	}
+	defer held.Release(workers)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	names := manyNames(databases)
+	targets := targetsForDSN("127.0.0.1:1", names...)
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/db000?sslmode=disable"},
+		WithContext(ctx),
+		WithConnectionsSemaphore(held, workers),
+	)
+	e.coverage.setSelection(true, true, databases, targets, nil, 0)
+
+	ch, stop := drain()
+	base := runtime.NumGoroutine()
+	type result struct{ failed, connFailures, deferred int }
+	out := make(chan result, 1)
+	go func() {
+		f, c, d := e.scrapeTargets(ch, targets)
+		out <- result{f, c, d}
+	}()
+
+	// Sampled while the workers are parked in the limiter, which is where a
+	// per-database fan-out would have five hundred goroutines waiting.
+	time.Sleep(100 * time.Millisecond)
+	peak := runtime.NumGoroutine() - base
+
+	got := <-out
+	stop()
+
+	if peak > workers+4 {
+		t.Errorf("%d goroutines above the baseline while %d databases waited on %d workers",
+			peak, databases, workers)
+	}
+	if got.deferred != databases {
+		t.Fatalf("%d of %d databases were deferred, want all of them: the rest were dropped", got.deferred, databases)
+	}
+	if got.failed != 0 || got.connFailures != 0 {
+		t.Errorf("%d failed and %d connection failures: nothing was tried, so nothing is known to be wrong",
+			got.failed, got.connFailures)
+	}
+
+	g := series(t, e.coverage)
+	unnamed := 0
+	for _, name := range names {
+		permit := g["pg_exporter_database_deferred{datname="+name+",reason="+reasonNoPermit+",server=127.0.0.1:1}"]
+		deadline := g["pg_exporter_database_deferred{datname="+name+",reason="+reasonDeadline+",server=127.0.0.1:1}"]
+		if permit+deadline != 1 {
+			unnamed++
+		}
+	}
+	if unnamed != 0 {
+		t.Errorf("%d of %d deferred databases are not named by a deferral series", unnamed, databases)
+	}
+}
+
+// TestWorkThatNeverReachedTheLimiterNamesTheDeadline pins a change the bounded
+// pool makes to what operators see.
+//
+// With one worker and the only permit held, the first database asks for a
+// permit and waits until the scrape's time runs out, so it reports
+// no_connection_permit. The databases behind it are reached after that time has
+// gone, so they never ask, and what they met is the deadline. Before the pool
+// every database asked at once and every one of them said
+// no_connection_permit, including on a scrape where the limiter was never the
+// constraint.
+//
+// The order is deterministic because there is one worker, which is what lets
+// this distinguish the two reasons at all.
+func TestWorkThatNeverReachedTheLimiterNamesTheDeadline(t *testing.T) {
+	held := semaphore.NewWeighted(1)
+	if !held.TryAcquire(1) {
+		t.Fatal("the fixture could not take the only permit")
+	}
+	defer held.Release(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	targets := targetsForDSN("127.0.0.1:1", "first", "second", "third")
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/first?sslmode=disable"},
+		WithContext(ctx),
+		WithConnectionsSemaphore(held, 1),
+	)
+	e.coverage.setSelection(true, true, 3, targets, nil, 0)
+
+	ch, stop := drain()
+	_, _, deferred := e.scrapeTargets(ch, targets)
+	stop()
+
+	if deferred != 3 {
+		t.Fatalf("%d of 3 databases were deferred, want all of them", deferred)
+	}
+
+	g := series(t, e.coverage)
+	key := func(name, reason string) string {
+		return "pg_exporter_database_deferred{datname=" + name + ",reason=" + reason + ",server=127.0.0.1:1}"
+	}
+	if g[key("first", reasonNoPermit)] != 1 {
+		t.Errorf("the database that asked for a permit and waited is not named for the permit: %v", g)
+	}
+	for _, name := range []string{"second", "third"} {
+		if g[key(name, reasonDeadline)] != 1 {
+			t.Errorf("%s was reached after the time had gone and is not named for the deadline", name)
+		}
+		if g[key(name, reasonNoPermit)] != 0 {
+			t.Errorf("%s never asked for a permit and is named for one", name)
+		}
 	}
 }
