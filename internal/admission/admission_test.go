@@ -359,3 +359,61 @@ func TestACancelledScrapeIsNotBlamedOnTheLimit(t *testing.T) {
 		t.Error("the free permit was taken by work that was never admitted")
 	}
 }
+
+// TestEndedAnswersOnlyTheTwoReasonsItCanObserve is the constraint on
+// per-collector admission.
+//
+// It performs no wait, so it has no way to observe a shortage of connection
+// permits, and a third reason here would be an assertion nothing made.
+func TestEndedAnswersOnlyTheTwoReasonsItCanObserve(t *testing.T) {
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	live, cancelLive := context.WithTimeout(context.Background(), time.Hour)
+	defer cancelLive()
+
+	for _, c := range []struct {
+		name  string
+		ctx   context.Context
+		want  Decision
+		ended bool
+	}{
+		{"a deadline that had passed", expired, Deadline, true},
+		{"a cancelled scrape", cancelled, Cancelled, true},
+		{"a scrape with time left", live, Admitted, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			decision, ended := Ended(c.ctx)
+			if ended != c.ended {
+				t.Fatalf("ended is %v, want %v", ended, c.ended)
+			}
+			if decision != c.want {
+				t.Errorf("decision is %v, want %v", decision, c.want)
+			}
+			if decision == NoPermit {
+				t.Error("a check that performs no wait reported a missing connection permit")
+			}
+		})
+	}
+}
+
+// TestEndedTakesNoPermit is the other half of the constraint. A limiter with
+// nothing free must not stop work that already holds its connection.
+func TestEndedTakesNoPermit(t *testing.T) {
+	sema := semaphore.NewWeighted(1)
+	if !sema.TryAcquire(1) {
+		t.Fatal("the fixture could not take the only permit")
+	}
+	defer sema.Release(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+
+	// Ended takes no limiter at all, which is the point: there is no argument
+	// through which it could ask for one. This asserts the observable
+	// consequence, which is that a full limiter does not stop the work.
+	if decision, ended := Ended(ctx); ended || decision != Admitted {
+		t.Errorf("work holding its own connection was stopped with %v while the limiter was full", decision)
+	}
+}

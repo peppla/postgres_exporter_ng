@@ -118,6 +118,18 @@ func withPermit(ctx context.Context, sema *semaphore.Weighted) (Permit, Decision
 	return Permit{sema: sema}, Admitted
 }
 
+// Ended reports how the scrape ended, and whether it has, for work that already
+// holds everything it needs to run.
+//
+// Per-collector work inside a database uses this rather than Admit. The
+// database holds one connection permit for the connection its collectors run
+// on, and asking for a second would let a bounded pool exhaust the limiter with
+// connections the pool is already holding. Nothing here waits, so NoPermit
+// cannot be among the answers: the only two are Deadline and Cancelled.
+func Ended(ctx context.Context) (Decision, bool) {
+	return contextDecision(ctx)
+}
+
 // contextDecision reports how the scrape ended, and whether it has.
 func contextDecision(ctx context.Context) (Decision, bool) {
 	err := ctx.Err()
