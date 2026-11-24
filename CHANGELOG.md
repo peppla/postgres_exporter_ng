@@ -110,6 +110,16 @@
   longer counts work that never started, and `databases_attempted` and
   `databases_deferred` say how much did and did not. An alert on failures no
   longer fires because the exporter was busy.
+* [BUGFIX] A database the scrape ran out of time to start work on is reported
+  as deferred with `reason="scrape_deadline"`, rather than as a database the
+  exporter could not connect to. With no connection limit configured the
+  exporter did not check the scrape's deadline before starting work, so after
+  the deadline passed every remaining database was attempted, each connection
+  failed on the expired deadline, and the result named the server as
+  unreachable. The new reason separates the two ways a scrape runs out of room:
+  `no_connection_permit` for work that waited for a connection and did not get
+  one, and `scrape_deadline` for work there was no time left to start. The two
+  call for different responses, so they are no longer reported as one.
 * [CHANGE] Database selection written in both the configuration file and a
   deprecated flag is refused at startup instead of being resolved at scrape
   time. The exporter exits rather than starting and serving a response with no

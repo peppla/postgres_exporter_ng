@@ -26,6 +26,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/admission"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
@@ -153,7 +154,7 @@ var (
 	)
 	collectorDeferredDatabaseDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_deferred"),
-		"1 for each selected database this scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it for database-local work, because that connection is what cluster-wide collection runs on. So this can name one more database than databases_deferred counts, in the same way database_up can. Reasons are a closed set, never an error message. A deferral is not an error and is not counted in database_error.",
+		"1 for each selected database this scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one, and scrape_deadline for work the scrape ran out of time to start. Also published for the configured connection database when that connection itself was deferred, whether or not selection kept it for database-local work, because that connection is what cluster-wide collection runs on. So this can name one more database than databases_deferred counts, in the same way database_up can. Reasons are a closed set, never an error message. A deferral is not an error and is not counted in database_error.",
 		[]string{"server", "datname", "reason"},
 		nil,
 	)
@@ -434,12 +435,15 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	cluster, local := p.byScope()
 	databaseLocal := len(local) > 0
 
-	if !p.acquire() {
+	permit, decision := admission.Admit(p.ctx, p.connSema)
+	if decision != admission.Admitted {
 		// Nothing was attempted, which is neither a success nor a connection
 		// failure. Returning silently here published no series at all, so a
 		// scrape that collected nothing was indistinguishable from one that
 		// was never configured to collect.
-		p.reportControlDeferral(ch, inst.name, controlName, databaseLocal)
+		reason := deferralReason(decision)
+		level.Warn(p.logger).Log("msg", "Deferred the control connection", "reason", reason)
+		p.reportControlDeferral(ch, inst.name, controlName, databaseLocal, reason)
 		p.retainedForControl(ch, inst.dsn, controlName, cluster, local)
 		return
 	}
@@ -447,7 +451,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	err := inst.setup(p.ctx)
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "err", err)
-		p.release()
+		permit.Release()
 		p.reportControlFailure(ch, inst.name, controlName, dbselect.ReasonConnect, databaseLocal)
 		p.retainedForControl(ch, inst.dsn, controlName, cluster, local)
 		return
@@ -510,7 +514,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	wg.Wait()
 	inst.Close()
-	p.release()
+	permit.Release()
 
 	// The control connection worked, whatever was selected to run over it.
 	// Without a catalog read there is no target to take the name from, so it
@@ -609,20 +613,29 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		p.publishRetained(ch, local, target, t.datname)
 		p.publishDatabaseFreshness(ch, target, t.datname, selection)
 	}
-	if !p.acquire() {
+	permit, decision := admission.Admit(p.ctx, p.connSema)
+	if decision != admission.Admitted {
 		// Deferred, not failed. Nothing was connected to and nothing was
 		// tried, so this says the exporter ran out of room rather than that
 		// something is wrong with this database, and an alert on the error
 		// series must not fire for it. database_up is still 0: it was not
 		// reached.
+		//
+		// The reason separates the two ways of running out of room, because
+		// they call for different responses. A full connection limit is
+		// answered by raising the limit or collecting less at once, and a
+		// deadline that passed before the work started is answered by a
+		// longer interval or a smaller selection.
+		reason := deferralReason(decision)
+		level.Warn(p.logger).Log("msg", "Deferred a database", "datname", t.datname, "reason", reason)
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
-			server, t.datname, dbselect.ReasonNoPermit)
+			server, t.datname, reason)
 		p.publishRetained(ch, local, target, t.datname)
 		p.publishDatabaseFreshness(ch, target, t.datname, selection)
 		return outcomeDeferred
 	}
-	defer p.release()
+	defer permit.Release()
 
 	dbInst, err := newInstance(t.dsn)
 	if err == nil {
@@ -825,21 +838,16 @@ func selectionOf(local map[string]Collector) string {
 	return lastsuccess.Selection(names)
 }
 
-func (p PostgresCollector) acquire() bool {
-	if p.connSema == nil {
-		return true
+// deferralReason is the bounded label for work that was not admitted.
+//
+// Called only where the decision is not admission.Admitted. Admitted work is not
+// deferred, and giving it a reason anyway would publish a database as deferred
+// while it was being collected.
+func deferralReason(d admission.Decision) string {
+	if d == admission.Deadline {
+		return dbselect.ReasonDeadline
 	}
-	if err := p.connSema.Acquire(p.ctx, 1); err != nil {
-		level.Warn(p.logger).Log("msg", "Failed to acquire semaphore", "err", err)
-		return false
-	}
-	return true
-}
-
-func (p PostgresCollector) release() {
-	if p.connSema != nil {
-		p.connSema.Release(1)
-	}
+	return dbselect.ReasonNoPermit
 }
 
 // localSelected counts the databases this request meant to run database-local
@@ -948,7 +956,7 @@ func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, ser
 // Separate from reportControlFailure because a deferral is not a failure. The
 // connection was never opened, so nothing is known to be wrong with the
 // server, and an alert on the error series must not fire for a busy exporter.
-func (p PostgresCollector) reportControlDeferral(ch chan<- prometheus.Metric, server, datname string, databaseLocal bool) {
+func (p PostgresCollector) reportControlDeferral(ch chan<- prometheus.Metric, server, datname string, databaseLocal bool, reason string) {
 	selected := 0
 	if databaseLocal && p.controlSelected(datname) {
 		selected = 1
@@ -967,7 +975,7 @@ func (p PostgresCollector) reportControlDeferral(ch chan<- prometheus.Metric, se
 	// the local set, so on a cluster-only request the two describe different
 	// things: one deferred connection, no deferred databases.
 	ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
-		server, datname, dbselect.ReasonNoPermit)
+		server, datname, reason)
 	p.reportOutcome(ch, server, selected, 0, selected)
 }
 
