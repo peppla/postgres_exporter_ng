@@ -3363,7 +3363,10 @@ func (s *IntegrationSuite) TestCollectRejectsAnUnusableSelection(c *C) {
 		collect string
 	}{
 		{"an unknown collector name", "postgres.collector.no_such_collector"},
-		{"a collector that ships disabled", "postgres.collector.stat_wal_receiver"},
+		// stat_wal_receiver used to be the example here. This change enables
+		// it, because the query file it replaces is being retired, so the
+		// case needs a collector that still ships disabled.
+		{"a collector that ships disabled", "postgres.collector.stat_statements"},
 		{"an unknown value in the postgres namespace", "postgres.nonsense"},
 		{"the old second-level collector form", "postgres.stat_user_tables"},
 	} {
@@ -3521,4 +3524,195 @@ func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
 
 	c.Check(collected, DeepEquals, []string{chosen},
 		Commentf("an include list naming %q collected from %v", chosen, collected))
+}
+
+// TestReplicationCollectorsAgainstServer covers the collectors written to take
+// the remaining built-in metrics out of the query engine.
+//
+// Every one of them runs a query against catalogues and views whose columns
+// differ between versions, and a query that is wrong for a version fails at
+// parse time. sqlmock never parses anything, so only a server can say whether
+// these run at all.
+//
+// Three of the four describe things this fixture has none of: there are no
+// standbys, no WAL senders and no subscriptions. That is the point of the
+// first half of this test. An empty view has to produce a successful collector
+// and no series, because no series and a zero are different answers and the
+// contract requires them to stay different.
+func (s *IntegrationSuite) TestReplicationCollectorsAgainstServer(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const slot = "retire_test_slot"
+	const publication = "retire_test_publication"
+	cleanup := func() {
+		_, _ = admin.db.Exec(`SELECT pg_drop_replication_slot($1)`, slot)
+		_, _ = admin.db.Exec(`DROP PUBLICATION IF EXISTS ` + publication)
+	}
+	cleanup()
+	defer cleanup()
+
+	// The second argument reserves write-ahead log immediately. Without it a
+	// physical slot has no restart position at all, which would make the
+	// assertion below pass or fail on a detail of slot creation rather than
+	// on whether the collector publishes it.
+	_, err = admin.db.Exec(`SELECT pg_create_physical_replication_slot($1, true)`, slot)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE PUBLICATION ` + publication + ` FOR ALL TABLES`)
+	c.Assert(err, IsNil)
+
+	limits := budget.Defaults()
+	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
+		dbselect.Absent(), dbselect.Absent())
+	c.Assert(err, IsNil)
+	families, err := registry.Gather()
+	c.Assert(err, IsNil)
+
+	byName := map[string]*dto.MetricFamily{}
+	for _, f := range families {
+		byName[f.GetName()] = f
+	}
+
+	// Every collector ran without error, including the ones with nothing to
+	// report. A query that is wrong for this version shows up here.
+	success, ok := byName["pg_scrape_collector_success"]
+	c.Assert(ok, Equals, true, Commentf("nothing was collected at all"))
+	for _, name := range []string{
+		"stat_replication", "stat_subscription", "publication", "stat_activity_walsender",
+	} {
+		found := false
+		for _, m := range success.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "collector" && l.GetValue() == name {
+					found = true
+					c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+						Commentf("the %s collector failed", name))
+				}
+			}
+		}
+		c.Check(found, Equals, true, Commentf("the %s collector did not run", name))
+	}
+
+	// Nothing is connected, so these publish no series rather than zeroes.
+	for _, name := range []string{
+		"pg_stat_replication_replay_lsn_bytes",
+		"pg_stat_subscription_received_lsn_bytes",
+		"pg_stat_activity_walsender_backend_start_seconds",
+	} {
+		_, present := byName[name]
+		c.Check(present, Equals, false,
+			Commentf("%s was published on a server with nothing connected, so an absent thing reads as a measured one", name))
+	}
+
+	// The publication exists, so this one has something to say.
+	pub, ok := byName["pg_publication_puballtables"]
+	c.Assert(ok, Equals, true, Commentf("a publication was created and nothing was published about it"))
+	var seen bool
+	for _, m := range pub.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if labels["pubname"] != publication {
+			continue
+		}
+		seen = true
+		c.Check(m.GetGauge().GetValue(), Equals, float64(1),
+			Commentf("FOR ALL TABLES did not report puballtables"))
+		c.Check(labels["datname"], Not(Equals), "",
+			Commentf("a per-database catalogue was published without naming the database"))
+	}
+	c.Check(seen, Equals, true, Commentf("the publication this test created is missing"))
+
+	// And the slot has a restart position now.
+	restart, ok := byName["pg_replication_slot_slot_restart_lsn"]
+	c.Assert(ok, Equals, true, Commentf("the slot has a restart position and nothing published it"))
+	seen = false
+	for _, m := range restart.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == "slot_name" && l.GetValue() == slot {
+				seen = true
+				c.Check(m.GetGauge().GetValue() > 0, Equals, true,
+					Commentf("the restart position is %v", m.GetGauge().GetValue()))
+			}
+		}
+	}
+	c.Check(seen, Equals, true, Commentf("the slot this test created is missing"))
+}
+
+// TestPublicationCollectorCoversEveryDatabase is the scope claim, which the
+// test above cannot make.
+//
+// pg_publication is a per-database catalogue. A collector registered as
+// cluster-scoped runs once on the configured connection and reports only that
+// database's publications, and on a one-database fixture that is
+// indistinguishable from doing the right thing. Two databases, each with a
+// publication of its own, is what tells them apart.
+func (s *IntegrationSuite) TestPublicationCollectorCoversEveryDatabase(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	c.Assert(dsn, Not(Equals), "")
+
+	admin, err := NewServer(strings.Split(dsn, ",")[0])
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	control, hasControl := config.DatabaseFromDSN(strings.Split(dsn, ",")[0])
+	c.Assert(hasControl, Equals, true)
+
+	const other = "publication_other"
+	const herePub = "publication_here"
+	const therePub = "publication_there"
+	cleanup := func() {
+		_, _ = admin.db.Exec(`DROP PUBLICATION IF EXISTS ` + herePub)
+		_, _ = admin.db.Exec(`DROP DATABASE IF EXISTS ` + other + ` WITH (FORCE)`)
+	}
+	cleanup()
+	defer cleanup()
+
+	_, err = admin.db.Exec(`CREATE PUBLICATION ` + herePub + ` FOR ALL TABLES`)
+	c.Assert(err, IsNil)
+	_, err = admin.db.Exec(`CREATE DATABASE ` + other)
+	c.Assert(err, IsNil)
+
+	otherDSN, err := config.DSNWithDatabase(strings.Split(dsn, ",")[0], other)
+	c.Assert(err, IsNil)
+	otherServer, err := NewServer(otherDSN)
+	c.Assert(err, IsNil)
+	defer otherServer.Close()
+	_, err = otherServer.db.Exec(`CREATE PUBLICATION ` + therePub + ` FOR ALL TABLES`)
+	c.Assert(err, IsNil)
+
+	limits := budget.Defaults()
+	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
+		dbselect.Absent(), dbselect.Absent())
+	c.Assert(err, IsNil)
+	families, err := registry.Gather()
+	c.Assert(err, IsNil)
+
+	found := map[string]string{}
+	for _, f := range families {
+		if f.GetName() != "pg_publication_puballtables" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			found[labels["pubname"]] = labels["datname"]
+		}
+	}
+
+	c.Check(found[herePub], Equals, control,
+		Commentf("the publication in the connected database is missing or mislabelled: %v", found))
+	c.Check(found[therePub], Equals, other,
+		Commentf("the publication in %s was not collected, so the collector ran on one database only: %v", other, found))
 }

@@ -146,7 +146,7 @@ func TestEveryMetricHasExactlyOneValueType(t *testing.T) {
 		switch len(d.Types) {
 		case 1:
 		case 0:
-			t.Errorf("%s (%s:%d) is defined but the inventory cannot see it emitted: it is published through something readMetricInventory does not follow",
+			t.Errorf("%s (%s:%d) is defined but the inventory cannot see where it is emitted. Pass the descriptor as a named variable to MustNewConstMetric or to a local emit(desc, vtype, value), rather than through a struct field or a table of descriptors, which cannot be followed by reading the source",
 				d.Name, d.File, d.Line)
 		default:
 			t.Errorf("%s is emitted as %v, so its type depends on which code path produced it", d.Name, d.Types)
@@ -343,6 +343,14 @@ func TestNoNewCounterWithoutTotal(t *testing.T) {
 
 	seen := map[string]bool{}
 	for _, d := range defs {
+		if len(d.Types) == 0 {
+			// Reported by TestEveryMetricHasExactlyOneValueType, which names
+			// it and says what to do. Reading Types[0] here panicked instead,
+			// so one unfollowed descriptor took down the whole package's
+			// tests with an index out of range rather than failing one of
+			// them with a message.
+			continue
+		}
 		if d.Types[0] != "Counter" || strings.HasSuffix(d.Name, "_total") {
 			continue
 		}

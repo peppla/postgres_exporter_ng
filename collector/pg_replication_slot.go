@@ -64,6 +64,16 @@ var (
 		[]string{"slot_name", "plugin", "slot_type"}, nil,
 	)
 
+	pgReplicationSlotRestartLsnDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(
+			namespace,
+			replicationSlotSubsystem,
+			"slot_restart_lsn",
+		),
+		"The oldest write-ahead log position this slot still needs, as a byte offset from the start of the log. The distance from the server's current position is how much log the slot is holding on disk.",
+		[]string{"slot_name", "plugin", "slot_type"}, nil,
+	)
+
 	pgReplicationSlotQuery = `SELECT
 		slot_name,
 		plugin,
@@ -73,7 +83,8 @@ var (
 		ELSE
 		    pg_current_wal_lsn() - '0/0'
 		END AS current_wal_lsn,
-		COALESCE(confirmed_flush_lsn, '0/0') - '0/0' AS confirmed_flush_lsn,
+		confirmed_flush_lsn - '0/0' AS confirmed_flush_lsn,
+		restart_lsn - '0/0' AS restart_lsn,
 		active
 	FROM pg_replication_slots;`
 )
@@ -93,8 +104,9 @@ func (PGReplicationSlotCollector) Update(ctx context.Context, instance *instance
 		var slotType sql.NullString
 		var walLSN sql.NullFloat64
 		var flushLSN sql.NullFloat64
+		var restartLSN sql.NullFloat64
 		var isActive sql.NullBool
-		if err := rows.Scan(&slotName, &plugin, &slotType, &walLSN, &flushLSN, &isActive); err != nil {
+		if err := rows.Scan(&slotName, &plugin, &slotType, &walLSN, &flushLSN, &restartLSN, &isActive); err != nil {
 			return err
 		}
 
@@ -123,14 +135,35 @@ func (PGReplicationSlotCollector) Update(ctx context.Context, instance *instance
 			pgReplicationSlotCurrentWalDesc,
 			prometheus.GaugeValue, walLSNMetric, slotNameLabel, pluginLabel, slotTypeLabel,
 		)
-		if isActive.Valid && isActive.Bool {
-			var flushLSNMetric float64
-			if flushLSN.Valid {
-				flushLSNMetric = flushLSN.Float64
-			}
+
+		// Published whether or not the slot is active. An inactive slot is
+		// exactly the case where this matters, because it is still holding log
+		// that nothing will confirm, and this is the position that log is held
+		// from.
+		if restartLSN.Valid {
+			ch <- prometheus.MustNewConstMetric(
+				pgReplicationSlotRestartLsnDesc,
+				prometheus.GaugeValue, restartLSN.Float64, slotNameLabel, pluginLabel, slotTypeLabel,
+			)
+		}
+		// Published whether or not the slot is active. It used to be published
+		// only for an active slot, which left out the case an operator cares
+		// about: an inactive slot whose consumer has gone away is the one
+		// holding write-ahead log that nothing will confirm, and the distance
+		// between this and the server's current position is how much.
+		//
+		// Omitted where there is no such position. A physical slot has no
+		// confirmed flush position at all, and a logical slot nothing has
+		// consumed from yet has none either. The query used to COALESCE that
+		// NULL to zero and the collector published it, so a physical slot
+		// reported a consumer that had confirmed nothing, measured on a live
+		// server as slot_confirmed_flush_lsn 0 with slot_type physical. The
+		// NULL reaches the scan now and the series is left out, which is what
+		// a measurement that does not apply looks like everywhere else here.
+		if flushLSN.Valid {
 			ch <- prometheus.MustNewConstMetric(
 				pgReplicationSlotCurrentFlushDesc,
-				prometheus.GaugeValue, flushLSNMetric, slotNameLabel, pluginLabel, slotTypeLabel,
+				prometheus.GaugeValue, flushLSN.Float64, slotNameLabel, pluginLabel, slotTypeLabel,
 			)
 		}
 		ch <- prometheus.MustNewConstMetric(

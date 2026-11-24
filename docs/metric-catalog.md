@@ -288,7 +288,8 @@ Replication slot positions.
 | metric | type | unit | versions | what it measures |
 | --- | --- | --- | --- | --- |
 | `pg_replication_slot_slot_current_wal_lsn` | gauge | bytes of WAL | 15-19 | The server's current write-ahead log position, as a number. |
-| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds: `restart_lsn` is the oldest position the slot may still need, and it is what retention is measured from. Published only while the slot is active, so an inactive slot has no sample at all, and an active slot whose position the server reports as NULL is published as zero, which is a real position: the start of the log. Both of those are in the correction queue, and so is the absent `restart_lsn`. |
+| `pg_replication_slot_slot_confirmed_flush_lsn` | gauge | bytes of WAL | 15-19 | The last position the consumer confirmed. The difference from the current position is how far behind the consumer is, which is not the same as how much WAL the slot holds. Omitted for a slot that has no confirmed position, which is every physical slot and any logical slot nothing has consumed from yet. |
+| `pg_replication_slot_slot_restart_lsn` | gauge | bytes of WAL | 15-19 | The oldest position the slot still needs, which is what retention is measured from. The distance from the current position is how much log the slot is holding on disk, and it is published whether or not the slot is active, because an inactive slot is where it matters. Slots that overlap hold the same segments once, so summing this across slots is not a disk figure. |
 | `pg_replication_slot_slot_is_active` | gauge | boolean | 15-19 | Whether anything is connected to the slot. An inactive slot still holds WAL. |
 
 ## stat_activity_autovacuum
@@ -453,6 +454,99 @@ the exporter does not.
 | `pg_stat_statements_seconds_total` | counter | seconds | 15-19 | Total execution time. |
 | `pg_stat_statements_block_read_seconds_total` | counter | seconds | 15-19 | Time spent reading blocks. Zero unless `track_io_timing` is on. |
 | `pg_stat_statements_block_write_seconds_total` | counter | seconds | 15-19 | Time spent writing blocks. Zero unless `track_io_timing` is on. |
+
+## publication
+
+Logical replication publications, from the publisher's side.
+
+`pg_publication` is a per-database catalogue, so a publication created in one
+database is invisible from another. The query file this replaces ran against
+the connected database alone and so described only that one.
+
+| | |
+| --- | --- |
+| Scope | database, `pg_publication` describes one database |
+| Labels | `datname`, `pubname` |
+| Cardinality | one series per publication per selected database, bounded by what is defined |
+| Reset | none, these are definitions rather than counters |
+| Availability | all versions |
+| Partial failure | the collector fails as a unit, per database |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_publication_puballtables` | gauge | boolean | 15-19 | Whether the publication covers every table in the database. |
+| `pg_publication_pubinsert` | gauge | boolean | 15-19 | Whether it replicates inserts. |
+| `pg_publication_pubupdate` | gauge | boolean | 15-19 | Whether it replicates updates. |
+| `pg_publication_pubdelete` | gauge | boolean | 15-19 | Whether it replicates deletes. |
+| `pg_publication_pubtruncate` | gauge | boolean | 15-19 | Whether it replicates truncates. |
+
+## stat_activity_walsender
+
+The WAL sender processes on a primary, one per connected standby or logical
+subscriber.
+
+| | |
+| --- | --- |
+| Scope | cluster, `pg_stat_activity` reports every database |
+| Labels | `pid`, `usename`, `application_name`, `client_addr`, `state` |
+| Cardinality | one series per connected client, and `pid` changes on reconnection, so the set grows with reconnections rather than with clients |
+| Reset | none, a series disappears when the client disconnects |
+| Availability | all versions; `pg_monitor` to see other users' sessions. Empty on a server with no replication clients, which is no series rather than zero |
+| Partial failure | the collector fails as a unit |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_activity_walsender_backend_start_seconds` | gauge | seconds since the epoch | 15-19 | When this sender process started. A value that keeps moving is a client that keeps reconnecting. |
+
+## stat_replication
+
+What a primary knows about the standbys connected to it.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | `pid`, `usename`, `application_name`, `client_addr`, `state`, `sync_state` |
+| Cardinality | one series per connected standby per metric, and `pid` changes on reconnection |
+| Reset | none, positions advance and lags are current measurements |
+| Availability | all versions. Empty on a standby and on a primary with nothing connected, which is no series rather than zero. `client_addr` is empty for a standby connected over a Unix socket |
+| Partial failure | the collector fails as a unit. A NULL position or lag is omitted rather than published as zero, because a standby that has not reported yet has no lag and zero would read as none |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_replication_write_lsn_bytes` | gauge | bytes of WAL | 15-19 | Position this standby has written. |
+| `pg_stat_replication_flush_lsn_bytes` | gauge | bytes of WAL | 15-19 | Position this standby has flushed to disk. |
+| `pg_stat_replication_replay_lsn_bytes` | gauge | bytes of WAL | 15-19 | Position this standby has replayed. The difference from the primary's current position is how far behind it is. |
+| `pg_stat_replication_write_lag_seconds` | gauge | seconds | 15-19 | Time between a local commit and this standby reporting it written. |
+| `pg_stat_replication_flush_lag_seconds` | gauge | seconds | 15-19 | Time between a local commit and this standby reporting it flushed. |
+| `pg_stat_replication_replay_lag_seconds` | gauge | seconds | 15-19 | Time between a local commit and this standby reporting it replayed. |
+
+## stat_subscription
+
+Logical replication subscriptions, from the subscriber's side.
+
+The query file this replaces selected `received_lsn` without converting it,
+and a `pg_lsn` reaches the query engine as a string such as `0/1FDF5FA0`,
+which the engine cannot parse into a number, so no real position was ever
+published. A NULL position did reach the wire, as a NaN, because the engine
+turns a NULL in a column mapped as a gauge into one. Measured against
+PostgreSQL 18 rather than read off the code.
+
+| | |
+| --- | --- |
+| Scope | cluster |
+| Labels | `subid`, `subname`, `pid` |
+| Cardinality | one series per subscription per metric, for the subscriptions that have something to report. `pid` is empty when the worker is not running, and a subscription with no worker has no positions or times either, so it has no series at all: there is no state indicator here saying that a subscription exists and is idle |
+| Reset | none |
+| Availability | all versions. Empty where nothing subscribes, which is no series rather than zero |
+| Partial failure | the collector fails as a unit. A NULL position or time is omitted rather than published as zero |
+
+| metric | type | unit | versions | what it measures |
+| --- | --- | --- | --- | --- |
+| `pg_stat_subscription_received_lsn_bytes` | gauge | bytes of WAL | 15-19 | Position last received from the publisher. |
+| `pg_stat_subscription_latest_end_lsn_bytes` | gauge | bytes of WAL | 15-19 | Position last reported back to the publisher. |
+| `pg_stat_subscription_last_msg_send_time_seconds` | gauge | seconds since the epoch | 15-19 | When the publisher sent the last message received. |
+| `pg_stat_subscription_last_msg_receipt_time_seconds` | gauge | seconds since the epoch | 15-19 | When this subscriber received it. The difference from the send time is the one-way delay, if the clocks agree. |
+| `pg_stat_subscription_latest_end_time_seconds` | gauge | seconds since the epoch | 15-19 | When the last position was reported back. |
 
 ## stat_user_indexes
 
@@ -656,6 +750,12 @@ author has to check each family.
 
 `pg_stat_io_reueses_total` is a misspelling of `reuses`.
 
+`pg_replication_slot_slot_confirmed_flush_lsn` is zero for a physical slot,
+which has no confirmed flush position. The query coalesces the NULL away, so a
+column that does not apply reads as a consumer that has confirmed nothing. The
+contract asks for missing and zero to stay distinguishable and here they do
+not.
+
 Three label sets are unbounded, and nothing in the exposition says so.
 `pg_stat_statements` mints a series per statement shape per user per database,
 `pg_process_idle_seconds` mints one per `application_name` that any client
@@ -685,16 +785,14 @@ availability column says 15-19 for metrics that are only measured below 17.
 PostgreSQL moved that accounting into `pg_stat_io`, which this exporter
 already collects.
 
-`restart_lsn` is not published, and it is the position retention is measured
-from. The slot section publishes the server's current position and the
-consumer's confirmed flush, and the distance between those two is how far
-behind the consumer is rather than how much log the slot is holding. Adding
-`restart_lsn` is a new metric rather than a correction, and summing per-slot
-distances is not a disk figure in any case, because slots that overlap hold the
-same segments once.
+`pg_replication_slot_slot_restart_lsn` was added rather than corrected, and it
+is the position retention is measured from. Before it, the positions published
+were the server's current one and the consumer's confirmed flush, and the
+distance between those two is how far behind the consumer is rather than how
+much log the slot is holding. Summing restart distances across slots is still
+not a disk figure, because slots that overlap hold the same segments once.
 
-The confirmed flush position is also published only while a slot is active,
-which leaves out the case an operator cares about: an inactive slot is the one
-holding log that nothing will confirm. An active slot whose position is NULL
-publishes zero, which reads as a consumer that has confirmed nothing rather
-than as a position that does not apply.
+The confirmed flush position is published for an inactive slot now, which is
+the case an operator cares about: an inactive slot is the one holding log that
+nothing will confirm. It is omitted where the server reports no position at
+all rather than published as zero.

@@ -1,12 +1,17 @@
 # Migration mapping
 
-Which built-in collector replaces which shipped query file, and what is lost or
-doubled on the way.
+Which built-in collector replaces which shipped query file, and what is left to
+write before each file can go.
 
-The exporter has two metric engines behind one `/metrics`. Built-in monitoring
-is the Go collectors catalogued in [metric-catalog.md](metric-catalog.md). The
-other engine runs query files, and the files PMM ships cover ground the Go
-collectors also cover.
+The target is that the query engine collects no built-in metric at all. Built-in
+monitoring is the Go collectors catalogued in
+[metric-catalog.md](metric-catalog.md), and the query engine exists for
+application queries an operator writes. A shipped query file that produces
+monitoring is built-in monitoring depending on configuration that can be edited
+or deleted, which is what the contract's §4.0 settled against.
+
+So nothing below is a verdict that a file should stay. Where a file cannot be
+retired, this says what has to be written first.
 
 `collector/metric_migration_test.go` checks this file against those query
 files, so a namespace added to one of them cannot stay undocumented here.
@@ -34,6 +39,31 @@ the truth unless it pins `server`.
 
 Nine more families are published **twice under two names**. A query cannot
 match both at once, so a dashboard uses one and silently ignores the other.
+
+The collectors written to replace the high-resolution file use canonical names
+rather than the `pg_custom_` ones, because a built-in metric should not be
+named custom. That is a rename for anything reading them, listed below with
+the others. If dashboard continuity matters more than the names, this is the
+decision to overturn, and it is cheaper to overturn now than later.
+
+```
+pg_custom_stat_replication_write_lsn_bytes      ->  pg_stat_replication_write_lsn_bytes
+pg_custom_stat_replication_flush_lsn_bytes      ->  pg_stat_replication_flush_lsn_bytes
+pg_custom_stat_replication_replay_lsn_bytes     ->  pg_stat_replication_replay_lsn_bytes
+pg_custom_stat_replication_write_lag_seconds    ->  pg_stat_replication_write_lag_seconds
+pg_custom_stat_replication_flush_lag_seconds    ->  pg_stat_replication_flush_lag_seconds
+pg_custom_stat_replication_replay_lag_seconds   ->  pg_stat_replication_replay_lag_seconds
+pg_custom_stat_subscription_last_msg_send_time  ->  pg_stat_subscription_last_msg_send_time_seconds
+pg_custom_stat_subscription_last_msg_receipt_time -> pg_stat_subscription_last_msg_receipt_time_seconds
+pg_custom_publication_puballtables              ->  pg_publication_puballtables
+pg_custom_publication_pubinsert                 ->  pg_publication_pubinsert
+pg_custom_publication_pubupdate                 ->  pg_publication_pubupdate
+pg_custom_publication_pubdelete                 ->  pg_publication_pubdelete
+pg_custom_stat_activity_walsender_backend_start_unix -> pg_stat_activity_walsender_backend_start_seconds
+pg_custom_replication_slots_restart_lsn_bytes   ->  pg_replication_slot_slot_restart_lsn
+pg_custom_replication_slots_active              ->  pg_replication_slot_slot_is_active
+pg_custom_replication_slots_confirmed_flush_lsn_bytes -> pg_replication_slot_slot_confirmed_flush_lsn
+```
 
 ```
 pg_statio_user_tables_heap_blks_hit    ->  pg_statio_user_tables_heap_blocks_hit
@@ -70,29 +100,69 @@ so adding a database needs no configuration change.
 | namespace | replacement | status |
 | --- | --- | --- |
 | `pg_database` | the `database` collector | fully covered, and duplicated today |
-| `pg_postmaster` | the `postmaster` collector | covered, but the built-in collector ships disabled, so today only the query file publishes it |
-| `pg_replication` | the `replication` collector, as `pg_replication_lag_seconds` | covered under a different name |
+| `pg_postmaster` | the `postmaster` collector | covered, and the collector is enabled now |
+| `pg_replication` | the `replication` collector, as `pg_replication_lag_seconds` | covered under a different name, and calculated differently |
 
-Retiring this file means enabling the `postmaster` collector in the same
-change. Nothing else publishes the server start time, and losing it silently
-would be the retirement doing exactly what stage 4 says not to do.
+The replication lag is not only a rename. The query file computes the lag from
+the timestamp of the last replayed transaction whenever the server is in
+recovery. The collector reports zero when the standby has caught up, which the
+file does not: on a caught-up standby with received and replayed positions
+equal, the file reported 0.95 seconds and the collector reported 0. Both
+describe the same standby. The file is reporting the age of the last
+transaction it replayed, which on an idle primary grows without anything being
+behind, and the collector is reporting that there is nothing left to replay.
+
+The collector's answer is the one an operator wants from a metric called lag,
+so this is a correction rather than a regression, and it is a change in the
+number rather than in the name. A threshold set against the file's value will
+behave differently against the collector's, and an alert on "lag above a few
+seconds" will stop firing on idle standbys that were never behind.
+
+The file also carries an Aurora-specific query, selected by distribution. The
+collector returns without metrics on Aurora. Aurora support is not settled in
+the supported-distribution contract, and that has to be resolved before this
+file can be called fully replaced: today, retiring it would take replication
+lag away from Aurora entirely. No Aurora instance was tested here, and this
+is read from the query file and the collector rather than measured.
+
+Everything else this file produces has a replacement that is switched on.
 
 ## queries-hr.yml
 
 | namespace | replacement | status |
 | --- | --- | --- |
-| `pg_custom_replication_slots` | the `replication_slot` collector | partly covered. The built-in publishes the current and confirmed-flush positions and whether the slot is active; the query file also publishes `restart_lsn` |
-| `pg_custom_stat_wal_receiver` | the `stat_wal_receiver` collector | partly covered, and the built-in ships disabled. The query file also publishes the receiver's lag in bytes and in seconds, which the built-in does not compute |
-| `pg_custom_stat_replication` | none | not covered. No Go collector reads `pg_stat_replication`, so a primary's view of its standbys exists only here |
-| `pg_custom_stat_activity_walsender` | none | not covered |
-| `pg_custom_stat_subscription` | none | not covered. Logical replication subscriptions exist only here |
-| `pg_custom_publication` | none | not covered |
+| `pg_custom_replication_slots` | the `replication_slot` collector | covered. `restart_lsn` is published, and the confirmed-flush position is published for inactive slots too |
+| `pg_custom_stat_wal_receiver` | the `stat_wal_receiver` collector | partly covered. The query file also publishes `written_lsn`, the lag in bytes and the lag in seconds, which the built-in does not compute |
+| `pg_custom_stat_replication` | the `stat_replication` collector | covered |
+| `pg_custom_stat_activity_walsender` | the `stat_activity_walsender` collector | covered |
+| `pg_custom_stat_subscription` | the `stat_subscription` collector | covered, and one of its metrics works for the first time |
+| `pg_custom_publication` | the `publication` collector | covered, and across every selected database rather than the connected one alone |
 
-This file must not be retired. Four of its six namespaces have no built-in
-equivalent at all, and the two that do are covered only in part. Replacing it
-means writing collectors for `pg_stat_replication`, `pg_stat_subscription` and
-`pg_publication` first, and adding `restart_lsn` and the receiver lag
-calculations to the collectors that exist.
+Five of the six are covered by collectors written for this. One thing is left
+before the file can go.
+
+The `stat_wal_receiver` collector needs `written_lsn`, the lag in bytes and
+the lag in seconds. The lag figures are the ones that matter, since they are
+what an operator reads, and the collector publishes positions without
+differencing them. That is an open coverage item with nothing in front of it:
+the column-order correction its query also needed merged in PR #14 and is in
+this base.
+
+`stat_wal_receiver` and `postmaster` shipped disabled and are enabled now. A
+replacement that is off is not a replacement.
+
+`pg_custom_stat_subscription_received_lsn` has never published a usable
+position. The file selects `received_lsn` without converting it, and a `pg_lsn`
+reaches the query engine as the string `0/1FDF5FA0`, which it cannot parse into
+a number, so every real position is dropped with one line at info level.
+Measured against PostgreSQL 18 rather than read off the code.
+
+The family does reach the wire, though, in one case: a NULL received position
+reaches `dbToFloat64(nil)`, which returns NaN, so a subscription whose worker
+has not received anything publishes a NaN sample. A NaN is not a position
+either, and it is worse than an absent series because it looks like a
+measurement. The collector converts the position in SQL and omits the sample
+where there is none.
 
 ## The legacy engine's own built-in maps
 
@@ -107,8 +177,8 @@ them, because what matters about them is what replaces them.
 | --- | --- | --- | --- |
 | `pg_stat_database_conflicts` | recovery conflicts per database, by cause: tablespace, lock, snapshot, bufferpin, deadlock | none | not covered. The `stat_database` collector reads `pg_stat_database`, which carries only the `conflicts` total, not the breakdown by cause |
 | `pg_lock_conflicts` | count of locks per blocking backend | none | not covered. The `locks` collector counts locks by mode, not by who is blocking whom |
-| `pg_stat_replication` | two numbers per standby: the server's current WAL position in bytes, and the byte distance from it to that standby's replay position. The positions, the three lag intervals, the sync state and the priority are all read and discarded by the mapping, and reach no metric. `application_name`, `client_addr`, `state` and `pid` are labels | none | not covered. No Go collector reads `pg_stat_replication` |
-| `pg_replication_slots` | two numbers per slot: whether it is active, and the byte distance from the current position to `restart_lsn`. `slot_name` and `database` are labels | the `replication_slot` collector | partly covered. That collector publishes whether a slot is active and the current and confirmed-flush positions, and neither producer publishes `restart_lsn`, which is the position this distance is measured from. The `database` label has no equivalent |
+| `pg_stat_replication` | two numbers per standby: the server's current WAL position in bytes, and the byte distance from it to that standby's replay position. The positions, the three lag intervals, the sync state and the priority are all read and discarded by the mapping, and reach no metric. `application_name`, `client_addr`, `state` and `pid` are labels | the collector this change adds | partly covered. The collector publishes each standby's write, flush and replay positions, which is more than the single replay distance this map computes, and it does not publish the primary's current position, which the map does. A server with no replication slots has no other producer for that position, so the distance cannot be reconstructed there. That gap is open |
+| `pg_replication_slots` | two numbers per slot: whether it is active, and the byte distance from the current position to `restart_lsn`. `slot_name` and `database` are labels | the `replication_slot` collector | covered. That collector publishes whether a slot is active and the current and confirmed-flush positions, and this change adds `slot_restart_lsn` beside them, so the distance is a subtraction a query can do. The `database` label has no equivalent |
 | `pg_stat_archiver` | three numbers: archived and failed counts, and the seconds since the last successful archive. The file names, the three timestamps and the reset time are read and discarded by the mapping, and reach no metric | none | not covered. No Go collector reads `pg_stat_archiver` |
 | `pg_stat_activity` | connection counts and the longest transaction and state durations, by database, state, user and application | none | not covered. The `long_running_transactions` and `process_idle` collectors read the same view for different things, and neither reports connection counts by state |
 | `querySettings` | every `pg_settings` row of type bool, integer or real, as `pg_settings_<name>` | a collector, to be written | not covered yet. The direction is settled: this output and its enable and disable behaviour are preserved and moved to a collector, with no period where both publish it. It is one series per setting per server, a few hundred of them, and what it reports is the monitored connection's effective settings, including anything a role or session override changes, rather than the server's configured defaults |
@@ -127,7 +197,7 @@ than predicted:
 | --- | --- | --- | --- |
 | `pg_stat_database_conflicts_confl_active_logicalslot` | 16-19 | Recovery conflicts with active logical slots, per database, labelled `datid` and `datname` | none. No Go collector reads `pg_stat_database_conflicts` at all |
 | `pg_stat_database_conflicts_stats_reset` | 19 | When those conflict counters were last reset, as unix seconds | none |
-| `pg_stat_replication_reply_time` | 15-19 | When the standby last replied, as unix seconds | none |
+| `pg_stat_replication_reply_time` | 15-19 | When the standby last replied, as unix seconds | none. The `stat_replication` collector publishes positions and lags and not this |
 
 They arrived by accident, because nobody mapped the column, and they are
 untyped and named after a view's column rather than after a measurement. None
