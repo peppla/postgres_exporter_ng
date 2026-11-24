@@ -111,8 +111,32 @@ var (
 	)
 	collectorDatabaseErrorDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_error"),
-		"1 for each database the collectors tried to reach and could not, labelled with why: connect for a connection that failed. Work that never started is in database_deferred instead. Covers the same set as database_up, which includes the configured connection database whether or not selection kept it. Reasons are a closed set, never an error message.",
+		"1 for each database this scrape did not cover, labelled with why: connect for a connection that failed, scrape for a database-local collector that failed on a connection that worked. A database with the second keeps database_up 1, because the connection is not what went wrong. Work that never started is in database_deferred instead. Reasons are a closed set, never an error message.",
 		[]string{"server", "datname", "reason"},
+		nil,
+	)
+	// What the database-local work came to. attempted and scraped are derived
+	// from the other three rather than counted beside them, so the two
+	// invariants cannot drift: attempted plus deferred is selected, and
+	// scraped plus failed is attempted. An exporter that has lost track of its
+	// own work is what these series exist to show, so they must not be able to
+	// disagree with each other.
+	collectorAttemptedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_attempted"),
+		"Selected databases this scrape started database-local work on. Selected minus deferred.",
+		[]string{"server"},
+		nil,
+	)
+	collectorScrapedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_scraped"),
+		"Databases where every selected database-local collector ran without error. All of them, not the ones a scheduling decision happened to start, so a database whose collection was partly left out is not counted here. Not a claim that each collector read everything there was to read.",
+		[]string{"server"},
+		nil,
+	)
+	collectorFailedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "collector", "databases_failed"),
+		"Databases this scrape started database-local work on and did not finish, because the connection failed or a collector did. Work that never started is counted in databases_deferred instead, which is a different thing: a failure says something is wrong with that database and a deferral says the exporter ran out of room.",
+		[]string{"server"},
 		nil,
 	)
 	collectorDeferredDesc = prometheus.NewDesc(
@@ -371,6 +395,9 @@ func (p PostgresCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collectorDiscoverySuccessDesc
 	ch <- collectorExcludedDatabaseDesc
 	ch <- collectorDatabaseErrorDesc
+	ch <- collectorAttemptedDesc
+	ch <- collectorScrapedDesc
+	ch <- collectorFailedDesc
 	ch <- collectorDeferredDesc
 	ch <- collectorDeferredDatabaseDesc
 	ch <- collectorLastSuccessDesc
@@ -433,6 +460,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	p.reportSelection(ch, inst.name, sel, databaseLocal)
+	selected := localSelected(sel, databaseLocal)
 
 	// The control connection is held for the cluster-wide work and released
 	// before the fan-out, so the per-database connections are bounded by the
@@ -449,13 +477,21 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 
 	// The control database's own database-local collectors run on the
 	// connection that is already open, so it is not opened twice.
+	//
+	// Their successes are counted because completion is all of them, not the
+	// ones that ran: a database whose collection was partly left out is not a
+	// database this scrape covered.
 	control := sel.controlTarget()
-	if control != nil && !control.skipDatabaseLocal {
+	controlLocal := control != nil && !control.skipDatabaseLocal
+	var controlSucceeded atomic.Int32
+	if controlLocal {
 		wg.Add(len(local))
 		for name, c := range local {
 			go func(name string, c Collector) {
 				defer wg.Done()
-				execute(p.ctx, name, c, inst, ch, p.logger, control.datname, p.lastSuccess)
+				if execute(p.ctx, name, c, inst, ch, p.logger, control.datname, p.lastSuccess) {
+					controlSucceeded.Add(1)
+				}
 			}(name, c)
 		}
 	}
@@ -473,11 +509,30 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, upName)
 
+	// A collector that failed on the control database is that database not
+	// covered, exactly as it is for the databases the fan-out opens. The
+	// connection worked, so database_up above stays 1 and the diagnostic
+	// beside it says what did not.
+	controlFailed := 0
+	if controlLocal && int(controlSucceeded.Load()) != len(local) {
+		controlFailed = 1
+		reportIncompleteDatabase(ch, inst.name, upName)
+	}
+
 	if !databaseLocal {
+		// Nothing was selected, so nothing was attempted, covered, failed or
+		// deferred. Reported as four zeros rather than left out: a
+		// cluster-only request already publishes a selected count of zero,
+		// and four series that appear or vanish with the request shape cannot
+		// be alerted on. Before this, the deferral count was published on the
+		// path where such a request had no permit and omitted on the path
+		// where it worked, which is the same configuration reporting two
+		// different shapes.
+		p.reportOutcome(ch, inst.name, 0, 0, 0)
 		return
 	}
 
-	var deferred atomic.Int32
+	var deferred, failed atomic.Int32
 	fanout := sync.WaitGroup{}
 	for _, t := range sel.targets {
 		if t.control || t.skipDatabaseLocal {
@@ -486,20 +541,39 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		fanout.Add(1)
 		go func(t dbTarget) {
 			defer fanout.Done()
-			if p.collectDatabase(ch, t, local, inst.name) {
+			switch p.collectDatabase(ch, t, local, inst.name) {
+			case outcomeDeferred:
 				deferred.Add(1)
+			case outcomeFailed:
+				failed.Add(1)
 			}
 		}(t)
 	}
 	fanout.Wait()
 
-	// After the fan-out, because it is the only point where the number is
-	// known. Published even when it is zero, so that a scrape which deferred
-	// nothing says so rather than leaving a reader to wonder whether the
-	// series is missing or the exporter kept up.
-	ch <- prometheus.MustNewConstMetric(collectorDeferredDesc, prometheus.GaugeValue,
-		float64(deferred.Load()), inst.name)
+	// After the fan-out, because it is the only point where the numbers are
+	// known. Published even when they are zero, so that a scrape which
+	// deferred nothing says so rather than leaving a reader to wonder whether
+	// the series is missing or the exporter kept up.
+	p.reportOutcome(ch, inst.name, selected, int(failed.Load())+controlFailed, int(deferred.Load()))
 }
+
+// databaseOutcome is what one database's database-local work came to. Every
+// selected database is exactly one of these, which is what makes the counts
+// add up to the selected set.
+type databaseOutcome int
+
+const (
+	// outcomeScraped: every selected database-local collector ran without
+	// error on this database.
+	outcomeScraped databaseOutcome = iota
+	// outcomeFailed: work started and did not finish, because the connection
+	// failed or a collector did.
+	outcomeFailed
+	// outcomeDeferred: work never started, so nothing is known to be wrong
+	// with this database.
+	outcomeDeferred
+)
 
 // collectDatabase opens one database and runs the database-local collectors
 // against it.
@@ -507,8 +581,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 // A database that cannot be opened reports database_up 0 and nothing else. The
 // alternative is emitting no series for it at all, which reads the same as a
 // database that was never selected.
-// It returns whether the database was deferred rather than attempted.
-func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) (deferred bool) {
+func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarget, local map[string]Collector, server string) databaseOutcome {
 	target, _ := targetid.ID(t.dsn)
 	fail := func(reason string) {
 		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
@@ -525,7 +598,7 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
 			server, t.datname, dbselect.ReasonNoPermit)
 		p.publishRetained(ch, local, target, t.datname)
-		return true
+		return outcomeDeferred
 	}
 	defer p.release()
 
@@ -536,21 +609,43 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 	if err != nil {
 		level.Error(p.logger).Log("msg", "Error opening connection to database", "datname", t.datname, "err", err)
 		fail(dbselect.ReasonConnect)
-		return false
+		return outcomeFailed
 	}
 	defer dbInst.Close()
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, server, t.datname)
 
+	// Counted, not assumed. Completion is every collector this request
+	// selected for the database, so a collector that fails, and a collector
+	// that a later scheduling decision never starts, both leave the database
+	// uncovered rather than letting the ones that did run speak for it.
+	var succeeded atomic.Int32
 	wg := sync.WaitGroup{}
 	wg.Add(len(local))
 	for name, c := range local {
 		go func(name string, c Collector) {
 			defer wg.Done()
-			execute(p.ctx, name, c, dbInst, ch, p.logger, t.datname, p.lastSuccess)
+			if execute(p.ctx, name, c, dbInst, ch, p.logger, t.datname, p.lastSuccess) {
+				succeeded.Add(1)
+			}
 		}(name, c)
 	}
 	wg.Wait()
-	return false
+	if int(succeeded.Load()) != len(local) {
+		reportIncompleteDatabase(ch, server, t.datname)
+		return outcomeFailed
+	}
+	return outcomeScraped
+}
+
+// reportIncompleteDatabase names a database whose connection worked and whose
+// database-local collection did not finish.
+//
+// Without it the aggregate count would say a database failed and no series
+// would say which one, which is the shortfall averaged across a set that the
+// per-database series exist to prevent.
+func reportIncompleteDatabase(ch chan<- prometheus.Metric, server, datname string) {
+	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1,
+		server, datname, dbselect.ReasonScrape)
 }
 
 // retainedForControl publishes what the control connection's collectors last
@@ -649,20 +744,48 @@ func (p PostgresCollector) release() {
 	}
 }
 
+// localSelected counts the databases this request meant to run database-local
+// collectors against.
+//
+// One function, read by what reports the intention and by what reports the
+// outcome. Two counts of the same thing can disagree, and the pair of them
+// disagreeing is indistinguishable from the exporter losing a database.
+func localSelected(sel dbSelection, databaseLocal bool) int {
+	if !databaseLocal {
+		return 0
+	}
+	selected := 0
+	for _, t := range sel.targets {
+		if !t.skipDatabaseLocal {
+			selected++
+		}
+	}
+	return selected
+}
+
+// reportOutcome publishes what the database-local work came to.
+//
+// Only failed and deferred are passed in. attempted and scraped are arithmetic
+// on them and on the selected count, so the invariants hold by construction
+// rather than by two call sites agreeing.
+func (p PostgresCollector) reportOutcome(ch chan<- prometheus.Metric, server string, selected, failed, deferred int) {
+	attempted := selected - deferred
+	gauge := func(d *prometheus.Desc, v int) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, float64(v), server)
+	}
+	gauge(collectorAttemptedDesc, attempted)
+	gauge(collectorScrapedDesc, attempted-failed)
+	gauge(collectorFailedDesc, failed)
+	gauge(collectorDeferredDesc, deferred)
+}
+
 // reportSelection publishes what this engine meant to cover, before it tries.
 //
 // databaseLocal says whether any database-scoped collector is enabled for this
 // request. None means no database was meant to be covered, whatever the
 // catalog holds, which is what collect[]=postgres.cluster asks for.
 func (p PostgresCollector) reportSelection(ch chan<- prometheus.Metric, server string, sel dbSelection, databaseLocal bool) {
-	selected := 0
-	if databaseLocal {
-		for _, t := range sel.targets {
-			if !t.skipDatabaseLocal {
-				selected++
-			}
-		}
-	}
+	selected := localSelected(sel, databaseLocal)
 	gauge := func(d *prometheus.Desc, v float64) {
 		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, server)
 	}
@@ -714,6 +837,11 @@ func (p PostgresCollector) reportControlFailure(ch chan<- prometheus.Metric, ser
 	}
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, datname)
 	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1, server, datname, reason)
+	// Attempted and failed, not deferred: the connection was tried and did
+	// not work. On a request that selected no database-local collector all
+	// four are zero, because the connection that failed was not one this
+	// engine was going to collect a database over.
+	p.reportOutcome(ch, server, selected, selected, 0)
 }
 
 // reportControlDeferral publishes what is known when there was no connection
@@ -742,7 +870,7 @@ func (p PostgresCollector) reportControlDeferral(ch chan<- prometheus.Metric, se
 	// things: one deferred connection, no deferred databases.
 	ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
 		server, datname, dbselect.ReasonNoPermit)
-	ch <- prometheus.MustNewConstMetric(collectorDeferredDesc, prometheus.GaugeValue, float64(selected), server)
+	p.reportOutcome(ch, server, selected, 0, selected)
 }
 
 // controlSelected reports whether the configured database would get
@@ -766,7 +894,13 @@ func boolToFloat(b bool) float64 {
 
 // execute runs one collector and reports whether it worked. datname is the
 // database it ran against, empty for a cluster-wide collector.
-func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string, lastSuccess *lastsuccess.Store) {
+//
+// The returned value is the same fact as the collector_success series it
+// publishes, from the same variable, so a reader comparing the count of
+// covered databases against the per-collector series cannot find them
+// disagreeing. A collector that reports no data counts as not having worked,
+// which is what that series has always said about it.
+func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string, lastSuccess *lastsuccess.Store) bool {
 	target, _ := targetid.ID(instance.dsn)
 	begin := time.Now()
 	err := c.Update(ctx, instance, ch)
@@ -803,6 +937,7 @@ func execute(ctx context.Context, name string, c Collector, instance *instance, 
 		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
 			float64(when.UnixNano())/1e9, name, datname, target)
 	}
+	return success == 1
 }
 
 // collectorFlagAction generates a new action function for the given collector

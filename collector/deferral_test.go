@@ -91,13 +91,13 @@ func TestADeferredDatabaseIsNotAFailure(t *testing.T) {
 	p := cancelledEngine(t, map[string]Collector{})
 	target := dbTarget{datname: "app", dsn: "postgresql://probe@198.51.100.9:5432/app"}
 
-	var wasDeferred bool
+	var outcome databaseOutcome
 	published := publishedByName(func(ch chan<- prometheus.Metric) {
-		wasDeferred = p.collectDatabase(ch, target, map[string]Collector{}, "198.51.100.9:5432")
+		outcome = p.collectDatabase(ch, target, map[string]Collector{}, "198.51.100.9:5432")
 	})
 
-	if !wasDeferred {
-		t.Error("a database with no connection permit was not reported as deferred to its caller")
+	if outcome != outcomeDeferred {
+		t.Errorf("a database with no connection permit was reported to its caller as %v, want deferred", outcome)
 	}
 	deferred, ok := published["pg_collector_database_deferred"]
 	if !ok {
