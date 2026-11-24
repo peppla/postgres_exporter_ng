@@ -197,7 +197,7 @@ func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.
 		databaseError: vec("database_scrape_error",
 			"1 for each selected database the last scrape started work on and did not cover, labelled with why: connect for a connection that failed, scrape for a query or collector that failed. Work that never started is in database_deferred instead. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
 		databaseDeferred: vec("database_deferred",
-			"1 for each selected database the last scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one, and scrape_deadline for work the scrape ran out of time to start. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
+			"1 for each selected database the last scrape did not start work on, labelled with why: no_connection_permit for work that waited for a connection and did not get one, scrape_deadline for work the scrape ran out of time to start with no such shortage observed, and scrape_cancelled for work the scrape was cancelled before starting. Reasons are a closed set, never an error message.", "server", "datname", "reason"),
 		databaseExcluded: vec("database_excluded",
 			"1 for each database an exclude list named and kept out of the selected set. Databases left out by a non-empty include list are counted in databases_excluded and not named here, because that set can be the whole server.", "server", "datname", "reason"),
 	}

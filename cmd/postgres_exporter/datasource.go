@@ -39,6 +39,7 @@ const (
 	reasonNotAttempted = dbselect.ReasonNotAttempted
 	reasonNoPermit     = dbselect.ReasonNoPermit
 	reasonDeadline     = dbselect.ReasonDeadline
+	reasonCancelled    = dbselect.ReasonCancelled
 )
 
 // deferralReason is the bounded label for work that was not admitted.
@@ -47,10 +48,14 @@ const (
 // deferred, and giving it a reason anyway would publish a database as deferred
 // while it was being scraped.
 func deferralReason(d admission.Decision) string {
-	if d == admission.Deadline {
+	switch d {
+	case admission.Cancelled:
+		return reasonCancelled
+	case admission.Deadline:
 		return reasonDeadline
+	default:
+		return reasonNoPermit
 	}
-	return reasonNoPermit
 }
 
 // databaseRef identifies one database for reporting: which server, and which

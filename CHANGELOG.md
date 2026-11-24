@@ -110,17 +110,19 @@
   longer counts work that never started, and `databases_attempted` and
   `databases_deferred` say how much did and did not. An alert on failures no
   longer fires because the exporter was busy.
-* [BUGFIX] A database the scrape ran out of time to start work on is reported
-  as deferred with `reason="scrape_deadline"` instead of
-  `reason="no_connection_permit"`. The connection limiter answers an expired
-  deadline and a full limit with the same error, and the exporter read that
-  error as the limit being full, so an expired scrape named a connection limit
-  that may have been entirely free. Raising that limit would have changed
-  nothing. The two ways a scrape runs out of room are now reported apart:
-  `no_connection_permit` for work that waited for a connection and did not get
-  one, and `scrape_deadline` for work there was no time left to start. A permit
-  granted at the same moment the deadline passes is given back rather than held
-  through work that cannot run.
+* [BUGFIX] A database the exporter did not start work on says which of three
+  things stopped it, where it used to say `reason="no_connection_permit"` for
+  all of them. The connection limiter reports an expired deadline, a
+  cancellation and a genuine wait for capacity with the same error, and the
+  exporter read that error as the limit being full, so a scrape that ran out of
+  time or was cancelled named a connection limit that may have been entirely
+  free. Whether a permit was available is now observed rather than read back
+  out of that error. The reasons are `no_connection_permit` for work no permit
+  was available to, `scrape_deadline` for work whose time ran out with no such
+  shortage observed, and `scrape_cancelled` for work the scrape was cancelled
+  before starting, which happens with any amount of time left. A permit granted
+  at the same moment the scrape ends is given back rather than held through
+  work that cannot run.
 * [CHANGE] Database selection written in both the configuration file and a
   deprecated flag is refused at startup instead of being resolved at scrape
   time. The exporter exits rather than starting and serving a response with no

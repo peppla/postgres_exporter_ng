@@ -59,14 +59,24 @@ const (
 	ReasonNoPermit = "no_connection_permit"
 
 	// ReasonDeadline is a deferral for work the scrape ran out of time to
-	// start. Nothing waited for a permit and nothing was contacted, so this
-	// is about the exporter's own clock rather than the database.
+	// start, where no shortage of connection permits was observed for it.
+	// Nothing was contacted, so this is about the exporter's own clock rather
+	// than the database.
 	//
-	// Separate from ReasonNoPermit because the two call for different
-	// responses. A full connection limit is answered by raising the limit or
-	// collecting less at once, and a deadline that passed before the work
-	// started is answered by a longer interval or a smaller selection.
+	// Separate from ReasonNoPermit because they are different observations,
+	// not because either one prescribes a change. The deadline comes from the
+	// timeout header, the fallback, the caps and the parent context together,
+	// so neither reason on its own says which control to look at.
 	ReasonDeadline = "scrape_deadline"
+
+	// ReasonCancelled is a deferral for work the scrape was cancelled before
+	// starting, or while it waited for a connection permit.
+	//
+	// Separate from ReasonDeadline because a cancelled scrape has not spent
+	// its time. A request whose client has gone away is cancelled with its
+	// whole budget unused, and reporting that as a deadline would describe a
+	// budget that was never reached.
+	ReasonCancelled = "scrape_cancelled"
 )
 
 // List is a configured list of database names that remembers whether it was

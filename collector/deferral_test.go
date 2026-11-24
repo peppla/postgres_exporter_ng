@@ -71,27 +71,37 @@ func fullLimitEngine(t *testing.T, collectors map[string]Collector) PostgresColl
 	return deferralEngine(ctx, sema, collectors)
 }
 
-// expiredScrapeEngine is an engine whose scrape has already run out of time,
-// with a connection permit free.
+// expiredScrapeEngine is an engine whose deadline has already passed, with a
+// connection permit free.
 //
-// Nothing here is short of permits, so a report naming the connection limit
-// would send an operator to raise a limit that was never reached. An earlier
-// version of this file used exactly this fixture to stand for a full limit,
-// because the code it tested could not tell the two apart and labelled both as
-// a missing permit.
+// A real deadline, not a cancellation. An earlier version of this fixture
+// cancelled the context instead, which is a different thing: a cancelled
+// scrape has not spent its time. Two versions of this file in a row named a
+// cause they were not staging, which is why each case below pins the reason
+// rather than only the outcome.
 func expiredScrapeEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancel)
+	return deferralEngine(ctx, semaphore.NewWeighted(1), collectors)
+}
+
+// cancelledScrapeEngine is an engine whose scrape was cancelled, with a
+// connection permit free and time still on the clock.
+func cancelledScrapeEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 	cancel()
 	t.Cleanup(cancel)
 	return deferralEngine(ctx, semaphore.NewWeighted(1), collectors)
 }
 
-// The two ways a scrape runs out of room, and the label each one publishes.
+// The ways a scrape stops before it starts a database, and the label each one
+// publishes.
 //
-// Every case below runs against both, because a deferral that names the wrong
-// cause is worse than one that names none: it is a specific instruction to fix
-// the wrong thing.
+// Every case below runs against all of them. A deferral that names the wrong
+// cause is worse than one that names none, because it describes a constraint
+// the exporter did not meet.
 var deferralCauses = []struct {
 	name   string
 	engine func(*testing.T, map[string]Collector) PostgresCollector
@@ -100,6 +110,7 @@ var deferralCauses = []struct {
 	{"a full connection limit", fullLimitEngine, dbselect.ReasonNoPermit},
 	{"a deadline that had passed", expiredScrapeEngine, dbselect.ReasonDeadline},
 	{"a deadline that had passed with no limit configured", unlimitedExpiredEngine, dbselect.ReasonDeadline},
+	{"a cancelled scrape", cancelledScrapeEngine, dbselect.ReasonCancelled},
 }
 
 // unlimitedExpiredEngine is an engine with no connection limit at all, whose
@@ -115,8 +126,7 @@ var deferralCauses = []struct {
 // something embedding this package does.
 func unlimitedExpiredEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	t.Cleanup(cancel)
 	return deferralEngine(ctx, nil, collectors)
 }
@@ -295,7 +305,7 @@ func TestAClusterOnlyDeferralSelectsNoDatabase(t *testing.T) {
 // TestDeferralReasonsAreAClosedSet keeps the label from becoming an error
 // string, which is how a bounded label set becomes unbounded.
 func TestDeferralReasonsAreAClosedSet(t *testing.T) {
-	for _, reason := range []string{dbselect.ReasonNoPermit, dbselect.ReasonNotAttempted, dbselect.ReasonDeadline} {
+	for _, reason := range []string{dbselect.ReasonNoPermit, dbselect.ReasonNotAttempted, dbselect.ReasonDeadline, dbselect.ReasonCancelled} {
 		if strings.ContainsAny(reason, " .:\"") {
 			t.Errorf("%q does not look like a closed-set value", reason)
 		}

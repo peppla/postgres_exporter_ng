@@ -35,14 +35,19 @@ func TestAnExpiredDeadlineStopsWorkWithNoLimiter(t *testing.T) {
 	}
 }
 
-func TestACancelledScrapeStopsWorkWithNoLimiter(t *testing.T) {
+// TestACancelledScrapeIsNotADeadline keeps the two apart.
+//
+// A cancelled scrape has not spent its time. A request whose client has gone
+// away is cancelled with its whole budget unused, so reporting it as a deadline
+// describes a budget that was never reached.
+func TestACancelledScrapeIsNotADeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	_, decision := Admit(ctx, nil)
 
-	if decision != Deadline {
-		t.Errorf("work under a cancelled scrape was %v, want %v", decision, Deadline)
+	if decision != Cancelled {
+		t.Errorf("work under a cancelled scrape was %v, want %v", decision, Cancelled)
 	}
 }
 
@@ -80,14 +85,13 @@ func TestAnAdmittedPieceOfWorkHoldsThePermit(t *testing.T) {
 	}
 }
 
-// TestAFullLimitSaysSoRatherThanBlamingTheDeadline separates the two
-// deferrals.
+// TestTimeRunningOutWhileWaitingForAPermitNamesThePermit covers the case where
+// both are true.
 //
-// The semaphore returns the context's error for every failure, so the engine
-// cannot tell from that error whether it waited. This call waited, because the
-// context was live when it started, so the connection limit is what this piece
-// of work ran into.
-func TestAFullLimitSaysSoRatherThanBlamingTheDeadline(t *testing.T) {
+// No permit was available to this work when it asked, and then its time ran
+// out. The observation about permits is what distinguishes this from work that
+// was simply reached too late.
+func TestTimeRunningOutWhileWaitingForAPermitNamesThePermit(t *testing.T) {
 	sema := semaphore.NewWeighted(1)
 	if !sema.TryAcquire(1) {
 		t.Fatal("the fixture could not take the only permit")
@@ -169,6 +173,135 @@ func TestAPermitGrantedAsTheDeadlinePassesIsGivenBack(t *testing.T) {
 	}
 }
 
+// cancelAfterFirstCheck is live for one Err call and cancelled from then on.
+//
+// It stages the instant between the entry check and the limiter's own check of
+// Done. Nothing in a real context exposes that instant reliably, so it is
+// staged here.
+type cancelAfterFirstCheck struct {
+	context.Context
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (c *cancelAfterFirstCheck) Err() error {
+	c.calls++
+	if c.calls == 1 {
+		c.cancel()
+		return nil
+	}
+	return c.Context.Err()
+}
+
+// TestAvailabilityIsObservedRatherThanInferred is ChatGPT's round 162 finding.
+//
+// Acquire fails only when the context ends, and it reads the context before it
+// looks at capacity, so it can fail without looking at capacity at all. An
+// earlier version read that failure as proof that no permit was available, and
+// reported a limiter that was entirely free as a missing connection permit.
+//
+// The fixture cancels the scrape in the instant after the entry check, so
+// Acquire returns without ever reaching its capacity branch, while the one
+// permit stays free throughout.
+func TestAvailabilityIsObservedRatherThanInferred(t *testing.T) {
+	inner, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAfterFirstCheck{Context: inner, cancel: cancel}
+	sema := semaphore.NewWeighted(1)
+
+	_, decision := Admit(ctx, sema)
+
+	// The fixture's own premise first. Without this, a permit that was taken
+	// and never returned would read as a limiter that was legitimately full.
+	if !sema.TryAcquire(1) {
+		t.Fatal("the permit was not free, so this case proves nothing")
+	}
+	sema.Release(1)
+
+	if decision == NoPermit {
+		t.Error("a free limiter was reported as a missing connection permit")
+	}
+	if decision != Cancelled {
+		t.Errorf("work cancelled before the limiter was asked was %v, want %v", decision, Cancelled)
+	}
+}
+
+// deadlineAfterFirstCheck reports no error once, then the expired deadline of
+// the context it wraps, whose Done channel is closed throughout.
+//
+// It stages the same instant as cancelAfterFirstCheck, for a deadline rather
+// than a cancellation. Both are needed: with only the cancellation staging, the
+// observation below can be removed from Admit and every test still passes,
+// because the cancellation branch in the wait path returns the right answer
+// for the wrong reason. The mutation found that.
+type deadlineAfterFirstCheck struct {
+	context.Context
+	calls int
+}
+
+func (c *deadlineAfterFirstCheck) Err() error {
+	c.calls++
+	if c.calls == 1 {
+		return nil
+	}
+	return c.Context.Err()
+}
+
+// TestAFreeLimiterIsNotReportedAsFullWhenTimeRunsOut is the deadline half of
+// round 162's finding.
+//
+// The limiter has a permit free the whole way through. Acquire reads the
+// context before it looks at capacity, so it returns the deadline error
+// without ever reaching the capacity branch. Reading that error as proof of a
+// full limiter reports a limiter that was free.
+func TestAFreeLimiterIsNotReportedAsFullWhenTimeRunsOut(t *testing.T) {
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	ctx := &deadlineAfterFirstCheck{Context: expired}
+	sema := semaphore.NewWeighted(1)
+
+	_, decision := Admit(ctx, sema)
+
+	// The fixture's own premise first.
+	if !sema.TryAcquire(1) {
+		t.Fatal("the permit was not free, so this case proves nothing")
+	}
+	sema.Release(1)
+
+	if decision == NoPermit {
+		t.Error("a free limiter was reported as a missing connection permit")
+	}
+	if decision != Deadline {
+		t.Errorf("work whose time ran out before the limiter was asked was %v, want %v", decision, Deadline)
+	}
+}
+
+// TestCancellationWhileWaitingForAPermitNamesTheCancellation covers the wait.
+//
+// The work was refused a permit and then the scrape was cancelled. It would
+// have had its permit had the scrape continued, so the cancellation is what
+// stopped it.
+func TestCancellationWhileWaitingForAPermitNamesTheCancellation(t *testing.T) {
+	sema := semaphore.NewWeighted(1)
+	if !sema.TryAcquire(1) {
+		t.Fatal("the fixture could not take the only permit")
+	}
+	defer sema.Release(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	_, decision := Admit(ctx, sema)
+
+	if decision != Cancelled {
+		t.Errorf("work cancelled while waiting for a permit was %v, want %v", decision, Cancelled)
+	}
+}
+
 func TestReleasingAPermitNobodyIssuedDoesNothing(t *testing.T) {
 	var permit Permit
 
@@ -188,8 +321,20 @@ func TestTheDecisionsAreDistinct(t *testing.T) {
 	if unset != Admitted {
 		t.Error("the zero Decision is not Admitted")
 	}
-	if NoPermit == Deadline {
-		t.Error("the two deferrals share a value, so the reason label cannot tell them apart")
+	seen := map[Decision]string{}
+	for value, name := range map[Decision]string{
+		Admitted:  "Admitted",
+		NoPermit:  "NoPermit",
+		Deadline:  "Deadline",
+		Cancelled: "Cancelled",
+	} {
+		if other, clash := seen[value]; clash {
+			t.Errorf("%s and %s share a value, so the reason label cannot tell them apart", name, other)
+		}
+		seen[value] = name
+	}
+	if len(seen) != 4 {
+		t.Errorf("%d distinct decisions, want 4", len(seen))
 	}
 }
 
@@ -206,8 +351,8 @@ func TestACancelledScrapeIsNotBlamedOnTheLimit(t *testing.T) {
 
 	_, decision := Admit(ctx, sema)
 
-	if decision != Deadline {
-		t.Errorf("work under a cancelled scrape with a free permit was %v, want %v", decision, Deadline)
+	if decision != Cancelled {
+		t.Errorf("work under a cancelled scrape with a free permit was %v, want %v", decision, Cancelled)
 	}
 	if !sema.TryAcquire(1) {
 		t.Error("the free permit was taken by work that was never admitted")

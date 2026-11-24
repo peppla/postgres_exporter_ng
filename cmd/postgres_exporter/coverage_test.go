@@ -476,10 +476,10 @@ func TestUnreachableDatabasesAreNamed(t *testing.T) {
 // The ways a scrape runs out of room before it starts a database, and the
 // label each one has to publish.
 //
-// The first two cases are what the shipped binary does, where a limiter is
-// always configured: before this change both of them reported
-// no_connection_permit, so an expired scrape named a limit that may have been
-// entirely free.
+// The cases with a limiter are what the shipped binary does, where one is
+// always configured. Before this change every one of them reported
+// no_connection_permit, so an expired or cancelled scrape named a limit that
+// may have been entirely free.
 //
 // The third case had no coverage at all. With no limiter the engine did not
 // read the context, so every database was attempted after the deadline had
@@ -502,9 +502,15 @@ func admissionCases(t *testing.T) []struct {
 	waiting, cancelWaiting := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	t.Cleanup(cancelWaiting)
 
-	expired, cancelExpired := context.WithCancel(context.Background())
-	cancelExpired()
+	// A real deadline, not a cancellation. An earlier version of this cancelled
+	// the context and called it an expired deadline, which is a different
+	// thing: a cancelled scrape has not spent its time.
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	t.Cleanup(cancelExpired)
+
+	cancelled, cancelNow := context.WithTimeout(context.Background(), time.Hour)
+	cancelNow()
+	t.Cleanup(cancelNow)
 
 	return []struct {
 		name   string
@@ -515,6 +521,7 @@ func admissionCases(t *testing.T) []struct {
 		{"a full connection limit", waiting, full, reasonNoPermit},
 		{"a deadline that had passed", expired, semaphore.NewWeighted(1), reasonDeadline},
 		{"a deadline that had passed with no limit configured", expired, nil, reasonDeadline},
+		{"a cancelled scrape", cancelled, semaphore.NewWeighted(1), reasonCancelled},
 	}
 }
 
