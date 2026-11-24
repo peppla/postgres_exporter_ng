@@ -900,6 +900,47 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	}
 }
 
+// rotateTargets puts each server's targets in the order its schedule says,
+// keeping the servers in the order they first appear.
+//
+// Grouped by server because the schedule is about one server's selected set.
+// The key's target is the server fingerprint, which is this engine's own
+// identity for a connection and is what its labels carry, and the profile is
+// the registry this exporter was built for, which is what distinguishes one
+// scrape job's selection from another's. The engine field keeps this apart
+// from the collector engine's schedule for the same server.
+//
+// A rotation and not a selection: every target is still returned, so a database
+// that gets no attempt is still reported as deferred by name.
+func (e *Exporter) rotateTargets(targets []scrapeTarget) []scrapeTarget {
+	if len(targets) < 2 {
+		return targets
+	}
+
+	servers := make([]string, 0, 1)
+	byServer := map[string][]scrapeTarget{}
+	for _, t := range targets {
+		if _, seen := byServer[t.server]; !seen {
+			servers = append(servers, t.server)
+		}
+		byServer[t.server] = append(byServer[t.server], t)
+	}
+
+	out := make([]scrapeTarget, 0, len(targets))
+	for _, server := range servers {
+		group := byServer[server]
+		members := make([]string, 0, len(group))
+		for _, t := range group {
+			members = append(members, t.datname)
+		}
+		key := rotation.Key{Engine: "query", Target: server, Profile: e.collectorName}
+		for _, i := range rotation.Order(e.rotation.Next(key, members), len(group)) {
+			out = append(out, group[i])
+		}
+	}
+	return out
+}
+
 // scrapeTargets runs the per-database fan-out and returns how many targets
 // failed, how many of those failed to connect, and how many were deferred
 // without being started.
@@ -912,6 +953,11 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 	var errorsCount atomic.Int32
 	var connectionErrorsCount atomic.Int32
 	var deferredCount atomic.Int32
+
+	// Rotated, so the database offered the first attempt is not the same one
+	// every scrape. Per server, because one call can carry targets discovered
+	// from several seed DSNs and a schedule is about one server's selected set.
+	targets = e.rotateTargets(targets)
 
 	// A fixed number of workers, each taking the next database as it finishes
 	// the last. Reaching that number is not a reason to leave a database out:

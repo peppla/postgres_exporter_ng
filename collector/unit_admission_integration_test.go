@@ -39,6 +39,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -482,4 +483,108 @@ func publishedByFamilyAndReason(emit func(ch chan<- prometheus.Metric)) map[stri
 		out[familyName(m)+"/"+r.labels["datname"]+"/"+r.labels["reason"]] = r
 	}
 	return out
+}
+
+// orderRecordingCollector records which database each run was against, in the
+// order the runs happened.
+type orderRecordingCollector struct {
+	mu    *sync.Mutex
+	order *[]string
+}
+
+func (c orderRecordingCollector) Update(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+	var name string
+	if err := inst.getDB().QueryRowContext(ctx, "SELECT current_database()").Scan(&name); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	*c.order = append(*c.order, name)
+	c.mu.Unlock()
+	return nil
+}
+
+// TestCollectOffersADifferentDatabaseFirstEachScrape goes through Collect, so
+// it fails if the engine takes its selected set in the order discovery returned
+// rather than the order the schedule says.
+//
+// One worker, so the fan-out is serial and the first database to run is the
+// first one offered an attempt. The budget is generous, because what is being
+// measured is the order of offers and not what fits.
+//
+// The configured connection database is in the selection, which is the point:
+// its local collectors used to run before any other database was offered one,
+// so it came first on every scrape whatever the rest were doing.
+func TestCollectOffersADifferentDatabaseFirstEachScrape(t *testing.T) {
+	dsn := liveDSN(t)
+	collectorScopes["stat_fixture_order"] = scopeDatabase
+	t.Cleanup(func() { delete(collectorScopes, "stat_fixture_order") })
+
+	// Three databases including the configured one. review_order_b and
+	// review_order_c are created here and dropped afterwards.
+	admin, err := newInstance(dsn)
+	if err != nil {
+		t.Fatalf("building the admin instance: %s", err)
+	}
+	if err := admin.setup(context.Background()); err != nil {
+		t.Fatalf("connecting: %s", err)
+	}
+	t.Cleanup(func() { admin.Close() })
+	for _, name := range []string{"review_order_b", "review_order_c"} {
+		if _, err := admin.getDB().Exec("CREATE DATABASE " + name); err != nil {
+			t.Skipf("cannot create %s, so this server cannot stage the case: %s", name, err)
+		}
+		t.Cleanup(func() {
+			_, _ = admin.getDB().Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+		})
+	}
+
+	store := rotation.New()
+	selected := []string{controlName, "review_order_b", "review_order_c"}
+
+	firstOf := make([]string, 0, len(selected))
+	for scrape := 0; scrape < len(selected); scrape++ {
+		var mu sync.Mutex
+		order := []string{}
+		local := map[string]Collector{"stat_fixture_order": orderRecordingCollector{mu: &mu, order: &order}}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		p := PostgresCollector{
+			Collectors:       local,
+			logger:           log.NewNopLogger(),
+			ctx:              ctx,
+			connSema:         semaphore.NewWeighted(1),
+			dbWorkers:        1,
+			includeDatabases: dbselect.Of(selected),
+			lastSuccess:      lastsuccess.New(),
+			rotation:         store,
+			instance:         &instance{dsn: dsn, name: "live"},
+		}
+
+		ch := make(chan prometheus.Metric, 1<<16)
+		p.Collect(ch)
+		close(ch)
+		for range ch {
+		}
+		cancel()
+
+		mu.Lock()
+		got := append([]string(nil), order...)
+		mu.Unlock()
+
+		// The premise. Without every selected database running, the first one
+		// is not evidence about an order.
+		if len(got) != len(selected) {
+			t.Fatalf("scrape %d ran on %v, want all %d selected databases", scrape, got, len(selected))
+		}
+		firstOf = append(firstOf, got[0])
+	}
+
+	seen := map[string]bool{}
+	for _, name := range firstOf {
+		if seen[name] {
+			t.Errorf("the databases offered the first attempt were %v, want a different one each scrape", firstOf)
+			break
+		}
+		seen[name] = true
+	}
 }

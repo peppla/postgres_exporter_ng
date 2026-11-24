@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -994,5 +995,141 @@ func TestWorkThatNeverReachedTheLimiterNamesTheDeadline(t *testing.T) {
 		if g[key(name, reasonNoPermit)] != 0 {
 			t.Errorf("%s never asked for a permit and is named for one", name)
 		}
+	}
+}
+
+// TestTheQueryEngineRotatesPerServer covers the schedule this engine keeps.
+//
+// One call can carry targets discovered from several seed DSNs, so a single
+// order over the whole list would let one server's membership move another
+// server's turn. Each server's group is rotated by its own schedule and the
+// servers keep the order they first appear in.
+func TestTheQueryEngineRotatesPerServer(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := append(targetsForDSN("127.0.0.1:1", "a", "b", "c"),
+		targetsForDSN("127.0.0.1:2", "x", "y")...)
+
+	firstOf := map[string][]string{}
+	for scrape := 0; scrape < 3; scrape++ {
+		got := e.rotateTargets(targets)
+		if len(got) != len(targets) {
+			t.Fatalf("scrape %d returned %d of %d targets: a rotation must not drop one", scrape, len(got), len(targets))
+		}
+
+		// The servers keep the order they first appear in, and each group holds
+		// the same databases it did.
+		seen := map[string][]string{}
+		for _, target := range got {
+			seen[target.server] = append(seen[target.server], target.datname)
+		}
+		if len(seen["127.0.0.1:1"]) != 3 || len(seen["127.0.0.1:2"]) != 2 {
+			t.Fatalf("scrape %d regrouped the targets: %v", scrape, seen)
+		}
+		firstOf["127.0.0.1:1"] = append(firstOf["127.0.0.1:1"], seen["127.0.0.1:1"][0])
+		firstOf["127.0.0.1:2"] = append(firstOf["127.0.0.1:2"], seen["127.0.0.1:2"][0])
+	}
+
+	// Three scrapes over three databases: each came first once.
+	if got := firstOf["127.0.0.1:1"]; got[0] == got[1] || got[1] == got[2] || got[0] == got[2] {
+		t.Errorf("the three-database server offered %v first, want three different databases", got)
+	}
+	// Two databases over three scrapes alternate, so the schedule moved rather
+	// than one server's turn being spent by the other's.
+	if got := firstOf["127.0.0.1:2"]; got[0] == got[1] {
+		t.Errorf("the two-database server offered %v first, want its own turn to move", got)
+	}
+}
+
+// TestTheTwoEnginesDoNotShareASchedule keeps one engine's turn out of the
+// other's for the same server.
+func TestTheTwoEnginesDoNotShareASchedule(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+	targets := targetsForDSN("127.0.0.1:1", "a", "b")
+
+	// The collector engine takes several turns against the same server.
+	for i := 0; i < 3; i++ {
+		store.Next(rotation.Key{Engine: "collector", Target: "127.0.0.1:1", Profile: "all"},
+			[]string{"a", "b"})
+	}
+
+	got := e.rotateTargets(targets)
+	if got[0].datname != "a" {
+		t.Errorf("the query engine's first scrape starts at %s, want a: the other engine moved its schedule", got[0].datname)
+	}
+}
+
+// TestTheDatabaseOfferedTheFirstAttemptChangesBetweenScrapes goes through
+// scrapeTargets rather than the rotation helper, so it fails if the fan-out
+// takes the targets in the order it was handed rather than the scheduled one.
+//
+// One worker and a held permit, so exactly one database asks the limiter and
+// waits, reporting no_connection_permit, while the rest are reached after the
+// time has gone and report scrape_deadline. The database that asked is the one
+// the schedule put first, and over three scrapes it has to be a different one
+// each time.
+func TestTheDatabaseOfferedTheFirstAttemptChangesBetweenScrapes(t *testing.T) {
+	names := []string{"first", "second", "third"}
+	store := rotation.New()
+
+	asked := make([]string, 0, len(names))
+	for scrape := 0; scrape < len(names); scrape++ {
+		held := semaphore.NewWeighted(1)
+		if !held.TryAcquire(1) {
+			t.Fatal("the fixture could not take the only permit")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		targets := targetsForDSN("127.0.0.1:1", names...)
+		e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/first?sslmode=disable"},
+			WithContext(ctx),
+			WithConnectionsSemaphore(held, 1),
+			WithRotation(store),
+			CollectorName("exporter"),
+		)
+		e.coverage.setSelection(true, true, len(names), targets, nil, 0)
+
+		ch, stop := drain()
+		_, _, deferred := e.scrapeTargets(ch, targets)
+		stop()
+		cancel()
+		held.Release(1)
+
+		if deferred != len(names) {
+			t.Fatalf("scrape %d deferred %d of %d databases", scrape, deferred, len(names))
+		}
+
+		g := series(t, e.coverage)
+		for _, name := range names {
+			if g["pg_exporter_database_deferred{datname="+name+",reason="+reasonNoPermit+",server=127.0.0.1:1}"] == 1 {
+				asked = append(asked, name)
+			}
+		}
+	}
+
+	// The premise. Without exactly one database asking per scrape, the order
+	// cannot be read off the reasons at all.
+	if len(asked) != len(names) {
+		t.Fatalf("%d databases asked the limiter across %d scrapes, want one each: %v", len(asked), len(names), asked)
+	}
+	seen := map[string]bool{}
+	for _, name := range asked {
+		if seen[name] {
+			t.Errorf("the databases offered the first attempt were %v, want a different one each scrape", asked)
+			break
+		}
+		seen[name] = true
 	}
 }
