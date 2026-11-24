@@ -733,13 +733,10 @@ func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, 
 // under: the connection, the database, and the selection that completed.
 //
 // The selection is part of the key because a request that asks for some
-// collectors has not shown the rest would have worked. Keyed only by database,
-// one shared record would let a narrow request answer for a wide one: an
-// earlier wide success would be republished under a narrow request that never
-// checked most of it, so the series would look answered while going stale. An
-// installation that runs two collect[] profiles at different intervals never
-// requests the whole enabled set at all, so a rule written against that set
-// leaves it with no time ever.
+// collectors has not shown the rest would have worked. One record per database
+// would let a narrow request answer for a wider one, and a rule written
+// against the whole enabled set leaves an installation that never selects it
+// with no time at all.
 func databaseKey(target, datname, selection string) lastsuccess.Key {
 	return lastsuccess.Key{
 		Engine:    lastsuccess.EngineCollector,

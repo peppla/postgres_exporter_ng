@@ -15,25 +15,12 @@
 // New in postgres_exporter_ng, 2026. No copyright line: this is newly written
 // code and its holder is not settled, so none is asserted.
 
-// When a database was last covered completely.
+// Database freshness is tracked separately for each selected collector set.
+// A failed selection retains only its own last successful timestamp.
 //
-// The per-collector times answer a narrower question than the contract asks.
-// "This collector last worked here at T" does not say the database was covered,
-// because a database is covered when all of its collectors worked, and an
-// operator deciding whether to trust a dashboard is asking about the database.
-//
-// The trap is a narrow request. A scrape that asked for one collector and got
-// it has shown nothing about the others, so it must not write a time that says
-// the whole set was covered. The first version of this answered that by
-// recording only when a request selected every enabled collector, which breaks
-// an installation that runs two collect[] profiles at different intervals: it
-// never selects the whole set, so it never gets a time at all, and worse, a
-// narrow request republished a wider one's older time, so the series looked
-// answered while going stale.
-//
-// What is recorded is therefore the selection, and a request reads and writes
-// its own. These tests hold that from both sides: a selection gets its own
-// time, and it cannot borrow or move another's.
+// The per-collector times answer a narrower question. One collector working
+// here does not say the database was covered, which is what an operator
+// deciding whether to trust a dashboard is asking.
 
 package collector
 
@@ -221,8 +208,8 @@ func TestAWiderFailureDoesNotInheritANarrowSuccess(t *testing.T) {
 	}
 }
 
-// TestTwoSelectionsAreRememberedSeparately is the installation ChatGPT named:
-// two collect[] profiles at different intervals, neither of them the whole set.
+// TestTwoSelectionsAreRememberedSeparately covers two collect[] profiles at
+// different intervals, neither of them the whole enabled set.
 func TestTwoSelectionsAreRememberedSeparately(t *testing.T) {
 	stubServer(t, catalogueOf("app"))
 	withScopedCollector(t, "freshness_local_a", scopeDatabase)
@@ -247,8 +234,8 @@ func TestTwoSelectionsAreRememberedSeparately(t *testing.T) {
 			t.Errorf("the %s profile has no record of its own", selection)
 		}
 	}
-	// Neither profile is the whole enabled set, which under the first version
-	// of this meant neither ever got a time.
+	// Neither profile is the whole enabled set, and nothing records a set no
+	// request asked for.
 	if _, ok := store.At(databaseKey(target, "app", "freshness_local_a,freshness_local_b,freshness_local_c")); ok {
 		t.Error("a record exists for the whole enabled set, which no request asked for")
 	}
@@ -282,8 +269,8 @@ func TestTheSelectionIsTheSameWhateverOrderItArrivesIn(t *testing.T) {
 //
 // A request for exactly one collector has a selection equal to that
 // collector's name. Held under one field, the database-level record and that
-// collector's own record would be the same key, and a collect[] naming one
-// collector is the common case.
+// collector's own record are the same key, and a collect[] naming one
+// collector is common.
 func TestASelectionDoesNotCollideWithOneCollectorsRecord(t *testing.T) {
 	store := lastsuccess.New()
 	const target, datname, name = "1", "app", "stat_user_tables"
@@ -347,20 +334,16 @@ func TestAFailedCollectorLeavesTheDatabaseTimeAlone(t *testing.T) {
 // path.
 //
 // The control database is collected over the connection the engine already
-// holds, and the databases around it are opened by the fan-out. The two are
-// separate code and the first test only reached the control one, which a
-// mutation showed by surviving it.
+// holds, and the databases around it are opened by the fan-out. They are
+// separate code, so each needs a case.
 func TestAFanOutDatabaseThatFailedKeepsItsTime(t *testing.T) {
 	stubServer(t, catalogueOf("app", "other"))
 	withScopedCollector(t, "freshness_local", scopeDatabase)
 	store := lastsuccess.New()
 
-	// Asked for rather than written out. The fan-out builds this DSN from the
-	// control one by replacing the database, and the identity is per
-	// connection string, so a string that differs by a character is a
-	// different target. Writing it out by hand produced exactly that: the
-	// rewrite adds an empty password, and the test looked for a record the
-	// engine had never written.
+	// Asked for rather than written out. The identity is per connection
+	// string, and the rewrite adds an empty password, so a hand-written DSN
+	// names a different target than the fan-out uses.
 	fanout, err := config.DSNWithDatabase("postgresql://probe@198.51.100.9:5432/app", "other")
 	if err != nil {
 		t.Fatalf("building the fan-out DSN: %s", err)
@@ -486,20 +469,16 @@ func TestAControlFailureRetainsOnlyTheMatchingContext(t *testing.T) {
 	}
 }
 
-// TestAnUnnamedControlDatabaseResolvesByItsOwnSelection reaches the branch the
-// other control test does not.
+// TestAnUnnamedControlDatabaseResolvesByItsOwnSelection covers a connection
+// string that carries no database.
 //
-// A connection string need not carry a database. When one does not and the
-// connection fails, the engine has no name to report against, so it asks what
-// this connection last covered. That question has to be asked of this
-// selection, and of the database level rather than of a collector that happens
-// to share the name.
+// The engine then has no name to report against, so it asks what this
+// connection last covered. That question has to be put to this selection, and
+// to the database level rather than to a collector that shares the name.
 //
-// Both traps are live here: the selection is "freshness_local_a", which is
-// also a collector's name, and a second selection holds a record on another
-// database. Two mutations survived until this existed, one dropping the
-// selection from the lookup and one dropping the level from the key
-// comparison.
+// The fixture makes either mistake visible: the selection is also a
+// collector's name, and a second selection holds a record on another
+// database.
 func TestAnUnnamedControlDatabaseResolvesByItsOwnSelection(t *testing.T) {
 	stubServer(t, func(_ int, mock sqlmock.Sqlmock) {
 		mock.ExpectPing().WillReturnError(errors.New("the server is not listening"))

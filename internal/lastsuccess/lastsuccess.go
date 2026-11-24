@@ -45,10 +45,9 @@ import (
 //
 // About says what the record is about, because a database-level record and a
 // collector-level one can otherwise write the same key. A request selecting
-// exactly one collector has a selection equal to that collector's name, and a
-// collect[] naming one collector is the common case, so the two would overwrite
-// each other. Its zero value is the collector-level meaning, so a key written
-// without thinking about this means what it has always meant.
+// exactly one collector has a selection equal to that collector's name, so the
+// two would overwrite each other. Its zero value is the collector level, so
+// keys written before this field existed keep their meaning.
 type Key struct {
 	// Engine separates the two metric engines, which collect the same
 	// databases over the same connections and succeed and fail independently.
@@ -76,15 +75,14 @@ const (
 // Selection is the canonical form of a set of collector names, for Key.Collector
 // at the WholeSelection level.
 //
-// Sorted, so a request that asks for the same collectors in another order is
-// the same context and reads the record the first one wrote. Built from the
-// names rather than from a count, so an enabled set that gains or loses a
-// collector cannot reuse a record written for a different set.
+// Sorted, so the same collectors in another order are the same context and
+// read the record the first request wrote. Built from the names rather than
+// from a count, so an enabled set that gains or loses a collector cannot reuse
+// a record written for a different set.
 //
-// One record per distinct selection, so a deployment scraping several collect[]
-// profiles holds one per profile per database. That is small in practice and
-// unbounded in principle, and bounding it belongs with the rest of the bounded
-// state work rather than in a silent cap here.
+// One record per distinct selection per database, which is bounded by how many
+// collect[] profiles are scraped. Bounding it is part of the bounded-state
+// work rather than a cap here.
 func Selection(names []string) string {
 	sorted := make([]string, len(names))
 	copy(sorted, names)
