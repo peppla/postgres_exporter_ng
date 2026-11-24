@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+* [CHANGE] A collector the scrape never started on a database it did reach is
+  reported as a deferral rather than as a collector that failed. It publishes
+  `pg_scrape_collector_deferred` with `reason="scrape_deadline"` or
+  `reason="scrape_cancelled"` and no `pg_scrape_collector_success` beside it,
+  where it used to run its query against an ended context and publish
+  `pg_scrape_collector_success 0`. A query cancelled while it was already in
+  flight still reports a failure, because it ran. The database keeps
+  `database_up` 1 and is still counted once in `databases_failed`, since work
+  did start on it, and `pg_collector_database_error` now carries the budget
+  reason for the part that never ran. A database where one collector failed and
+  another never started carries both reasons, so the real failure is not
+  replaced by the budget one. The check reads the scrape's context on the
+  connection the database already holds and asks for no second connection
+  permit, so `no_connection_permit` cannot appear on a collector.
 * [ENHANCEMENT] The per-database fan-out runs a fixed number of workers instead
   of one goroutine per selected database. Both engines used to start a goroutine
   for every database and let it queue on the connection limiter, so the limit

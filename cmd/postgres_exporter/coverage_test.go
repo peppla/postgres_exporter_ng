@@ -949,9 +949,9 @@ func TestManyDatabasesBehindAHeldPermitStayBounded(t *testing.T) {
 // permit and waits until the scrape's time runs out, so it reports
 // no_connection_permit. The databases behind it are reached after that time has
 // gone, so they never ask, and what they met is the deadline. Before the pool
-// every database asked at once and every one of them said
-// no_connection_permit, including on a scrape where the limiter was never the
-// constraint.
+// every database asked at once, so every one of them observed the shortage for
+// itself and said no_connection_permit. What changed is when a database reaches
+// the limiter, not whether the older observation was real.
 //
 // The order is deterministic because there is one worker, which is what lets
 // this distinguish the two reasons at all.

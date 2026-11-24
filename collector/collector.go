@@ -78,8 +78,14 @@ var (
 	)
 	scrapeSuccessDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "scrape", "collector_success"),
-		"postgres_exporter: Whether a collector succeeded. datname is the database a database-local collector ran against, and is empty for a cluster-wide collector.",
+		"postgres_exporter: Whether a collector succeeded. datname is the database a database-local collector ran against, and is empty for a cluster-wide collector. Absent for a collector this scrape never started, which is in scrape_collector_deferred instead.",
 		[]string{"collector", "datname"},
+		nil,
+	)
+	scrapeDeferredDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "scrape", "collector_deferred"),
+		"1 for each collector this scrape did not start on this database, labelled with why: scrape_deadline for a turn that came after the scrape ran out of time, scrape_cancelled for a scrape that was cancelled. No SQL ran, so this is not a collector that failed and carries no scrape_collector_success beside it. The connection was already open and already held its permit, so no_connection_permit is not among the reasons here. datname is empty for a cluster-wide collector.",
+		[]string{"collector", "datname", "reason"},
 		nil,
 	)
 
@@ -119,7 +125,7 @@ var (
 	)
 	collectorDatabaseErrorDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "database_error"),
-		"1 for each database this scrape did not cover, labelled with why: connect for a connection that failed, scrape for a database-local collector that failed on a connection that worked. A database with the second keeps database_up 1, because the connection is not what went wrong. Work that never started is in database_deferred instead. Reasons are a closed set, never an error message.",
+		"1 for each database this scrape did not cover, labelled with why: connect for a connection that failed, scrape for a database-local collector that failed on a connection that worked, and scrape_deadline or scrape_cancelled for a collection that started and then had collectors it never got to. The last three keep database_up 1, because the connection is not what went wrong, and the budget reasons assert nothing about the database itself: they say the exporter ran out of room part way through. A database where both happened carries one series for each, so a real collector failure is not replaced by the budget reason, and it is still one database in databases_failed. A database where nothing at all started is in database_deferred instead. Reasons are a closed set, never an error message.",
 		[]string{"server", "datname", "reason"},
 		nil,
 	)
@@ -143,7 +149,7 @@ var (
 	)
 	collectorFailedDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "collector", "databases_failed"),
-		"Databases this scrape started database-local work on and did not finish, because the connection failed or a collector did. Work that never started is counted in databases_deferred instead, which is a different thing: a failure says something is wrong with that database and a deferral says the exporter ran out of room.",
+		"Databases this scrape started database-local work on and did not finish, because the connection failed, a collector failed, or the scrape ran out of room before every selected collector had its turn. Why it did not finish is in database_error. A database where nothing at all started is counted in databases_deferred instead, which is a different thing: an attempt that did not finish says work was done here, and a deferral says none was.",
 		[]string{"server"},
 		nil,
 	)
@@ -518,17 +524,13 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// its own.
 	selection := selectionOf(local)
 	controlBegin := time.Now()
-	var controlSucceeded atomic.Int32
+	var controlOutcome localOutcome
 	if controlLocal {
-		wg.Add(len(local))
-		for name, c := range local {
-			go func(name string, c Collector) {
-				defer wg.Done()
-				if execute(p.ctx, name, c, inst, ch, p.logger, control.datname, p.lastSuccess) {
-					controlSucceeded.Add(1)
-				}
-			}(name, c)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			controlOutcome = runLocalCollectors(p.ctx, local, inst, ch, p.logger, control.datname, p.lastSuccess)
+		}()
 	}
 	wg.Wait()
 	inst.Close()
@@ -549,9 +551,9 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	// connection worked, so database_up above stays 1 and the diagnostic
 	// beside it says what did not.
 	controlFailed := 0
-	if controlLocal && int(controlSucceeded.Load()) != len(local) {
+	if controlLocal && controlOutcome.ran != len(local) {
 		controlFailed = 1
-		reportIncompleteDatabase(ch, inst.name, upName)
+		reportIncompleteDatabase(ch, inst.name, upName, controlOutcome)
 	}
 	if controlLocal {
 		controlTarget, _ := targetid.ID(inst.dsn)
@@ -616,6 +618,77 @@ func (p PostgresCollector) collectDatabases(ch chan<- prometheus.Metric, pending
 		}
 	})
 	return int(failedCount.Load()), int(deferredCount.Load())
+}
+
+// unitOutcome is what one collector's turn came to on one database.
+//
+// Three outcomes rather than two, because a collector that never started and a
+// collector that ran and failed call for different responses, and reporting
+// them as the same thing wakes an operator alerting on failures whenever the
+// exporter is busy.
+type unitOutcome int
+
+const (
+	// unitRan: the collector ran and reported no error.
+	unitRan unitOutcome = iota
+	// unitFailed: the collector ran and did not finish, which includes a query
+	// cancelled while it was in flight.
+	unitFailed
+	// unitDeferred: the collector never started, because the scrape had ended
+	// before its turn came.
+	unitDeferred
+)
+
+// localOutcome is what a database's database-local collectors came to together.
+type localOutcome struct {
+	ran      int
+	failed   int
+	deferred int
+	// reason names why the deferred collectors did not start, and is empty
+	// when none were deferred. One context ends one way and stays ended that
+	// way, so every collector deferred on one database shares this.
+	reason string
+}
+
+// runLocalCollectors runs every selected database-local collector against one
+// open connection.
+//
+// The number of collectors is the number registered and selected, which
+// configuration fixes, so this is not where a database count turns into a
+// goroutine count. That is the fan-out across databases, which is bounded by
+// the connection limit.
+func runLocalCollectors(ctx context.Context, local map[string]Collector, inst *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string, lastSuccess *lastsuccess.Store) localOutcome {
+	var ran, failed, deferred atomic.Int32
+	var mu sync.Mutex
+	reason := ""
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(local))
+	for name, c := range local {
+		go func(name string, c Collector) {
+			defer wg.Done()
+			outcome, why := execute(ctx, name, c, inst, ch, logger, datname, lastSuccess)
+			switch outcome {
+			case unitRan:
+				ran.Add(1)
+			case unitFailed:
+				failed.Add(1)
+			default:
+				deferred.Add(1)
+				mu.Lock()
+				reason = why
+				mu.Unlock()
+			}
+		}(name, c)
+	}
+	wg.Wait()
+
+	return localOutcome{
+		ran:      int(ran.Load()),
+		failed:   int(failed.Load()),
+		deferred: int(deferred.Load()),
+		reason:   reason,
+	}
 }
 
 // databaseOutcome is what one database's database-local work came to. Every
@@ -687,25 +760,15 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 
 	// Counted, not assumed. Completion is every collector this request
 	// selected for the database, so a collector that fails, and a collector
-	// that a later scheduling decision never starts, both leave the database
-	// uncovered rather than letting the ones that did run speak for it.
-	var succeeded atomic.Int32
+	// that never starts, both leave the database uncovered rather than letting
+	// the ones that did run speak for it.
+	//
 	// Stamped from before the work rather than after it, so the database-level
 	// time is never later than the collector times it summarises.
 	begin := time.Now()
-	wg := sync.WaitGroup{}
-	wg.Add(len(local))
-	for name, c := range local {
-		go func(name string, c Collector) {
-			defer wg.Done()
-			if execute(p.ctx, name, c, dbInst, ch, p.logger, t.datname, p.lastSuccess) {
-				succeeded.Add(1)
-			}
-		}(name, c)
-	}
-	wg.Wait()
-	if int(succeeded.Load()) != len(local) {
-		reportIncompleteDatabase(ch, server, t.datname)
+	outcome := runLocalCollectors(p.ctx, local, dbInst, ch, p.logger, t.datname, p.lastSuccess)
+	if outcome.ran != len(local) {
+		reportIncompleteDatabase(ch, server, t.datname, outcome)
 		p.publishDatabaseFreshness(ch, target, t.datname, selection)
 		return outcomeFailed
 	}
@@ -715,14 +778,26 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 }
 
 // reportIncompleteDatabase names a database whose connection worked and whose
-// database-local collection did not finish.
+// database-local collection did not finish, and says what stopped it.
 //
 // Without it the aggregate count would say a database failed and no series
 // would say which one, which is the shortfall averaged across a set that the
 // per-database series exist to prevent.
-func reportIncompleteDatabase(ch chan<- prometheus.Metric, server, datname string) {
-	ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1,
-		server, datname, dbselect.ReasonScrape)
+//
+// Both causes when both happened. A real collector failure replaced by the
+// budget reason loses the thing that is actually wrong with this database, and
+// a budget cause reported as a collector failure says something is wrong when
+// nothing was tried. So this can publish two series for one database, and the
+// database is still one incomplete attempt in the counts.
+func reportIncompleteDatabase(ch chan<- prometheus.Metric, server, datname string, o localOutcome) {
+	if o.failed > 0 {
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1,
+			server, datname, dbselect.ReasonScrape)
+	}
+	if o.deferred > 0 {
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseErrorDesc, prometheus.GaugeValue, 1,
+			server, datname, o.reason)
+	}
 }
 
 // retainedForControl publishes what the control connection's collectors last
@@ -1046,8 +1121,44 @@ func boolToFloat(b bool) float64 {
 // covered databases against the per-collector series cannot find them
 // disagreeing. A collector that reports no data counts as not having worked,
 // which is what that series has always said about it.
-func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string, lastSuccess *lastsuccess.Store) bool {
+func execute(ctx context.Context, name string, c Collector, instance *instance, ch chan<- prometheus.Metric, logger log.Logger, datname string, lastSuccess *lastsuccess.Store) (unitOutcome, string) {
 	target, _ := targetid.ID(instance.dsn)
+
+	// When this collector last worked here, which the success below cannot
+	// say: it reports this scrape, and the question is how long a failure has
+	// been going on. Built before the work because a collector that never
+	// starts publishes it too.
+	key := lastsuccess.Key{
+		Engine:    lastsuccess.EngineCollector,
+		Target:    target,
+		Database:  datname,
+		Collector: name,
+	}
+	publishUnitFreshness := func() {
+		if when, ok := lastSuccess.At(key); ok {
+			ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
+				float64(when.UnixNano())/1e9, name, datname, target)
+		}
+	}
+
+	// Read on the connection this database already holds, before any SQL. A
+	// collector whose turn comes after the scrape has ended must not be
+	// reported as a collector that failed: nothing ran, so nothing is known
+	// about it, and an operator alerting on collector failures would be woken
+	// by a busy exporter.
+	//
+	// No connection permit is asked for. The connection is open and already
+	// holds one, and a second request per collector would let the bounded
+	// worker pool exhaust the limiter with connections the pool is holding
+	// itself. So the reasons available here are the two a context can give.
+	if decision, ended := admission.Ended(ctx); ended {
+		reason := deferralReason(decision)
+		level.Warn(logger).Log("msg", "Deferred a collector", "name", name, "datname", datname, "reason", reason)
+		ch <- prometheus.MustNewConstMetric(scrapeDeferredDesc, prometheus.GaugeValue, 1, name, datname, reason)
+		publishUnitFreshness()
+		return unitDeferred, reason
+	}
+
 	begin := time.Now()
 	err := c.Update(ctx, instance, ch)
 	duration := time.Since(begin)
@@ -1067,23 +1178,18 @@ func execute(ctx context.Context, name string, c Collector, instance *instance, 
 	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, duration.Seconds(), name, datname)
 	ch <- prometheus.MustNewConstMetric(scrapeSuccessDesc, prometheus.GaugeValue, success, name, datname)
 
-	// When this collector last worked here, which the success above cannot
-	// say: it reports this scrape, and the question is how long a failure has
-	// been going on.
-	key := lastsuccess.Key{
-		Engine:    lastsuccess.EngineCollector,
-		Target:    target,
-		Database:  datname,
-		Collector: name,
-	}
 	if err == nil {
 		lastSuccess.Record(key, begin)
 	}
-	if when, ok := lastSuccess.At(key); ok {
-		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
-			float64(when.UnixNano())/1e9, name, datname, target)
+	publishUnitFreshness()
+	if err != nil {
+		// A query cancelled while it was in flight is a collector that ran and
+		// did not finish, which is a different thing from one that never
+		// started. Both can happen in one database, and they are reported
+		// apart.
+		return unitFailed, ""
 	}
-	return success == 1
+	return unitRan, ""
 }
 
 // collectorFlagAction generates a new action function for the given collector
