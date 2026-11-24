@@ -44,6 +44,13 @@ import (
 )
 
 // liveDSN is the server these tests run against.
+// controlName is the database every case here connects to, and controlUp is
+// its own database_up entry rather than whichever database published last.
+const (
+	controlName = "postgres"
+	controlUp   = "pg_collector_database_up/" + controlName + "/"
+)
+
 func liveDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("DATA_SOURCE_NAME")
@@ -302,7 +309,7 @@ func TestTheFanOutPathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 	if healthy != outcomeScraped || healthyRan.Load() != 1 {
 		t.Fatalf("the healthy run came to %v with %d collector runs, want scraped with 1", healthy, healthyRan.Load())
 	}
-	if healthySeries["pg_collector_database_up/"].value != 1 {
+	if healthySeries[controlUp].value != 1 {
 		t.Fatalf("the healthy run did not report the connection as up: %v", healthySeries)
 	}
 
@@ -314,7 +321,7 @@ func TestTheFanOutPathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 	boundary := int64(-1)
 	for n := int64(1); n <= atRun.Load()+8; n++ {
 		o, p, ran, _ := run(n, nil)
-		if p["pg_collector_database_up/"].value == 1 && ran.Load() == 0 {
+		if p[controlUp].value == 1 && ran.Load() == 0 {
 			outcome, published, boundary = o, p, n
 			break
 		}
@@ -326,19 +333,19 @@ func TestTheFanOutPathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 	if outcome != outcomeFailed {
 		t.Errorf("a database whose connection worked and whose collectors were deferred came to %v, want an attempt that did not finish", outcome)
 	}
-	if published["pg_collector_database_error/"+dbselect.ReasonDeadline].value != 1 {
+	if published["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonDeadline].value != 1 {
 		t.Errorf("the database does not name the budget as the cause: %v", published)
 	}
-	if _, found := published["pg_collector_database_error/"+dbselect.ReasonScrape]; found {
+	if _, found := published["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonScrape]; found {
 		t.Error("no collector failed and the database reports a collector failure")
 	}
-	if _, found := published["pg_collector_database_deferred/"+dbselect.ReasonDeadline]; found {
+	if _, found := published["pg_collector_database_deferred/"+controlName+"/"+dbselect.ReasonDeadline]; found {
 		t.Error("the database is counted as both an attempt that did not finish and a database nothing was tried on")
 	}
-	if _, found := published["pg_scrape_collector_deferred/"+dbselect.ReasonDeadline]; !found {
+	if _, found := published["pg_scrape_collector_deferred/"+controlName+"/"+dbselect.ReasonDeadline]; !found {
 		t.Errorf("the collector that never started is not named: %v", published)
 	}
-	if _, found := published["pg_collector_last_success_timestamp_seconds/"]; !found {
+	if _, found := published["pg_collector_last_success_timestamp_seconds/"+controlName+"/"]; !found {
 		t.Errorf("the deferred collector lost the time it last worked, which the healthy run recorded: %v", published)
 	}
 }
@@ -361,13 +368,19 @@ func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T)
 		ctx := newCountedCheck(context.Background(), n)
 		local := map[string]Collector{"stat_fixture_live": reportingCollector{ran: &ran, atRun: &atRun, ctx: ctx}}
 		p := PostgresCollector{
-			Collectors:  local,
-			logger:      log.NewNopLogger(),
-			ctx:         ctx,
-			connSema:    semaphore.NewWeighted(4),
-			dbWorkers:   4,
-			lastSuccess: store,
-			instance:    &instance{dsn: dsn, name: "live"},
+			Collectors: local,
+			logger:     log.NewNopLogger(),
+			ctx:        ctx,
+			connSema:   semaphore.NewWeighted(4),
+			dbWorkers:  4,
+			// Only the control database, so a collector run and a database_up
+			// here belong to the control connection and to nothing else. A
+			// server with a second eligible database would otherwise put a
+			// fan-out database's series beside the control's, and the counts
+			// below are about the control database's own attempt.
+			includeDatabases: dbselect.Of([]string{controlName}),
+			lastSuccess:      store,
+			instance:         &instance{dsn: dsn, name: "live"},
 		}
 		published := publishedByFamilyAndReason(func(ch chan<- prometheus.Metric) {
 			p.Collect(ch)
@@ -379,7 +392,7 @@ func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T)
 	if healthyRan.Load() < 1 {
 		t.Fatalf("the healthy run never reached a collector: %v", healthy)
 	}
-	if healthy["pg_collector_database_up/"].value != 1 {
+	if healthy[controlUp].value != 1 {
 		t.Fatalf("the healthy run did not report the control connection as up: %v", healthy)
 	}
 
@@ -387,7 +400,7 @@ func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T)
 	boundary := int64(-1)
 	for n := int64(1); n <= atRun.Load()+8; n++ {
 		p, ran, _ := run(n)
-		if p["pg_collector_database_up/"].value == 1 && ran.Load() == 0 {
+		if p[controlUp].value == 1 && ran.Load() == 0 {
 			published, boundary = p, n
 			break
 		}
@@ -396,27 +409,34 @@ func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T)
 		t.Fatalf("no boundary between a control connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
 	}
 	t.Logf("the scrape ends at context read %d, after the control connection is open and before its collectors start", boundary)
-	if published["pg_collector_database_error/"+dbselect.ReasonDeadline].value != 1 {
+	if published["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonDeadline].value != 1 {
 		t.Errorf("the control database does not name the budget as the cause: %v", published)
 	}
-	if _, found := published["pg_collector_database_error/"+dbselect.ReasonScrape]; found {
+	if _, found := published["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonScrape]; found {
 		t.Error("no control collector failed and the control database reports a collector failure")
 	}
-	if _, found := published["pg_scrape_collector_deferred/"+dbselect.ReasonDeadline]; !found {
+	if _, found := published["pg_scrape_collector_deferred/"+controlName+"/"+dbselect.ReasonDeadline]; !found {
 		t.Errorf("the control collector that never started is not named: %v", published)
 	}
-	if published["pg_collector_databases_failed/"].value != 1 {
+	if published["pg_collector_databases_failed//"].value != 1 {
 		t.Errorf("databases_failed is %v, want 1 for the control database's unfinished attempt: %v",
-			published["pg_collector_databases_failed/"].value, published)
+			published["pg_collector_databases_failed//"].value, published)
 	}
-	if published["pg_collector_databases_deferred/"].value != 0 {
+	if published["pg_collector_databases_deferred//"].value != 0 {
 		t.Errorf("databases_deferred is %v, want 0: the control database was attempted",
-			published["pg_collector_databases_deferred/"].value)
+			published["pg_collector_databases_deferred//"].value)
 	}
 }
 
-// publishedByFamilyAndReason keys what was published by family and reason, so a
-// family carrying two reasons at once keeps both.
+// publishedByFamilyAndReason keys what was published by family, database and
+// reason, so a family carrying two reasons at once keeps both and two databases
+// do not collapse into one entry.
+//
+// The database belongs in the key. Without it a scrape covering more than one
+// database kept whichever database_up arrived last, so a fixture reading that
+// entry could be told the control connection was up when it was not. That is
+// how the control-path case below passed against a server with one eligible
+// database and failed against one with two.
 func publishedByFamilyAndReason(emit func(ch chan<- prometheus.Metric)) map[string]MetricResult {
 	ch := make(chan prometheus.Metric, 4096)
 	emit(ch)
@@ -424,7 +444,7 @@ func publishedByFamilyAndReason(emit func(ch chan<- prometheus.Metric)) map[stri
 	out := map[string]MetricResult{}
 	for m := range ch {
 		r := readMetric(m)
-		out[familyName(m)+"/"+r.labels["reason"]] = r
+		out[familyName(m)+"/"+r.labels["datname"]+"/"+r.labels["reason"]] = r
 	}
 	return out
 }
