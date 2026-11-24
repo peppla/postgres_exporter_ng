@@ -34,6 +34,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/fanout"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -460,7 +461,11 @@ type Exporter struct {
 	queryCache *querycache.Cache
 	// lastSuccess outlives this exporter too, for the same reason: how long a
 	// database has been failing cannot be answered from one scrape.
-	lastSuccess       *lastsuccess.Store
+	lastSuccess *lastsuccess.Store
+	// rotation outlives this exporter for the same kind of reason: where the
+	// last scrape of this profile started is the one thing a new one cannot
+	// work out for itself. Nil means the sorted order every scrape.
+	rotation          *rotation.Store
 	userQueriesPath   map[MetricResolution]string
 	resolutionEnabled MetricResolution
 	enabled           bool
@@ -599,6 +604,18 @@ func IncludeDatabases(s string) ExporterOpt {
 func WithQueryCache(cache *querycache.Cache) ExporterOpt {
 	return func(e *Exporter) {
 		e.queryCache = cache
+	}
+}
+
+// WithRotation sets the process-owned schedule of which selected database is
+// offered the first attempt.
+//
+// Without one the order is the sorted order every scrape, which is what left a
+// selected set that does not fit the budget giving the same prefix every
+// opportunity and the rest none.
+func WithRotation(store *rotation.Store) ExporterOpt {
+	return func(e *Exporter) {
+		e.rotation = store
 	}
 }
 

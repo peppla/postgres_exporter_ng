@@ -22,6 +22,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
@@ -61,7 +62,25 @@ var (
 // configuration here because resolving them can fail, and a scrape is the wrong
 // place to discover that: it has no way to report a configuration error except
 // by serving no metrics.
-func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, lastSuccess *lastsuccess.Store, excludeSelection, includeSelection dbselect.List) http.Handler {
+// Stores are the pieces of state that outlive a request.
+//
+// Grouped rather than passed one by one, because each of them answers a
+// question a single scrape cannot: how long a database has been failing, and
+// where the last scrape of this profile got to. The next one costs no further
+// parameter here.
+type Stores struct {
+	// LastSuccess is when each database and collector last worked.
+	LastSuccess *lastsuccess.Store
+	// Rotation is which selected database is offered the first attempt.
+	Rotation *rotation.Store
+}
+
+// NewStores builds the state that outlives a request.
+func NewStores() Stores {
+	return Stores{LastSuccess: lastsuccess.New(), Rotation: rotation.New()}
+}
+
+func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Refused before any SQL runs, and not queued. A queue turns an
 		// overloaded exporter into a slow one, and the scrapes waiting in it
@@ -114,7 +133,7 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		}
 
 		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache,
-			lastSuccess, excludeSelection, includeSelection)
+			stores, excludeSelection, includeSelection)
 		if err != nil {
 			// Only a request that named collectors turns a build failure into
 			// a client error, because then the names came from the request.
@@ -262,7 +281,7 @@ func (f Filters) postgresCollectors() []string {
 // names came from the request. Everything else is logged and the registry is
 // returned with whatever could be built, which is the behaviour a scrape has
 // always had.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, lastSuccess *lastsuccess.Store, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, error) {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, error) {
 	registry := prometheus.NewRegistry()
 
 	// Always, whatever was selected. A refused request serves no metrics of
@@ -293,7 +312,8 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		// so one it owned would be empty on arrival and discarded on the way
 		// out, which is what cache_seconds was doing.
 		WithQueryCache(queryCache),
-		WithLastSuccess(lastSuccess),
+		WithLastSuccess(stores.LastSuccess),
+		WithRotation(stores.Rotation),
 	}
 
 	if filters.EnableAllCollectors || filters.EnableDefaultCollector {
@@ -392,7 +412,8 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 			filters.postgresCollectors(),
 			collector.WithContext(ctx),
 			collector.WithConnectionsSemaphore(connSema, limits.Connections),
-			collector.WithLastSuccess(lastSuccess),
+			collector.WithLastSuccess(stores.LastSuccess),
+			collector.WithRotation(stores.Rotation),
 			// Built-in monitoring's own set, resolved at startup. Never
 			// intersected with the legacy engine's, which builds its own from
 			// its own configuration.

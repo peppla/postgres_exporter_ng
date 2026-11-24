@@ -61,6 +61,16 @@ type dbTarget struct {
 	// control database from database-local collection does not stop its
 	// connection being used for cluster metrics.
 	skipDatabaseLocal bool
+
+	// baselineConnected marks a target this scrape has already connected to
+	// once, for the cluster-wide work and the catalogue read. Only the
+	// configured connection database is ever marked.
+	//
+	// It exists so a deferral does not contradict an observation. The
+	// connection to this database was made and it worked. If its own turn for
+	// database-local work never comes, saying it could not be reached would
+	// publish an assertion against something already seen.
+	baselineConnected bool
 }
 
 // dbSelection is what one pass over the catalog decided.

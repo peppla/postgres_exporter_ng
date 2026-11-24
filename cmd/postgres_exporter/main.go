@@ -27,7 +27,6 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
-	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -219,10 +218,10 @@ func main() {
 	// One cache for the process, so a result a query file asked to keep
 	// survives the request that collected it.
 	queryCache := querycache.New()
-	// When each database was last collected without error, which no single
-	// scrape can answer.
-	lastSuccess := lastsuccess.New()
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache, lastSuccess,
+	// What no single scrape can answer: when each database was last collected
+	// without error, and where the last scrape of a profile got to.
+	stores := NewStores()
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache, stores,
 		excludeSelection, includeSelection))
 
 	if *metricsPath != "/" && *metricsPath != "" {
