@@ -57,11 +57,18 @@ func (p Permit) Release() {
 // sema may be nil, which means no connection limit is configured.
 func Admit(ctx context.Context, sema *semaphore.Weighted) (Permit, Decision) {
 	// Checked before admission, and checked whether or not a limiter exists.
-	// Without this, work reached after the deadline has passed is admitted,
-	// opens a connection that fails on the dead context, and is reported as a
-	// database the exporter could not connect to. The database is then named
-	// as broken when what ran out was the exporter's own time, which sends
-	// whoever is on call to the wrong place.
+	//
+	// With a limiter, this is what tells an expired deadline apart from a full
+	// limit. The limiter answers both with the context's error, so without
+	// this check the two are one answer and an expired scrape is reported as a
+	// connection limit that may have been entirely free.
+	//
+	// With no limiter there is nothing to ask, and the engines used to take
+	// that as permission. Work then started after the deadline had passed,
+	// its connection failed on the dead context, and the database was reported
+	// as one the exporter could not connect to. The shipped binary always
+	// configures a limiter, so that path is reached through the exported API
+	// rather than by running the exporter.
 	if ctx.Err() != nil {
 		return Permit{}, Deadline
 	}

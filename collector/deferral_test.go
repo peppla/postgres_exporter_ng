@@ -109,6 +109,10 @@ var deferralCauses = []struct {
 // did not read the context, so work was started after the deadline had passed,
 // its connection failed on the dead context, and the database was reported as
 // one the exporter could not connect to.
+//
+// main always constructs a limiter, so the shipped binary does not take this
+// path. NewPostgresCollector is exported and the limiter is an option, so
+// something embedding this package does.
 func unlimitedExpiredEngine(t *testing.T, collectors map[string]Collector) PostgresCollector {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())

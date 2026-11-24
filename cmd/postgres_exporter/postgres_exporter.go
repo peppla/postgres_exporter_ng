@@ -890,10 +890,10 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 			defer wg.Done()
 
 			// Admission is checked whether or not a connection limit is
-			// configured. Without the check, work reached after the deadline
-			// has passed is started anyway, its connection fails on the dead
-			// context, and the database is reported as one the exporter could
-			// not connect to. What ran out was the exporter's own time.
+			// configured, and the decision says which of the two ran out. The
+			// limiter answers an expired deadline and a full limit with the
+			// same error, so reading that error alone reported every expired
+			// scrape as a connection limit.
 			permit, decision := admission.Admit(e.ctx, e.connSema)
 			if decision != admission.Admitted {
 				// This database is not scraped, so it must not be counted as

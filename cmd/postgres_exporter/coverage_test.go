@@ -476,11 +476,16 @@ func TestUnreachableDatabasesAreNamed(t *testing.T) {
 // The ways a scrape runs out of room before it starts a database, and the
 // label each one has to publish.
 //
-// The third case is the one that had no coverage. With no connection limit
-// configured the engine did not read the context at all, so every database was
-// attempted after the deadline had passed, each connection failed on the dead
-// context, and the scrape reported a server it could not connect to. What ran
-// out was the exporter's own time.
+// The first two cases are what the shipped binary does, where a limiter is
+// always configured: before this change both of them reported
+// no_connection_permit, so an expired scrape named a limit that may have been
+// entirely free.
+//
+// The third case had no coverage at all. With no limiter the engine did not
+// read the context, so every database was attempted after the deadline had
+// passed and the scrape reported a server it could not connect to. main always
+// constructs a limiter, so this path is reached through NewExporter rather
+// than by running the exporter.
 func admissionCases(t *testing.T) []struct {
 	name   string
 	ctx    context.Context
