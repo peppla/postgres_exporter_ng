@@ -21,11 +21,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1586,5 +1588,114 @@ func TestDiscoverySettlesTheMasterSeedBeforeItVisitsAnything(t *testing.T) {
 	if e.masterDSN != seeds[len(seeds)-1] {
 		t.Errorf("the master seed is %q after a discovery where nothing connected, want %q",
 			e.masterDSN, seeds[len(seeds)-1])
+	}
+}
+
+// TestAHealthySeedIsCollectedBeforeAStalledOneIsRead is the ordering the whole
+// interleaving exists for.
+//
+// Discovery used to finish for every seed before any collection began, so one
+// seed that stalls spent the budget and the databases already found waited
+// behind it. Enqueuing every seed read and appending collection behind it is
+// the same defect with more machinery, so what this asserts is the order the
+// work actually happened in, not that both appear in one queue.
+//
+// The recorder is the connection attempt itself: the healthy seed's databases
+// are at a closed port, so each attempt fails at once and is recorded, and the
+// stalled seed is an address that accepts nothing and burns the remaining
+// budget.
+func TestAHealthySeedIsCollectedBeforeAStalledOneIsRead(t *testing.T) {
+	stalled, stop := stalledEndpoint(t)
+	defer stop()
+
+	var mu sync.Mutex
+	var order []string
+	recordAttempt := func(what string) {
+		mu.Lock()
+		order = append(order, what)
+		mu.Unlock()
+	}
+
+	// A healthy seed whose databases do not answer, and a stalled seed. The
+	// healthy one is read first here, which is the case that used to collect
+	// nothing at all.
+	healthy := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	seeds := []string{healthy, stalled}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := NewExporter(seeds,
+		WithContext(ctx),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		AutoDiscoverDatabases(true),
+		WithRotation(rotation.New()),
+		CollectorName("exporter"),
+	)
+	e.onSeedRead = func(seed string) { recordAttempt("read " + seed) }
+	e.onTargetCollected = func(target string) { recordAttempt("collect " + target) }
+
+	ch, drainStop := drain()
+	d := discovery{ok: true}
+	e.discoverAndCollect(ch, &d)
+	drainStop()
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+
+	// The premise: both seeds were read, so this is about the order and not
+	// about one of them never happening.
+	reads := 0
+	for _, step := range got {
+		if strings.HasPrefix(step, "read ") {
+			reads++
+		}
+	}
+	if reads != len(seeds) {
+		t.Fatalf("%d of %d seeds were read: %v", reads, len(seeds), got)
+	}
+
+	// The healthy seed's collection has to come before the stalled seed's read.
+	stalledRead, firstCollect := -1, -1
+	for i, step := range got {
+		if step == "read "+stalled {
+			stalledRead = i
+		}
+		if firstCollect < 0 && strings.HasPrefix(step, "collect ") {
+			firstCollect = i
+		}
+	}
+	if firstCollect < 0 {
+		t.Fatalf("nothing was collected at all: %v", got)
+	}
+	if stalledRead >= 0 && firstCollect > stalledRead {
+		t.Errorf("the stalled seed was read before anything was collected: %v", got)
+	}
+}
+
+// stalledEndpoint is a listener that accepts connections and answers nothing,
+// which is how a seed consumes a budget without failing.
+func stalledEndpoint(t *testing.T) (dsn string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %s", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Held open and never answered.
+			go func() { <-done; conn.Close() }()
+		}
+	}()
+	return "postgresql://u:p@" + ln.Addr().String() + "/app?sslmode=disable", func() {
+		ln.Close()
+		<-done
 	}
 }

@@ -169,109 +169,130 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 	// Settled before anything runs, and not touched again while it does.
 	e.masterDSN = masterSeed(e.dsn)
 
-	// DSN to how that database is reported. The name is empty when it is
-	// not known.
-	dsns := make(map[string]databaseRef)
 	for _, dsn := range e.dsn {
-		var dsnURI *url.URL
-		var dsnConnstring string
-
-		if strings.HasPrefix(dsn, "postgresql://") || strings.HasPrefix(dsn, "postgres://") {
-			var err error
-			dsnURI, err = url.Parse(dsn)
-			if err != nil {
-				level.Error(logger).Log("msg", "Unable to parse DSN as URI", "dsn", loggableDSN(dsn), "err", err)
-				// The set could not be determined for this seed, and the
-				// seed itself is dropped. Reporting success here would
-				// publish "nothing to cover, and that is correct".
-				d.ok = false
-				continue
-			}
-		} else if connstringRe.MatchString(dsn) {
-			dsnConnstring = dsn
-		} else {
-			level.Error(logger).Log("msg", "Unable to parse DSN as either URI or connstring", "dsn", loggableDSN(dsn))
-			d.ok = false
-			continue
-		}
-		seed := dsn
-		// The host:port identity this seed's databases are reported under.
-		// Discovery has already accepted the DSN above, so a failure here
-		// leaves the identity empty rather than dropping the seed.
-		fingerprint, err := parseFingerprint(dsn)
-		if err != nil {
-			level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
-		}
-		dsns[seed] = databaseRef{server: fingerprint, identity: identityOf(seed)}
-
-		catalog, connected, err := e.getDatabaseNames(dsn)
-		if connected {
-			d.connectSuccesses++
-		}
-		if err != nil {
-			var connectErr *ErrorConnectToServer
-			if errors.As(err, &connectErr) {
-				d.connectFailures++
-			}
-			// Discovery failed for this seed. The DSN list keeps the seed
-			// alone, so coverage silently collapsed to one database -- which
-			// is exactly what ok=false exists to stop being silent.
-			d.ok = false
-			// The seed's own database exists whatever the catalog query did,
-			// because the connection to it is how the query was attempted.
-			d.discovered++
-			continue
-		}
-		d.discovered += len(catalog)
-		if name, found := currentName(catalog); found {
-			dsns[seed] = databaseRef{server: fingerprint, datname: name, identity: identityOf(seed)}
-		} else {
-			// The connection database is not in its own catalog. The query
-			// also filters out templates and databases this role has no
-			// CONNECT privilege on, so this says the database is outside the
-			// eligible set, not specifically that it became unconnectable
-			// mid-scrape. Connecting to a template database is one way to
-			// get here. It is still a target and still counted, but there is
-			// no name to report it under and inventing one would be worse.
-			d.discovered++
-		}
-
-		sel := dbselect.Apply(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
-		for _, name := range sel.Excluded {
-			d.excluded = append(d.excluded, databaseRef{server: fingerprint, datname: name})
-		}
-		d.notIncluded += sel.NotIncluded
-
-		// The configured database is subject to the same rules as any other,
-		// but it cannot be dropped from the DSN list: it is the connection
-		// the cluster-wide work runs on. Exclusion of database-local
-		// collection for it is a separate change.
-		for _, databaseName := range sel.Selected {
-			if dsnURI != nil {
-				if dsnURI.Host == "" && strings.HasPrefix(dsnURI.Path, "/") {
-					dsnURI.Path = "/" + databaseName
-				} else {
-					dsnURI.Path = databaseName
-				}
-				dsn = dsnURI.String()
-			} else {
-				// replacing one dbname with another is complicated.
-				// just append new dbname to override.
-				dsn = fmt.Sprintf("%s dbname=%s", dsnConnstring, databaseName)
-			}
-			dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: identityOf(dsn)}
-		}
+		d.targets = append(d.targets, e.discoverSeed(dsn, &d)...)
 	}
-
-	d.targets = make([]scrapeTarget, 0, len(dsns))
-	for dsn, ref := range dsns {
-		d.targets = append(d.targets, scrapeTarget{dsn: dsn, databaseRef: ref})
-	}
-	// Map iteration order is random, and a random order makes a failure
-	// report read differently every scrape for no reason.
-	sort.Slice(d.targets, func(i, j int) bool { return d.targets[i].dsn < d.targets[j].dsn })
-
+	sortTargets(d.targets)
 	return d
+}
+
+// discoverSeed reads one seed's catalogue and returns the targets it yields,
+// adding what it observed to d.
+//
+// One seed at a time, because the caller collects a seed's databases before
+// reading the next one. Reading every seed first and collecting afterwards is
+// what let one stalled seed spend the whole budget while databases that had
+// already been found waited behind it.
+func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
+	dsns := make(map[string]databaseRef)
+	var dsnURI *url.URL
+	var dsnConnstring string
+
+	if strings.HasPrefix(dsn, "postgresql://") || strings.HasPrefix(dsn, "postgres://") {
+		var err error
+		dsnURI, err = url.Parse(dsn)
+		if err != nil {
+			level.Error(logger).Log("msg", "Unable to parse DSN as URI", "dsn", loggableDSN(dsn), "err", err)
+			// The set could not be determined for this seed, and the
+			// seed itself is dropped. Reporting success here would
+			// publish "nothing to cover, and that is correct".
+			d.ok = false
+			return nil
+		}
+	} else if connstringRe.MatchString(dsn) {
+		dsnConnstring = dsn
+	} else {
+		level.Error(logger).Log("msg", "Unable to parse DSN as either URI or connstring", "dsn", loggableDSN(dsn))
+		d.ok = false
+		return nil
+	}
+	seed := dsn
+	// The host:port identity this seed's databases are reported under.
+	// Discovery has already accepted the DSN above, so a failure here
+	// leaves the identity empty rather than dropping the seed.
+	fingerprint, err := parseFingerprint(dsn)
+	if err != nil {
+		level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
+	}
+	dsns[seed] = databaseRef{server: fingerprint, identity: identityOf(seed)}
+
+	catalog, connected, err := e.getDatabaseNames(dsn)
+	if connected {
+		d.connectSuccesses++
+	}
+	if err != nil {
+		var connectErr *ErrorConnectToServer
+		if errors.As(err, &connectErr) {
+			d.connectFailures++
+		}
+		// Discovery failed for this seed. The DSN list keeps the seed
+		// alone, so coverage silently collapsed to one database -- which
+		// is exactly what ok=false exists to stop being silent.
+		d.ok = false
+		// The seed's own database exists whatever the catalog query did,
+		// because the connection to it is how the query was attempted, and it
+		// is already in the map. Returning nothing here would drop it.
+		d.discovered++
+		return targetsOf(dsns)
+	}
+	d.discovered += len(catalog)
+	if name, found := currentName(catalog); found {
+		dsns[seed] = databaseRef{server: fingerprint, datname: name, identity: identityOf(seed)}
+	} else {
+		// The connection database is not in its own catalog. The query
+		// also filters out templates and databases this role has no
+		// CONNECT privilege on, so this says the database is outside the
+		// eligible set, not specifically that it became unconnectable
+		// mid-scrape. Connecting to a template database is one way to
+		// get here. It is still a target and still counted, but there is
+		// no name to report it under and inventing one would be worse.
+		d.discovered++
+	}
+
+	sel := dbselect.Apply(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
+	for _, name := range sel.Excluded {
+		d.excluded = append(d.excluded, databaseRef{server: fingerprint, datname: name})
+	}
+	d.notIncluded += sel.NotIncluded
+
+	// The configured database is subject to the same rules as any other,
+	// but it cannot be dropped from the DSN list: it is the connection
+	// the cluster-wide work runs on. Exclusion of database-local
+	// collection for it is a separate change.
+	for _, databaseName := range sel.Selected {
+		if dsnURI != nil {
+			if dsnURI.Host == "" && strings.HasPrefix(dsnURI.Path, "/") {
+				dsnURI.Path = "/" + databaseName
+			} else {
+				dsnURI.Path = databaseName
+			}
+			dsn = dsnURI.String()
+		} else {
+			// replacing one dbname with another is complicated.
+			// just append new dbname to override.
+			dsn = fmt.Sprintf("%s dbname=%s", dsnConnstring, databaseName)
+		}
+		dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: identityOf(dsn)}
+	}
+
+	return targetsOf(dsns)
+}
+
+// targetsOf turns the seed's map into targets in a fixed order. Map iteration
+// order is random, and a random order makes a failure report read differently
+// every scrape for no reason.
+func targetsOf(dsns map[string]databaseRef) []scrapeTarget {
+	targets := make([]scrapeTarget, 0, len(dsns))
+	for dsn, ref := range dsns {
+		targets = append(targets, scrapeTarget{dsn: dsn, databaseRef: ref})
+	}
+	sortTargets(targets)
+	return targets
+}
+
+// sortTargets puts targets in a fixed order.
+func sortTargets(targets []scrapeTarget) {
+	sort.Slice(targets, func(i, j int) bool { return targets[i].dsn < targets[j].dsn })
 }
 
 // identityOf returns this process's identity for a connection string, logging

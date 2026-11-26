@@ -81,19 +81,13 @@ func NewStores() Stores {
 }
 
 func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) http.Handler {
-	// What gathering this endpoint's own metrics came to, which the response
-	// otherwise cannot say. A collector that returns an invalid metric, a
-	// duplicate or an inconsistent label set has the affected metrics or
-	// samples rejected by the gatherer, and the request still answers 200.
-	// pg_up stays 1 and last_scrape_error stays 0, because the collection
-	// those two describe worked: what failed was turning it into a response.
+	// What gathering this endpoint's metrics came to, which the response
+	// otherwise cannot say. Gathering can reject metrics while the collection
+	// behind them succeeded, so pg_up and last_scrape_error stay 1 and 0 and
+	// something asked for is still missing from the body.
 	//
-	// How much is rejected depends on what was wrong. Duplicate samples in
-	// three databases left the family in place with one sample each, while an
-	// invalid metric takes its family with it. Either way something asked for
-	// is missing from the response and nothing in the response says so.
-	//
-	// One failed gather is one increment, whatever it rejected.
+	// It belongs to the endpoint rather than to a request, so the count
+	// survives the per-request registries and is not rebuilt with them.
 	//
 	// It belongs to the process and not to a request, because each request
 	// builds its own registry and a counter rebuilt with it would reset on
@@ -169,14 +163,10 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
 		//
 		// Served from both: the registry this request built, and the
-		// endpoint's own. The second is what carries the count of gathers that
-		// went wrong, so a dropped family is visible in the output rather than
-		// only in a log nobody is scraping.
+		// endpoint's own, which carries the count of gathers that went wrong.
 		//
-		// On the response after it, not this one. The hook increments once
-		// gathering has finished, so this request's own failure is already too
-		// late for the body being built from it. That is this handler's
-		// ordering rather than something true of counters.
+		// The hook increments after gathering, so a request's own failure is
+		// too late for the body built from it and appears in a later response.
 		h := promhttp.HandlerFor(prometheus.Gatherers{registry, handlerMetrics}, promhttp.HandlerOpts{
 			ErrorHandling: promhttp.ContinueOnError,
 			ErrorLog:      stdlog.New(log.NewStdlibAdapter(logger), "handler", 0),

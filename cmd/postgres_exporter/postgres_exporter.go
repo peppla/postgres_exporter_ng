@@ -465,7 +465,14 @@ type Exporter struct {
 	// rotation outlives this exporter for the same kind of reason: where the
 	// last scrape of this profile started is the one thing a new one cannot
 	// work out for itself. Nil means the sorted order every scrape.
-	rotation          *rotation.Store
+	rotation *rotation.Store
+
+	// onSeedRead and onTargetCollected record the order the work happened in.
+	// Nil in a running exporter: the order is only observable from outside by
+	// watching connections, and a test that watches connections cannot tell a
+	// seed read from a database collection on the same address.
+	onSeedRead        func(seed string)
+	onTargetCollected func(target string)
 	userQueriesPath   map[MetricResolution]string
 	resolutionEnabled MetricResolution
 	enabled           bool
@@ -879,8 +886,11 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	d := discovery{ok: true, discovered: len(e.dsn)}
 	if e.autoDiscoverDatabases {
-		d = e.discoverDatabaseDSNs()
-	} else {
+		errorsCount, connectionErrorsCount, deferredCount := e.discoverAndCollect(ch, &d)
+		e.finishScrape(d, errorsCount, connectionErrorsCount, deferredCount)
+		return
+	}
+	{
 		// No discovery, so no catalog and no names. The targets are the
 		// configured DSNs as given, identified by server only.
 		for _, dsn := range e.dsn {
@@ -900,12 +910,71 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	e.coverage.setSelection(e.autoDiscoverDatabases, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
 
 	errorsCount, connectionErrorsCount, deferredCount := e.scrapeTargets(ch, d.targets)
+	e.finishScrape(d, errorsCount, connectionErrorsCount, deferredCount)
+}
 
+// discoverAndCollect reads one seed, collects the databases it yielded, and
+// only then reads the next.
+//
+// Discovery used to finish for every seed before any collection began, so one
+// seed that stalls spends the whole budget and databases already found wait
+// behind it with nothing left to run in. Measured against a stalled endpoint:
+// four requests in a row discovered the healthy seed and collected none of its
+// databases.
+//
+// The seed order rotates on the same schedule the databases use, so the seed
+// that goes first is not the same one every scrape. That is what gives a
+// healthy seed its turn on the scrapes where it is not behind the stalled one,
+// which no amount of ordering within a seed can do.
+//
+// The intent is recorded as each seed yields it rather than once at the end, so
+// a scrape cut short still reports what it had meant to cover.
+func (e *Exporter) discoverAndCollect(ch chan<- prometheus.Metric, d *discovery) (failed, connectionFailures, deferred int) {
+	for _, seed := range e.rotateSeeds(e.dsn) {
+		if e.onSeedRead != nil {
+			e.onSeedRead(seed)
+		}
+		targets := e.discoverSeed(seed, d)
+		d.targets = append(d.targets, targets...)
+		sortTargets(d.targets)
+		e.coverage.setSelection(true, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
+
+		f, c, def := e.scrapeTargets(ch, targets)
+		failed += f
+		connectionFailures += c
+		deferred += def
+	}
+	return failed, connectionFailures, deferred
+}
+
+// rotateSeeds puts the configured seeds in the order this request's schedule
+// says, so the seed read first is not the same one every scrape.
+//
+// Its own schedule, separate from the one the databases within a seed use: they
+// are different sets and a turn in one is not a turn in the other.
+func (e *Exporter) rotateSeeds(seeds []string) []string {
+	if len(seeds) < 2 {
+		return seeds
+	}
+	members := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		members = append(members, identityOf(seed))
+	}
+	key := rotation.Key{Engine: "query", Target: e.scheduleTarget(), Profile: e.collectorName + " seeds"}
+	out := make([]string, 0, len(seeds))
+	for _, i := range rotation.Order(e.rotation.Next(key, members), len(seeds)) {
+		out = append(out, seeds[i])
+	}
+	return out
+}
+
+// finishScrape publishes what the whole scrape came to.
+func (e *Exporter) finishScrape(d discovery, errorsCount, connectionErrorsCount, deferredCount int) {
 	e.coverage.setOutcome(len(d.targets), errorsCount, deferredCount)
 
-	up, failed := health(len(d.targets), deferredCount, connectionErrorsCount, errorsCount, d)
+	up, failedScrape := health(len(d.targets), deferredCount, connectionErrorsCount, errorsCount, d)
 	e.psqlUp.Set(up)
-	e.error.Set(failed)
+	e.error.Set(failedScrape)
 }
 
 // health is what this scrape says about the server and about itself.
@@ -1057,6 +1126,9 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				return
 			}
 			defer permit.Release()
+			if e.onTargetCollected != nil {
+				e.onTargetCollected(target.dsn)
+			}
 			if err := e.scrapeDSN(ch, &target); err != nil {
 				errorsCount.Add(1)
 
