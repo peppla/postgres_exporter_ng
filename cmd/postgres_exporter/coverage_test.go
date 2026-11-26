@@ -1433,8 +1433,12 @@ func (b brokenCollector) Collect(ch chan<- prometheus.Metric) {
 // options: removing Registry from the production HandlerOpts leaves such a test
 // passing, which is what the first version of this did.
 func TestAGatherErrorIsCountedThroughTheHandler(t *testing.T) {
+	// An invalid metric, which takes its whole family with it. Other gather
+	// failures reject less: duplicate samples leave the family in place with
+	// the samples that survived. What they have in common is that something
+	// asked for is missing and the response does not say so.
 	broken := brokenCollector{
-		desc: prometheus.NewDesc("pg_fixture_broken", "a family the gatherer will drop",
+		desc: prometheus.NewDesc("pg_fixture_broken", "a family this one takes with it",
 			[]string{"one", "two"}, nil),
 	}
 	limits := budget.Defaults()

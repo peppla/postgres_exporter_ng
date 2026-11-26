@@ -83,11 +83,17 @@ func NewStores() Stores {
 func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) http.Handler {
 	// What gathering this endpoint's own metrics came to, which the response
 	// otherwise cannot say. A collector that returns an invalid metric, a
-	// duplicate or an inconsistent label set has its series dropped by the
-	// gatherer, and the request still answers 200. pg_up stays 1 and
-	// last_scrape_error stays 0, because the collection those two describe
-	// worked: what failed was turning it into a response. So a family can
-	// disappear from the output with nothing in the output saying so.
+	// duplicate or an inconsistent label set has the affected metrics or
+	// samples rejected by the gatherer, and the request still answers 200.
+	// pg_up stays 1 and last_scrape_error stays 0, because the collection
+	// those two describe worked: what failed was turning it into a response.
+	//
+	// How much is rejected depends on what was wrong. Duplicate samples in
+	// three databases left the family in place with one sample each, while an
+	// invalid metric takes its family with it. Either way something asked for
+	// is missing from the response and nothing in the response says so.
+	//
+	// One failed gather is one increment, whatever it rejected.
 	//
 	// It belongs to the process and not to a request, because each request
 	// builds its own registry and a counter rebuilt with it would reset on
