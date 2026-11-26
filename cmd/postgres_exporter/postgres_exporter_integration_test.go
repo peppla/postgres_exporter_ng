@@ -514,8 +514,11 @@ func (s *IntegrationSuite) TestAutoDiscoverDatabases(c *C) {
 	defer server.Close()
 
 	// The same catalog discovery is built from, asked for directly.
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	c.Assert(len(catalog) > 1, Equals, true,
 		Commentf("the fixture server has one database, so discovery was never exercised"))
 
@@ -814,8 +817,11 @@ func (s *IntegrationSuite) TestCollectorSelectionExcludesDatabases(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	others := otherThanCurrent(catalog)
 	c.Assert(len(others) > 0, Equals, true,
 		Commentf("the fixture server has one database, so exclusion cannot be exercised"))
@@ -1544,8 +1550,11 @@ func (s *IntegrationSuite) TestApplicationQueryDatabaseSelection(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	control, found := currentName(catalog)
 	c.Assert(found, Equals, true)
 	others := otherThanCurrent(catalog)
@@ -2418,8 +2427,11 @@ func (s *IntegrationSuite) TestTwoDatabasesOnOneHostKeepSeparateCacheEntries(c *
 	admin, err := NewServer(configured)
 	c.Assert(err, IsNil)
 	defer admin.Close()
-	catalog, err := queryDatabases(context.Background(), admin)
+	allDatabases, err := queryDatabases(context.Background(), admin)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	control, found := currentName(catalog)
 	c.Assert(found, Equals, true)
 	others := otherThanCurrent(catalog)
@@ -3290,8 +3302,11 @@ func (s *IntegrationSuite) TestClusterOnlyScrapeCoversNoDatabases(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	c.Assert(len(catalog) > 1, Equals, true,
 		Commentf("the fixture server has one database, so a count of zero cannot be told from a count of one"))
 
@@ -3460,8 +3475,11 @@ func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	others := otherThanCurrent(catalog)
 	c.Assert(len(others) > 0, Equals, true,
 		Commentf("the fixture server has one database, so selection cannot be exercised"))

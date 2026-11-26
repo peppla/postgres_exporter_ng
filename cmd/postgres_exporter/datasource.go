@@ -241,7 +241,11 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 		d.discovered++
 		return targetsOf(seed, dsns)
 	}
-	d.discovered += len(catalog)
+	// The eligible rows only. The read now returns every database the server
+	// has, so that a later component can tell one that was dropped from one
+	// that merely stopped being reachable, and counting all of them here would
+	// put templates into a coverage denominator that never had them.
+	d.discovered += len(eligible(catalog))
 	if name, found := currentName(catalog); found {
 		dsns[seed] = databaseRef{server: fingerprint, datname: name, identity: identityOf(seed)}
 	} else {

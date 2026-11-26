@@ -330,6 +330,15 @@ func addQueries(ctx context.Context, content []byte, pgVersion semver.Version, s
 type catalogDatabase struct {
 	name    string
 	current bool
+	// eligible is whether this database is one the exporter may collect from:
+	// it accepts connections, is not a template, and this role may connect.
+	//
+	// A column rather than a filter, so one read answers two questions. The
+	// eligible set is what coverage has always counted, and the rows as a whole
+	// are what the server contains, which is the only thing that can say a
+	// database is gone rather than merely out of reach. Losing CONNECT looks
+	// exactly like being dropped to a query that filters on it.
+	eligible bool
 }
 
 // queryDatabases returns every database on the server that this role may
@@ -340,7 +349,7 @@ type catalogDatabase struct {
 // database that fails to answer later is still part of this set, and is
 // reported as a failure rather than removed from it.
 func queryDatabases(ctx context.Context, server *Server) ([]catalogDatabase, error) {
-	rows, err := server.db.QueryContext(ctx, "SELECT datname, datname = current_database() AS is_current FROM pg_database WHERE datallowconn = true AND datistemplate = false AND has_database_privilege(current_user, datname, 'connect')")
+	rows, err := server.db.QueryContext(ctx, "SELECT datname, datname = current_database() AS is_current, datallowconn AND NOT datistemplate AND has_database_privilege(current_user, datname, 'connect') AS eligible FROM pg_database")
 	if err != nil {
 		return nil, fmt.Errorf("Error retrieving databases: %v", err)
 	}
@@ -349,7 +358,7 @@ func queryDatabases(ctx context.Context, server *Server) ([]catalogDatabase, err
 	var db catalogDatabase
 	result := make([]catalogDatabase, 0)
 	for rows.Next() {
-		err = rows.Scan(&db.name, &db.current)
+		err = rows.Scan(&db.name, &db.current, &db.eligible)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintln("Error retrieving rows:", err))
 		}
@@ -374,9 +383,41 @@ func queryDatabases(ctx context.Context, server *Server) ([]catalogDatabase, err
 func otherThanCurrent(dbs []catalogDatabase) []string {
 	out := make([]string, 0, len(dbs))
 	for _, db := range dbs {
-		if !db.current {
+		if !db.current && db.eligible {
 			out = append(out, db.name)
 		}
+	}
+	return out
+}
+
+// eligible returns the databases the exporter may collect from, which is the
+// set the predicate used to select in the query itself.
+func eligible(dbs []catalogDatabase) []catalogDatabase {
+	out := make([]catalogDatabase, 0, len(dbs))
+	for _, db := range dbs {
+		if db.eligible {
+			out = append(out, db)
+		}
+	}
+	return out
+}
+
+// inventory returns every database the server reported, eligible or not.
+//
+// This is what can authorise forgetting a database: a name absent from a
+// complete read of pg_database is a database the server does not have. A name
+// absent from the eligible set may simply have lost CONNECT, and treating the
+// two alike would erase the history of a database that is still there.
+//
+// Nothing calls it yet. The read returns the rows it needs, so the bounded
+// cleanup that will use it does not have to change the query or take a second
+// snapshot of a server that has moved on in between.
+//
+//nolint:unused // the cleanup component this exists for is not written yet
+func inventory(dbs []catalogDatabase) []string {
+	out := make([]string, 0, len(dbs))
+	for _, db := range dbs {
+		out = append(out, db.name)
 	}
 	return out
 }
@@ -387,7 +428,7 @@ func otherThanCurrent(dbs []catalogDatabase) []string {
 // and must not be guessed at.
 func currentName(dbs []catalogDatabase) (string, bool) {
 	for _, db := range dbs {
-		if db.current {
+		if db.current && db.eligible {
 			return db.name, true
 		}
 	}

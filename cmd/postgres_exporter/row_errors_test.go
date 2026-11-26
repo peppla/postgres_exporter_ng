@@ -213,9 +213,9 @@ func TestQueryDatabasesReportsRowErrors(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectQuery("FROM pg_database").WillReturnRows(
-		sqlmock.NewRows([]string{"datname", "is_current"}).
-			AddRow("postgres", true).
-			AddRow("app", false).
+		sqlmock.NewRows([]string{"datname", "is_current", "eligible"}).
+			AddRow("postgres", true, true).
+			AddRow("app", false, true).
 			RowError(1, errLegacyRowFailure))
 
 	names, err := queryDatabases(context.Background(), &Server{db: db})
