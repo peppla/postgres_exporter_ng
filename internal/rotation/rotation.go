@@ -182,6 +182,17 @@ func (s *Store) Len() int {
 	return len(s.waiting)
 }
 
+// Waiting is how many names a schedule is holding, for the tests that bound
+// this.
+func (s *Store) Waiting(k Key) int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.waiting[k])
+}
+
 // Keys is every schedule held, in no particular order.
 //
 // For the cleanup that will bound this store, which has to decide per schedule

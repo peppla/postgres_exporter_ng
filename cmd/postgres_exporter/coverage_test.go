@@ -1987,3 +1987,49 @@ func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T)
 		t.Error("an older catalogue removed a connection that a newer catalogue, read through the other seed that built it, had just confirmed")
 	}
 }
+
+// TestTheScheduleDoesNotGrowWithDatabasesComingAndGoing bounds this store on
+// the axis a catalogue read would otherwise have to prune.
+//
+// A schedule is keyed by the engine, the configured connections and the
+// profile, so what a server does to its databases cannot add one. The names
+// inside a schedule are rebuilt from the members it is handed on every call,
+// so a database that leaves the selection leaves the schedule with it rather
+// than waiting for something to come and remove it.
+//
+// This is why the cleanup for this store is the cap on profiles and not a
+// census: there is nothing here for a census to own.
+func TestTheScheduleDoesNotGrowWithDatabasesComingAndGoing(t *testing.T) {
+	store := rotation.New()
+	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	e := NewExporter([]string{seed},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	const scrapes = 50
+	for i := 0; i < scrapes; i++ {
+		// One database that stays and one that is replaced every scrape.
+		targets := targetsForDSN("127.0.0.1:1", "stays", fmt.Sprintf("churn%03d", i))
+		for j := range targets {
+			targets[j].seed = seed
+		}
+		if got := e.rotateTargets(targets); len(got) != len(targets) {
+			t.Fatalf("scrape %d returned %d of %d targets", i, len(got), len(targets))
+		}
+	}
+
+	keys := store.Keys()
+	if len(keys) != 1 {
+		t.Errorf("%d scrapes with a different database each time left %d schedules, want 1: %v",
+			scrapes, len(keys), keys)
+	}
+	for _, key := range keys {
+		if waiting := store.Waiting(key); waiting > 2 {
+			t.Errorf("a schedule over two databases is holding %d names after %d scrapes",
+				waiting, scrapes)
+		}
+	}
+}
