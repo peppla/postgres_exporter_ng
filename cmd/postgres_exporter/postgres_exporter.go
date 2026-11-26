@@ -1089,13 +1089,18 @@ func (e *Exporter) rotateTargets(targets []scrapeTarget) []scrapeTarget {
 	//
 	// One schedule per seed keeps each seed's own waiting list, and the seed
 	// order has a schedule of its own above this.
+	//
+	// The seed goes into the key as the identity this process assigns it, not
+	// as the connection string. The string carries a password, and this map
+	// lives as long as the process: keying on it put one credential per seed
+	// ever discovered somewhere a heap dump would print.
 	seed := targets[0].seed
 	members := make([]string, 0, len(targets))
 	for _, t := range targets {
 		members = append(members, t.identity)
 	}
 
-	key := rotation.Key{Engine: "query", Target: e.scheduleTarget() + " " + seed, Profile: e.collectorName}
+	key := rotation.Key{Engine: "query", Target: e.scheduleTarget() + " " + identityOf(seed), Profile: e.collectorName}
 	out := make([]scrapeTarget, 0, len(targets))
 	for _, i := range rotation.Order(e.rotation.Next(key, members), len(targets)) {
 		out = append(out, targets[i])

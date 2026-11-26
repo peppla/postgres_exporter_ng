@@ -1874,3 +1874,54 @@ func TestACensusFromOneConnectionLeavesAnotherAlone(t *testing.T) {
 		t.Error("a census read through one connection removed another connection's record")
 	}
 }
+
+// TestNoScheduleKeyCarriesAConnectionString keeps credentials out of state that
+// lives as long as the process.
+//
+// The per-seed schedule is keyed by the seed its targets were discovered
+// through. That key held the seed's connection string, password and all, and
+// the map it keys is never emptied, so a process that discovered ten seeds held
+// ten passwords for as long as it ran. Nothing exported them and nothing had
+// to: a heap dump, a core file or a map printed by a panic is enough.
+//
+// The password is checked for in every field rather than in the one that held
+// it, so moving the string into another field does not pass.
+func TestNoScheduleKeyCarriesAConnectionString(t *testing.T) {
+	const password = "hunter2-correct-horse"
+	seed := "postgresql://u:" + password + "@127.0.0.1:1/one?sslmode=disable"
+
+	store := rotation.New()
+	e := NewExporter([]string{seed},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := targetsForDSN("127.0.0.1:1", "a", "b")
+	for i := range targets {
+		targets[i].seed = seed
+	}
+	if got := e.rotateTargets(targets); len(got) != len(targets) {
+		t.Fatalf("the rotation returned %d of %d targets", len(got), len(targets))
+	}
+
+	keys := store.Keys()
+	if len(keys) == 0 {
+		t.Fatal("no schedule was created, so this proves nothing about what a key carries")
+	}
+	for _, key := range keys {
+		for field, value := range map[string]string{
+			"Engine":  key.Engine,
+			"Target":  key.Target,
+			"Profile": key.Profile,
+		} {
+			if strings.Contains(value, password) {
+				t.Errorf("the schedule key's %s field is %q, which carries the seed's password", field, value)
+			}
+			if strings.Contains(value, "postgresql://") {
+				t.Errorf("the schedule key's %s field is %q, which carries a connection string", field, value)
+			}
+		}
+	}
+}

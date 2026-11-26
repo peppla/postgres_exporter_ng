@@ -182,6 +182,24 @@ func (s *Store) Len() int {
 	return len(s.waiting)
 }
 
+// Keys is every schedule held, in no particular order.
+//
+// For the cleanup that will bound this store, which has to decide per schedule
+// whether anything still reaches it, and for the tests that check what a key
+// is allowed to carry.
+func (s *Store) Keys() []Key {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Key, 0, len(s.waiting))
+	for k := range s.waiting {
+		out = append(out, k)
+	}
+	return out
+}
+
 // Order returns the positions 0 to n-1 rotated so that start comes first.
 //
 // A rotation rather than a subset: every selected database is still visited, so
