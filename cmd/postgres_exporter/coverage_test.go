@@ -19,7 +19,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"sort"
 	"strings"
@@ -29,6 +32,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -1397,4 +1401,76 @@ func TestASeedThatConnectedKeepsTheServerUp(t *testing.T) {
 	if up != 0 {
 		t.Errorf("pg_up is %v when every attempted database failed and nothing else connected, want 0", up)
 	}
+}
+
+// brokenCollector returns a metric whose label count does not match its
+// descriptor, which is what an application query that names a label column its
+// SQL does not select used to produce.
+type brokenCollector struct{ desc *prometheus.Desc }
+
+func (b brokenCollector) Describe(ch chan<- *prometheus.Desc) { ch <- b.desc }
+
+func (b brokenCollector) Collect(ch chan<- prometheus.Metric) {
+	// One label value for a descriptor that declares two. The gatherer rejects
+	// this and drops the family.
+	ch <- prometheus.NewInvalidMetric(b.desc, errors.New("inconsistent label cardinality"))
+}
+
+// TestAGatherErrorIsCountedWhereAnOperatorCanSeeIt covers the one failure this
+// endpoint used to report nowhere.
+//
+// A collector that returns an invalid metric has its family dropped by the
+// gatherer and the request still answers 200. The collection those health
+// signals describe worked, so pg_up stays 1 and last_scrape_error stays 0:
+// what failed was turning the collection into a response. Without a count of
+// gather failures the family simply vanishes from the output.
+func TestAGatherErrorIsCountedWhereAnOperatorCanSeeIt(t *testing.T) {
+	handlerMetrics := prometheus.NewRegistry()
+	broken := prometheus.NewRegistry()
+	broken.MustRegister(brokenCollector{
+		desc: prometheus.NewDesc("pg_fixture_broken", "a family the gatherer will drop",
+			[]string{"one", "two"}, nil),
+	})
+	// A healthy family beside it, because a real registry holds many and the
+	// question is whether one of them disappearing is visible. With only the
+	// broken one there is nothing left to serve, and the handler answers 500
+	// for that reason rather than for anything this case is about.
+	healthy := prometheus.NewGauge(prometheus.GaugeOpts{Name: "pg_fixture_healthy", Help: "a family that gathers"})
+	healthy.Set(1)
+	broken.MustRegister(healthy)
+
+	h := promhttp.HandlerFor(prometheus.Gatherers{broken, handlerMetrics}, promhttp.HandlerOpts{
+		ErrorHandling: promhttp.ContinueOnError,
+		Registry:      handlerMetrics,
+	})
+
+	// The first request's own failure lands in the counter after that response
+	// has been gathered, so the count is read from the one after it. That is
+	// how a cumulative counter behaves here and the comment beside the handler
+	// says so.
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("the first request answered %d, want 200: a dropped family is not an error to the client", first.Code)
+	}
+	if strings.Contains(first.Body.String(), "pg_fixture_broken") {
+		t.Fatal("the broken family was served, so the gatherer did not drop it and this proves nothing")
+	}
+
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := second.Body.String()
+
+	if !strings.Contains(body, "promhttp_metric_handler_errors_total") {
+		t.Fatalf("no count of gather failures is served, so a dropped family is invisible: %s", body)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, `promhttp_metric_handler_errors_total{cause="gathering"}`) {
+			if strings.HasSuffix(strings.TrimSpace(line), " 0") {
+				t.Errorf("the gather failure was not counted: %s", line)
+			}
+			return
+		}
+	}
+	t.Errorf("no gathering cause in the counter: %s", body)
 }

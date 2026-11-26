@@ -81,6 +81,22 @@ func NewStores() Stores {
 }
 
 func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) http.Handler {
+	// What gathering this endpoint's own metrics came to, which the response
+	// otherwise cannot say. A collector that returns an invalid metric, a
+	// duplicate or an inconsistent label set has its series dropped by the
+	// gatherer, and the request still answers 200. pg_up stays 1 and
+	// last_scrape_error stays 0, because the collection those two describe
+	// worked: what failed was turning it into a response. So a family can
+	// disappear from the output with nothing in the output saying so.
+	//
+	// It belongs to the process and not to a request, because each request
+	// builds its own registry and a counter rebuilt with it would reset on
+	// every scrape and never show the operator anything.
+	//
+	// Built once per endpoint. Registering the handler's error counter twice
+	// into one registry panics, which is the other reason this cannot live
+	// beside the per-request collectors.
+	handlerMetrics := prometheus.NewRegistry()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Refused before any SQL runs, and not queued. A queue turns an
 		// overloaded exporter into a slow one, and the scrapes waiting in it
@@ -144,9 +160,20 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 		}
 
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
-		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		//
+		// Served from both: the registry this request built, and the
+		// endpoint's own. The second is what carries the count of gathers that
+		// went wrong, so a dropped family is visible in the same response that
+		// is missing it rather than only in a log nobody is scraping.
+		//
+		// The count is cumulative and this request's own failure lands in it
+		// after this response is gathered, so an operator sees it on the next
+		// scrape. That is how a counter behaves and is why it is a counter
+		// rather than a flag for this scrape.
+		h := promhttp.HandlerFor(prometheus.Gatherers{registry, handlerMetrics}, promhttp.HandlerOpts{
 			ErrorHandling: promhttp.ContinueOnError,
 			ErrorLog:      stdlog.New(log.NewStdlibAdapter(logger), "handler", 0),
+			Registry:      handlerMetrics,
 		})
 
 		h.ServeHTTP(w, r)
