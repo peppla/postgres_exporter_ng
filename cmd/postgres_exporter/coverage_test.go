@@ -1236,6 +1236,15 @@ func TestHealthAnswersForWorkThatNeverStarted(t *testing.T) {
 			wantUp: 0, wantFailed: 1,
 		},
 		{
+			name: "one target failed at the connection while a seed had connected",
+			// The seed that connected was not retried, so its observation
+			// stands. What went wrong is in the error signal and in the
+			// per-database outcomes.
+			targets: 4, deferred: 3, connErrors: 1, errors: 1,
+			d:      discovery{ok: false, connectSuccesses: 1, connectFailures: 1},
+			wantUp: 1, wantFailed: 1,
+		},
+		{
 			name:    "one target connected and another did not",
 			targets: 2, connErrors: 1, errors: 1,
 			d:      discovery{ok: true},
@@ -1282,14 +1291,51 @@ func TestHealthAnswersForWorkThatNeverStarted(t *testing.T) {
 	}
 }
 
-// TestNoWaitAfterTheLastAttempt covers the retry loop's terminal wait.
+// TestGetServerReturnsWithoutWaitingAfterItsLastAttempt exercises the
+// connection getter itself.
 //
-// The loop returns on its next turn once the count passes the limit, so a wait
-// after the final attempt is time spent on a retry that never happens. In
-// discovery that time is spent holding a connection permit, so a login refused
-// immediately could consume the rest of a short budget and leave the whole
-// fan-out deferred.
-func TestNoWaitAfterTheLastAttempt(t *testing.T) {
+// An earlier version of this test checked only the helper that names the
+// condition, so removing the guards from both error paths in GetServer left it
+// passing. It was a test that could not fail for the thing it was written for,
+// which is the defect this project keeps finding, here in my own test.
+//
+// One attempt is allowed and the count is raised before the limit is checked,
+// so the loop returns on its next turn and a wait before that return precedes
+// no retry. The wait is attempt seconds, cut short only by the context ending,
+// and in discovery it is spent holding a connection permit. So the measurement
+// is the time GetServer takes to come back from a connection that fails at
+// once, against a context with plenty of time left: with the guards it returns
+// immediately, and without them it sits for about a second.
+func TestGetServerReturnsWithoutWaitingAfterItsLastAttempt(t *testing.T) {
+	// Long enough that the context cannot be what cuts the wait short, which
+	// would make this pass for the wrong reason.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
+		WithContext(ctx),
+		CollectorName("exporter"),
+	)
+
+	begin := time.Now()
+	server, err := e.GetServer(ctx, "postgresql://u:p@127.0.0.1:1/app?sslmode=disable")
+	took := time.Since(begin)
+
+	// The premise. Without a failure there is no final attempt to return from.
+	if err == nil {
+		if server != nil {
+			server.Close()
+		}
+		t.Fatal("the connection to a closed port succeeded, so this case proves nothing")
+	}
+	if took >= time.Second {
+		t.Errorf("the final failed attempt took %v to come back, so it waited for a retry that never happens", took)
+	}
+}
+
+// TestLastAttemptNamesTheCondition covers the comparison on its own. It is not
+// what protects the fix: the case above is.
+func TestLastAttemptNamesTheCondition(t *testing.T) {
 	for _, c := range []struct {
 		name              string
 		errCount, retries int
@@ -1331,10 +1377,28 @@ func TestASeedThatConnectedKeepsTheServerUp(t *testing.T) {
 		t.Errorf("a refused login alone gives up %v and error %v, want 0 and 1", up, failed)
 	}
 
-	// A fan-out that attempted and failed at every connection is still down,
-	// whatever discovery managed before it.
-	up, _ = health(2, 0, 2, 2, discovery{ok: true, connectSuccesses: 1})
+	// The counterexample that showed an earlier version of this rule wrong.
+	// Four targets, three deferred, and the one that was admitted failed at
+	// the connection. The good seed's own targets were never retried, so its
+	// success stands, and the failure is reported by the error signal and the
+	// per-database outcomes rather than by unmaking it.
+	up, failed = health(4, 3, 1, 1, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
+	if up != 1 || failed != 1 {
+		t.Errorf("one failed target among three deferred gives up %v and error %v, want 1 and 1", up, failed)
+	}
+
+	// The same observations with nothing admitted have to give the same
+	// answer. An aggregate that changes with how much budget was left is
+	// reporting the budget rather than the server.
+	deferredUp, _ := health(4, 4, 0, 0, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
+	if deferredUp != up {
+		t.Errorf("pg_up is %v with one target admitted and %v with none, from the same connection observations", up, deferredUp)
+	}
+
+	// A fan-out that failed at every connection with no successful discovery
+	// behind it is still down.
+	up, _ = health(2, 0, 2, 2, discovery{ok: true})
 	if up != 0 {
-		t.Errorf("pg_up is %v when every attempted database failed at the connection, want 0", up)
+		t.Errorf("pg_up is %v when every attempted database failed and nothing else connected, want 0", up)
 	}
 }

@@ -920,24 +920,21 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 // says nothing about the server either way. failed is 1 when anything went
 // wrong, discovery included.
 //
-// Discovery's successful connection counts only where the fan-out attempted
-// nothing. Where the fan-out did attempt and every attempt failed at the
-// connection, that is what the scrape observed of the databases and it is not
-// overridden by the catalogue read having worked.
+// A connection that worked counts whenever it happened, in discovery or in the
+// fan-out. An earlier version let discovery's success count only where the
+// fan-out attempted nothing, which made the answer depend on how much budget
+// was left rather than on what was observed: with four targets deferred the
+// same observations gave up 1, and admitting one target that then failed to
+// connect turned it into up 0, while the seed that had connected was never
+// retried. One context failing does not unmake another context's success, and
+// the per-database outcomes and failed below are what report the failure.
 func health(targets, deferred, connectionErrors, errors int, d discovery) (up, failed float64) {
 	// A target that was attempted and did not fail at the connection is one
-	// that connected.
-	attempted := targets - deferred
-	fanOutConnected := attempted - connectionErrors
+	// that connected, and so is a seed whose catalogue this scrape read.
+	fanOutConnected := targets - deferred - connectionErrors
 
 	switch {
-	case fanOutConnected > 0:
-		up = 1
-	case attempted == 0 && d.connectSuccesses > 0:
-		// Nothing was attempted, so the only connection this scrape made is
-		// discovery's, and it worked. Without this a seed that connected and
-		// listed its databases, followed by a second seed that was refused and
-		// a fan-out with no budget left, reported the server as down.
+	case fanOutConnected > 0 || d.connectSuccesses > 0:
 		up = 1
 	case connectionErrors > 0 || d.connectFailures > 0:
 		up = 0
