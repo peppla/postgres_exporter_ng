@@ -2,6 +2,7 @@ package rotation
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 )
@@ -354,5 +355,45 @@ func TestTheInputOrderDoesNotDecideWhoIsSkipped(t *testing.T) {
 		if first[name] != 1 {
 			t.Errorf("%s came first %d times in %d calls, want once: %v", name, first[name], len(members), first)
 		}
+	}
+}
+
+// TestASelectionThatCollapsesLeavesNothingWaiting is the case a two-member
+// test cannot reach.
+//
+// Reconciling the waiting list against the current members is the only thing
+// that keeps this store from growing, and it happens inside Next. A selection
+// that falls to one member, or to none, still has to go through it: a
+// thousand-database selection collapsing to one left nine hundred and
+// ninety-nine names waiting, and ten further calls did not shift them.
+func TestASelectionThatCollapsesLeavesNothingWaiting(t *testing.T) {
+	s := New()
+	k := Key{Engine: "collector", Target: "1", Profile: "all"}
+
+	members := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		members = append(members, strconv.Itoa(i))
+	}
+	s.Next(k, members)
+	if s.Waiting(k) != len(members)-1 {
+		t.Fatalf("a thousand members left %d waiting, so the fixture is not what this is about", s.Waiting(k))
+	}
+
+	// Down to one, ten times over.
+	for i := 0; i < 10; i++ {
+		s.Next(k, members[:1])
+	}
+	if waiting := s.Waiting(k); waiting != 0 {
+		t.Errorf("a schedule over one member is holding %d names", waiting)
+	}
+
+	// And back up, then down to none.
+	s.Next(k, members)
+	s.Next(k, nil)
+	if waiting := s.Waiting(k); waiting != 0 {
+		t.Errorf("a schedule over no members at all is holding %d names", waiting)
+	}
+	if s.Len() != 0 {
+		t.Errorf("a selection with nothing in it kept %d schedules", s.Len())
 	}
 }

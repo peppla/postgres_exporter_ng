@@ -986,7 +986,7 @@ func (e *Exporter) discoverAndCollect(ch chan<- prometheus.Metric, d *discovery)
 // Its own schedule, separate from the one the databases within a seed use: they
 // are different sets and a turn in one is not a turn in the other.
 func (e *Exporter) rotateSeeds(seeds []string) []string {
-	if len(seeds) < 2 {
+	if len(seeds) == 0 {
 		return seeds
 	}
 	members := make([]string, 0, len(seeds))
@@ -1075,7 +1075,10 @@ func health(targets, deferred, connectionErrors, errors int, d discovery) (up, f
 // A rotation and not a selection: every target is still returned, so a database
 // that gets no attempt is still reported as deferred by name.
 func (e *Exporter) rotateTargets(targets []scrapeTarget) []scrapeTarget {
-	if len(targets) < 2 {
+	// Nothing to rotate and no seed to name a schedule with, so there is also
+	// nothing this call could reconcile. One target is different: the schedule
+	// still has to be told, or the members this seed no longer has stay in it.
+	if len(targets) == 0 {
 		return targets
 	}
 

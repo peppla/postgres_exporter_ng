@@ -108,6 +108,11 @@ func New() *Store {
 //
 // A member that leaves the selection loses its place. One that joins, or that
 // has already had its turn this cycle, goes behind the ones still waiting.
+// That is what keeps this store from growing, so every call has to reach it,
+// including the ones where there is nothing to choose between. A caller that
+// skips the schedule when it has one member or none leaves the departed
+// members in it: a thousand-database selection collapsing to one left nine
+// hundred and ninety-nine names behind, and ten more calls did not shift them.
 //
 // Two requests overlapping on one schedule are served one after the other and
 // get different databases, because the choice and the record of it happen
@@ -119,9 +124,6 @@ func New() *Store {
 // nothing has still used its turn, because leaving the schedule where it was is
 // how the same databases keep being offered first.
 func (s *Store) Next(k Key, members []string) int {
-	if len(members) == 0 {
-		return 0
-	}
 	if s == nil {
 		// No schedule, so the sorted order every scrape. This is the shape
 		// that starves the tail of a set that does not fit the budget, so
@@ -131,6 +133,14 @@ func (s *Store) Next(k Key, members []string) int {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if len(members) == 0 {
+		// Nothing is selected, so nothing is waiting. Returning before this
+		// left the whole list behind: a selection that collapses to none kept
+		// every name it had, for as long as the process ran.
+		delete(s.waiting, k)
+		return 0
+	}
 
 	selected := make(map[string]struct{}, len(members))
 	for _, name := range members {

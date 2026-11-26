@@ -2033,3 +2033,49 @@ func TestTheScheduleDoesNotGrowWithDatabasesComingAndGoing(t *testing.T) {
 		}
 	}
 }
+
+// TestTheEngineReconcilesASelectionThatCollapses is the same bound at the call
+// site, which is where it was missing.
+//
+// rotateTargets returned before reaching the schedule when it had fewer than
+// two targets, so a seed whose selection fell to one database kept every name
+// it had been handed before. The store-level case cannot catch that: the
+// schedule is never told, so there is nothing for it to get wrong.
+func TestTheEngineReconcilesASelectionThatCollapses(t *testing.T) {
+	store := rotation.New()
+	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	e := NewExporter([]string{seed},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	names := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		names = append(names, fmt.Sprintf("db%04d", i))
+	}
+	big := targetsForDSN("127.0.0.1:1", names...)
+	for i := range big {
+		big[i].seed = seed
+	}
+	e.rotateTargets(big)
+
+	keys := store.Keys()
+	if len(keys) != 1 {
+		t.Fatalf("%d schedules after one scrape, want 1", len(keys))
+	}
+	if waiting := store.Waiting(keys[0]); waiting != len(big)-1 {
+		t.Fatalf("a thousand targets left %d waiting, so the fixture is not what this is about", waiting)
+	}
+
+	// The server is down to one database, and stays there.
+	for i := 0; i < 10; i++ {
+		if got := e.rotateTargets(big[:1]); len(got) != 1 {
+			t.Fatalf("one target in, %d out", len(got))
+		}
+	}
+	if waiting := store.Waiting(keys[0]); waiting != 0 {
+		t.Errorf("a seed down to one database is holding %d names in its schedule", waiting)
+	}
+}
