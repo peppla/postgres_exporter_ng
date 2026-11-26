@@ -26,6 +26,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http/httptest"
 	"net/url"
@@ -47,6 +48,7 @@ import (
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -3732,4 +3734,79 @@ func (s *IntegrationSuite) TestPublicationCollectorCoversEveryDatabase(c *C) {
 		Commentf("the publication in the connected database is missing or mislabelled: %v", found))
 	c.Check(found[therePub], Equals, other,
 		Commentf("the publication in %s was not collected, so the collector ran on one database only: %v", other, found))
+}
+
+// TestForgettingIsAuthorisedOnlyByTheServerStillHavingTheDatabase drives the
+// cleanup through real requests against a real server.
+//
+// Two databases that stop being collected for different reasons. One is
+// dropped, so the server no longer has it and its history may go. The other
+// stops accepting connections, so it leaves the eligible set while remaining in
+// the server, and its history has to stay: losing the right to connect is not
+// the same as ceasing to exist, and a read that filtered on connectability
+// could not tell them apart.
+func (s *IntegrationSuite) TestForgettingIsAuthorisedOnlyByTheServerStillHavingTheDatabase(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	admin, err := sql.Open("postgres", dsn)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const dropped, closed = "cleanup_dropped", "cleanup_closed"
+	for _, name := range []string{dropped, closed} {
+		if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+			c.Skip("cannot create databases on this server: " + err.Error())
+		}
+		defer admin.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)") // nolint: errcheck
+	}
+
+	// Discovery on, or the only database scraped is the one in the connection
+	// string and neither of the two above is ever collected.
+	previous := *autoDiscoverDatabases
+	*autoDiscoverDatabases = true
+	defer func() { *autoDiscoverDatabases = previous }()
+
+	// One handler and one set of stores for every request, because what is
+	// under test is what survives from one scrape to the next.
+	limits := budget.Defaults()
+	stores := NewStores()
+	h := Handler(log.NewNopLogger(), []string{dsn},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), stores,
+		dbselect.Absent(), dbselect.Absent())
+
+	scrape := func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics?collect[]=exporter", nil))
+		c.Assert(rec.Code, Equals, 200)
+	}
+
+	target := identityOf(dsn)
+	recorded := func(name string) bool {
+		_, ok := stores.LastSuccess.At(lastsuccess.Key{
+			Engine: lastsuccess.EngineQuery, Target: target, Database: name, Collector: "exporter",
+		})
+		return ok
+	}
+
+	// Both collected, so both have a record to lose.
+	scrape()
+	c.Assert(recorded(dropped), Equals, true,
+		Commentf("%s was never collected, so this says nothing about forgetting it", dropped))
+	c.Assert(recorded(closed), Equals, true,
+		Commentf("%s was never collected, so this says nothing about keeping it", closed))
+
+	_, err = admin.Exec("DROP DATABASE " + dropped + " WITH (FORCE)")
+	c.Assert(err, IsNil)
+	// Still on the server, and no longer connectable, which is what a filtered
+	// read cannot tell from being dropped.
+	_, err = admin.Exec("ALTER DATABASE " + closed + " WITH ALLOW_CONNECTIONS false")
+	c.Assert(err, IsNil)
+	defer admin.Exec("ALTER DATABASE " + closed + " WITH ALLOW_CONNECTIONS true") // nolint: errcheck
+
+	scrape()
+
+	c.Check(recorded(dropped), Equals, false,
+		Commentf("a database the server no longer has kept its history"))
+	c.Check(recorded(closed), Equals, true,
+		Commentf("a database that is still there lost its history because it stopped accepting connections"))
 }
