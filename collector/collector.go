@@ -513,6 +513,7 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		if err != nil {
 			level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
 		}
+		p.applyCensus(inst.dsn, sel)
 	}
 	p.reportSelection(ch, inst.name, sel, databaseLocal)
 	selected := localSelected(sel, databaseLocal)
@@ -757,6 +758,39 @@ const (
 	outcomeDeferred
 )
 
+// applyCensus hands the server's own catalogue to the store that keeps
+// per-database state, which is what authorises forgetting a database.
+//
+// This engine applies its own. The query engine applies one too, but only a
+// request that runs application queries reaches that code, and a deployment
+// collecting nothing but built-in metrics never does. State that built-in
+// monitoring creates has to be maintained by built-in monitoring.
+//
+// Only a complete, successful, unfiltered read gets this far. A read that
+// failed leaves no inventory, and a filtered one is missing a database that
+// lost CONNECT, which is absent for a reason that has nothing to do with
+// existing.
+func (p PostgresCollector) applyCensus(dsn string, sel dbSelection) {
+	if !sel.catalogRead || sel.inventory == nil {
+		return
+	}
+	seed, _ := targetid.ID(dsn)
+	databases := make(map[string]struct{}, len(sel.inventory))
+	for _, name := range sel.inventory {
+		databases[name] = struct{}{}
+	}
+	_, removed := p.lastSuccess.Apply(lastsuccess.Census{
+		Target:    seed,
+		Children:  targetid.ChildrenOf(seed),
+		Taken:     sel.taken,
+		Databases: databases,
+	})
+	if removed > 0 {
+		level.Info(p.logger).Log("msg", "Forgot databases the server no longer has",
+			"target", seed, "records", removed)
+	}
+}
+
 // collectDatabase opens one database and runs the database-local collectors
 // against it.
 //
@@ -800,6 +834,12 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		return outcomeDeferred
 	}
 	defer permit.Release()
+
+	// Held for as long as this database is being collected. A catalogue read
+	// that started before this work can finish during it, and its list is then
+	// older than whatever this is in the middle of doing. Both engines share
+	// the store, so both have to protect their work the same way.
+	defer p.lastSuccess.Hold(target)()
 
 	dbInst, err := newInstance(t.dsn)
 	if err == nil {

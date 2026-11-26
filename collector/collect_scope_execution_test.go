@@ -158,7 +158,7 @@ func TestAClusterOnlyScrapeRunsNoCatalogQuery(t *testing.T) {
 	// this engine logs, so an unexpected query is invisible to a test. An
 	// expectation that goes unmatched is not.
 	mock.ExpectQuery("FROM pg_database").WillReturnRows(
-		sqlmock.NewRows([]string{"datname", "is_current"}).AddRow("app", true))
+		sqlmock.NewRows([]string{"datname", "is_current", "eligible"}).AddRow("app", true, true))
 
 	out := collectEngine(t, engineWith(map[string]Collector{"scope_exec_cluster": quietCollector{}}))
 
@@ -198,7 +198,7 @@ func TestADatabaseScopedScrapeRunsTheCatalogQuery(t *testing.T) {
 	mock.ExpectQuery("SELECT version").WillReturnRows(
 		sqlmock.NewRows([]string{"version"}).AddRow("PostgreSQL 18.0 on x86_64-pc-linux-gnu"))
 	mock.ExpectQuery("FROM pg_database").WillReturnRows(
-		sqlmock.NewRows([]string{"datname", "is_current"}).AddRow("app", true))
+		sqlmock.NewRows([]string{"datname", "is_current", "eligible"}).AddRow("app", true, true))
 
 	out := collectEngine(t, engineWith(map[string]Collector{"scope_exec_local": quietCollector{}}))
 
@@ -228,7 +228,7 @@ func TestAClusterOnlyScrapeThatCannotConnectSelectsNoDatabase(t *testing.T) {
 
 	mock.ExpectPing().WillReturnError(errors.New("the server is not listening"))
 	mock.ExpectQuery("FROM pg_database").WillReturnRows(
-		sqlmock.NewRows([]string{"datname", "is_current"}).AddRow("app", true))
+		sqlmock.NewRows([]string{"datname", "is_current", "eligible"}).AddRow("app", true, true))
 
 	out := collectEngine(t, engineWith(map[string]Collector{"scope_exec_cluster": quietCollector{}}))
 
