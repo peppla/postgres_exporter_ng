@@ -1441,24 +1441,35 @@ func TestAGatherErrorIsCountedThroughTheHandler(t *testing.T) {
 		desc: prometheus.NewDesc("pg_fixture_broken", "a family this one takes with it",
 			[]string{"one", "two"}, nil),
 	}
+	// A healthy collector under another name, so a request can be made that
+	// gathers cleanly through the same handler. Every name a request selects
+	// has to have a collector here, since the registry registers whatever the
+	// filter names.
+	healthy := prometheus.NewGauge(prometheus.GaugeOpts{Name: "pg_fixture_healthy", Help: "a family that gathers"})
+	healthy.Set(1)
+
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
 		semaphore.NewWeighted(limits.Connections),
-		map[string]prometheus.Collector{"standard.go": broken},
+		map[string]prometheus.Collector{"standard.go": broken, "version": healthy},
 		limits, NewCollectionGate(limits), querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
 
-	get := func() string {
+	// standard.go is where the broken collector was registered, so a request
+	// that selects it gathers a failure and a request that selects something
+	// else does not. Without that difference every request here fails and the
+	// claim about surviving a clean one is never exercised.
+	get := func(selected string) string {
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/metrics?collect[]=standard.go", nil)
+		r := httptest.NewRequest(http.MethodGet, "/metrics?collect[]="+selected, nil)
 		h.ServeHTTP(w, r)
 		if w.Code != http.StatusOK {
-			t.Fatalf("the request answered %d, want 200: a dropped family is not an error to the client", w.Code)
+			t.Fatalf("the %s request answered %d, want 200: a rejected metric is not an error to the client", selected, w.Code)
 		}
 		return w.Body.String()
 	}
 
-	first := get()
+	first := get("standard.go")
 	if strings.Contains(first, "pg_fixture_broken") {
 		t.Fatal("the broken family was served, so the gatherer did not drop it and this proves nothing")
 	}
@@ -1475,20 +1486,27 @@ func TestAGatherErrorIsCountedThroughTheHandler(t *testing.T) {
 		return ""
 	}
 
-	second := gathering(get())
+	// The second failing request carries the first one's failure.
+	second := gathering(get("standard.go"))
 	if second == "" {
-		t.Fatalf("no count of gather failures is served, so a dropped family is invisible")
+		t.Fatalf("no count of gather failures is served, so a rejected metric is invisible")
 	}
-	if strings.HasSuffix(second, " 0") {
-		t.Errorf("the gather failure was not counted: %s", second)
+	if !strings.HasSuffix(second, " 1") {
+		t.Errorf("after one failed gather the count is %q, want 1", second)
 	}
 
-	// It survives a request that gathered cleanly, which is what makes it a
-	// record rather than a flag. The count comes from the endpoint and not from
-	// the registry each request builds.
-	third := gathering(get())
-	if third == "" || strings.HasSuffix(third, " 0") {
-		t.Errorf("the count did not survive a later request: %q", third)
+	// Two requests have now failed, and these two gather cleanly because they
+	// do not select the broken collector. The count has to hold at 2 across
+	// both: a reset would lose the record, and an increment on a clean gather
+	// would report a failure that did not happen.
+	for i, request := range []string{"version", "version"} {
+		clean := gathering(get(request))
+		if clean == "" {
+			t.Fatalf("clean request %d serves no count at all", i+1)
+		}
+		if !strings.HasSuffix(clean, " 2") {
+			t.Errorf("clean request %d carries %q, want 2 retained from the two failed gathers", i+1, clean)
+		}
 	}
 }
 

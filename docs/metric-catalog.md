@@ -130,6 +130,29 @@ not any collector succeeded.
 | `pg_collector_database_last_success_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When the database-local collectors this request selected last all ran on this database without error in one scrape. The selection is remembered rather than labelled: a request for a subset gets the time that subset last completed and cannot read or move another selection's time, and two scrape jobs with different `collect[]` sets are separated by their own target labels. Published on the paths that collected nothing too, so a database that is failing keeps the time it was last covered. One record per selection per database is held in the process, which is bounded by how many `collect[]` profiles are scraped. Nothing removes a record while the process runs: the store records and reads, and bounded cleanup is not implemented yet. The `target` label is this process's identity for the connection; it is not stable across restarts. |
 | `pg_collector_last_success_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When this collector last ran on this database without error. Absent for a collector this process has never run successfully there, which is not the same as one that last succeeded at the epoch. Published on the paths that run no collector too, so a database that cannot be connected to keeps the time it last worked, and omitted for a database the configuration no longer selects while that state is kept for a request that selects it again. The `target` label is this process's identity for the connection; it is not stable across restarts. |
 
+### When the response is missing something the collection produced
+
+`promhttp_metric_handler_errors_total` with `cause="gathering"` counts the
+scrapes of this endpoint whose metrics could not all be turned into a response.
+A collector that returns an invalid metric, a duplicate sample or an
+inconsistent label set has the affected metrics or samples rejected, and the
+request still answers 200.
+
+It is separate from everything else on this page. `pg_up` and
+`pg_exporter_last_scrape_error` describe reaching the databases and running the
+SQL, and both are right to report success here: the collection worked and the
+exposition did not. Without this counter a sample asked for is simply absent,
+and nothing in the response says why.
+
+Two things to know before alerting on it. The count rises on the response after
+the failure, because the handler increments once gathering has finished, so a
+failure is seen on the next scrape rather than in the body it spoiled. And one
+failed gather is one increment whatever it rejected: duplicate samples across
+three databases advance it once. How much goes missing depends on what was
+wrong. Duplicates were observed leaving the family in place with the samples
+that survived, while an invalid metric takes its family with it. Which of two
+conflicting samples survives is not something to depend on.
+
 ## database
 
 Database sizes, from `pg_database`.
