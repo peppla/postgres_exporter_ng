@@ -1474,3 +1474,82 @@ func TestAGatherErrorIsCountedWhereAnOperatorCanSeeIt(t *testing.T) {
 	}
 	t.Errorf("no gathering cause in the counter: %s", body)
 }
+
+// TestTheMasterSeedDoesNotMoveWithTheVisitingOrder covers which seed carries
+// the queries that run once per server rather than once per database.
+//
+// It used to be assigned inside the seed loop, so it was whichever seed the
+// loop reached last. That is a data race the moment discovery and collection
+// overlap, and it would move the placement as soon as the visiting order is
+// scheduled rather than fixed. The behaviour is deliberately unchanged: it is
+// still the last seed that parses, taken from the configured list instead of
+// from the order of execution.
+func TestTheMasterSeedDoesNotMoveWithTheVisitingOrder(t *testing.T) {
+	first := "postgresql://u:p@127.0.0.1:1/a?sslmode=disable"
+	second := "host=127.0.0.1 port=2 dbname=b"
+	third := "postgresql://u:p@127.0.0.1:3/c?sslmode=disable"
+
+	if got := masterSeed([]string{first, second, third}); got != third {
+		t.Errorf("the master seed is %q, want the last that parses, %q", got, third)
+	}
+
+	// A seed that parses as neither form is not a candidate, exactly as the
+	// loop skips it.
+	if got := masterSeed([]string{first, "nonsense"}); got != first {
+		t.Errorf("the master seed is %q with an unparseable seed last, want %q", got, first)
+	}
+	if got := masterSeed([]string{"nonsense"}); got != "" {
+		t.Errorf("the master seed is %q with nothing parseable, want empty", got)
+	}
+	if got := masterSeed(nil); got != "" {
+		t.Errorf("the master seed is %q with no seeds, want empty", got)
+	}
+
+	// The answer is a function of the configured list, so no visiting order
+	// can change it. Reversing the list is a different configuration and is
+	// allowed to differ; the same list must not.
+	configured := []string{first, second, third}
+	want := masterSeed(configured)
+	for i := 0; i < 8; i++ {
+		if got := masterSeed(configured); got != want {
+			t.Fatalf("the same configured list gave %q and then %q", want, got)
+		}
+	}
+}
+
+// TestDiscoverySettlesTheMasterSeedBeforeItVisitsAnything is the half that
+// matters for concurrency: the field is written once, before any seed is read,
+// rather than as each one is reached.
+//
+// It does not detect putting the assignment back inside the loop. While the
+// loop is sequential and visits the configured order, the last seed it reaches
+// is the last seed configured, so both give the same answer. What separates
+// them is a visiting order that is scheduled rather than fixed, and a reader
+// running at the same time, neither of which exists yet. The regression for
+// that belongs with the interleaving change that introduces both.
+func TestDiscoverySettlesTheMasterSeedBeforeItVisitsAnything(t *testing.T) {
+	seeds := []string{
+		"postgresql://u:p@127.0.0.1:1/a?sslmode=disable",
+		"postgresql://u:p@127.0.0.1:2/b?sslmode=disable",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	e := NewExporter(seeds,
+		WithContext(ctx),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		AutoDiscoverDatabases(true),
+		CollectorName("exporter"),
+	)
+
+	// Nothing answers at either address, so every seed fails to connect and
+	// the field cannot have been set by a successful read.
+	d := e.discoverDatabaseDSNs()
+	if d.ok {
+		t.Fatal("discovery reported success against addresses that do not answer")
+	}
+	if e.masterDSN != seeds[len(seeds)-1] {
+		t.Errorf("the master seed is %q after a discovery where nothing connected, want %q",
+			e.masterDSN, seeds[len(seeds)-1])
+	}
+}

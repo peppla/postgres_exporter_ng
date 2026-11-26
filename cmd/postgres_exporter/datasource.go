@@ -125,12 +125,49 @@ type discovery struct {
 	connectSuccesses int
 }
 
+// connstringRe superficially validates a DSN that is not a URI. The syntax is
+// complex and does not need parsing here, only a valid-looking keyword pair.
+var connstringRe = regexp.MustCompile(`^ *[a-zA-Z0-9]+ *= *[^= ]+`)
+
+// parsesAsDSN says whether a seed is one discovery will work with at all.
+//
+// The two branches are the ones the seed loop applies, and they are syntax
+// only: nothing here connects or reads.
+func parsesAsDSN(dsn string) bool {
+	if strings.HasPrefix(dsn, "postgresql://") || strings.HasPrefix(dsn, "postgres://") {
+		_, err := url.Parse(dsn)
+		return err == nil
+	}
+	return connstringRe.MatchString(dsn)
+}
+
+// masterSeed is the configured seed whose own database carries the queries that
+// run on one server rather than on each database.
+//
+// Taken from the configured list, so it does not depend on the order the seeds
+// are visited in. It used to be assigned as the loop went, which made it
+// whichever seed the loop reached last and would make it a data race as soon as
+// discovery and collection overlap, as well as moving the placement whenever
+// the visiting order changed.
+//
+// It is the last seed that parses, which is what the assignment in the loop
+// came to, not the first as the comment beside it said. That behaviour is
+// unchanged here on purpose: this makes it stable, not different.
+func masterSeed(dsns []string) string {
+	master := ""
+	for _, dsn := range dsns {
+		if parsesAsDSN(dsn) {
+			master = dsn
+		}
+	}
+	return master
+}
+
 func (e *Exporter) discoverDatabaseDSNs() discovery {
 	d := discovery{ok: true}
-	// connstring syntax is complex (and not sure if even regular).
-	// we don't need to parse it, so just superficially validate that it starts
-	// with a valid-ish keyword pair
-	connstringRe := regexp.MustCompile(`^ *[a-zA-Z0-9]+ *= *[^= ]+`)
+
+	// Settled before anything runs, and not touched again while it does.
+	e.masterDSN = masterSeed(e.dsn)
 
 	// DSN to how that database is reported. The name is empty when it is
 	// not known.
@@ -166,9 +203,6 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 			level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
 		}
 		dsns[seed] = databaseRef{server: fingerprint, identity: identityOf(seed)}
-
-		// If autoDiscoverDatabases is true, set first dsn as master database (Default: false)
-		e.masterDSN = dsn
 
 		catalog, connected, err := e.getDatabaseNames(dsn)
 		if connected {
