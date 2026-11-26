@@ -37,6 +37,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/rotation"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -1929,5 +1930,60 @@ func TestNoScheduleKeyCarriesAConnectionString(t *testing.T) {
 				t.Errorf("the schedule key's %s field is %q, which carries a connection string", field, value)
 			}
 		}
+	}
+}
+
+// TestANewerInventoryThroughEitherSeedProtectsASharedConnection is the case
+// where one connection is reached two ways.
+//
+// Two seeds can be the same server and the same role, differing only in the
+// database the seed itself opens. Each builds the same connection string for a
+// third database, so that is one connection with two seeds able to report on
+// it. If only one of them is recorded as having built it, the other's complete
+// catalogue cannot confirm it is still there, and the first one's catalogue,
+// read earlier and finishing later, removes its history.
+func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T) {
+	targetid.Clear()
+	defer targetid.Clear()
+
+	const child = "postgresql://reader:secret@db:5432/shared?sslmode=disable"
+	seedA := identityOf("postgresql://reader:secret@db:5432/one?sslmode=disable")
+	seedB := identityOf("postgresql://reader:secret@db:5432/two?sslmode=disable")
+	target := derivedIdentityOf(seedA, child, "shared")
+	if again := derivedIdentityOf(seedB, child, "shared"); again != target {
+		t.Fatalf("one connection string was given two identities, %q and %q", target, again)
+	}
+
+	store := lastsuccess.New()
+	long := time.Now().Add(-time.Hour)
+	key := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "shared"}
+	store.Record(key, long)
+
+	e := NewExporter([]string{"postgresql://reader:secret@db:5432/one?sslmode=disable"},
+		WithContext(context.Background()),
+		WithLastSuccess(store),
+		CollectorName("exporter"),
+	)
+
+	// The newer read, through the second seed, saw the database. Nothing has
+	// collected from it since, so its last success is still the old one.
+	e.applyCensus(lastsuccess.Census{
+		Target:    seedB,
+		Children:  targetid.ChildrenOf(seedB),
+		Taken:     time.Now().Add(-time.Minute),
+		Databases: nameSet([]string{"shared", "two"}),
+	})
+
+	// The older read, through the first seed, began before that one and does
+	// not list the database.
+	e.applyCensus(lastsuccess.Census{
+		Target:    seedA,
+		Children:  targetid.ChildrenOf(seedA),
+		Taken:     time.Now().Add(-30 * time.Minute),
+		Databases: nameSet([]string{"one"}),
+	})
+
+	if _, ok := store.At(key); !ok {
+		t.Error("an older catalogue removed a connection that a newer catalogue, read through the other seed that built it, had just confirmed")
 	}
 }

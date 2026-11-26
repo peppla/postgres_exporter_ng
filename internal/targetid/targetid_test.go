@@ -110,3 +110,56 @@ func TestConcurrentAssignmentIsSafe(t *testing.T) {
 		t.Errorf("one connection string produced %d identities", Len())
 	}
 }
+
+// TestATwiceDerivedConnectionBelongsToBothSeeds is what keeps a cleanup from
+// depending on one seed.
+//
+// Two seeds can open the same server as the same role, differing only in which
+// database the seed itself connects to. Each builds the same connection string
+// for a third database, which is therefore one connection reached two ways.
+// Recorded under only the first seed, the second's catalogue says nothing
+// about it: a newer complete inventory read through the second cannot confirm
+// the connection is still there, so an older inventory read through the first,
+// finishing late, removes its history. It also leaves the cleanup working only
+// while the first seed keeps being scraped.
+func TestATwiceDerivedConnectionBelongsToBothSeeds(t *testing.T) {
+	Clear()
+	defer Clear()
+
+	const child = "postgresql://reader:secret@db:5432/app?sslmode=disable"
+	first, _ := Derived("A", child, "app")
+	again, _ := Derived("B", child, "app")
+	if again != first {
+		t.Fatalf("one connection string was given two identities, %q and %q", first, again)
+	}
+
+	for _, seed := range []string{"A", "B"} {
+		children := ChildrenOf(seed)
+		if database, ok := children[first]; !ok || database != "app" {
+			t.Errorf("seed %s has children %v, and the connection it built for app is not among them", seed, children)
+		}
+	}
+	if children := ChildrenOf("C"); len(children) != 0 {
+		t.Errorf("a seed that derived nothing has children %v", children)
+	}
+}
+
+// TestADerivedConnectionIsNotConfusedWithAnother keeps the relation narrow.
+func TestADerivedConnectionIsNotConfusedWithAnother(t *testing.T) {
+	Clear()
+	defer Clear()
+
+	mine, _ := Derived("A", "postgresql://reader:secret@db:5432/app?sslmode=disable", "app")
+	// The same server and database as a different role. A role sees different
+	// tables, so this is a different connection context and its own identity.
+	theirs, _ := Derived("B", "postgresql://other:secret@db:5432/app?sslmode=disable", "app")
+	if mine == theirs {
+		t.Fatalf("two roles on one database share the identity %q", mine)
+	}
+	if _, ok := ChildrenOf("A")[theirs]; ok {
+		t.Error("one seed's children include a connection another seed built")
+	}
+	if _, ok := ChildrenOf("B")[mine]; ok {
+		t.Error("one seed's children include a connection another seed built")
+	}
+}

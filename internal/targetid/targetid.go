@@ -40,7 +40,7 @@ var (
 	mtx      sync.Mutex
 	assigned = map[string]string{}
 	last     int
-	// derived records which seed a connection was built from and which
+	// derived records which seeds a connection was built from and which
 	// database it opens, keyed by the derived identity.
 	//
 	// Kept because a seed's complete catalogue is the only thing that can
@@ -53,9 +53,18 @@ var (
 	derived = map[string]parent{}
 )
 
-// parent is the seed a derived connection came from and the database it opens.
+// parent is the seeds a derived connection came from and the database it
+// opens.
+//
+// Every seed is kept, not the first. Two seeds on one server as one role build
+// the same connection string for the same database, and that is one connection
+// with two ways into it. Keeping only the first makes the second seed's
+// catalogue unable to say anything about it, so a newer inventory read through
+// the second cannot protect the connection from an older inventory read
+// through the first, and the whole cleanup then depends on the first seed
+// continuing to be scraped.
 type parent struct {
-	seed     string
+	seeds    map[string]struct{}
 	database string
 }
 
@@ -97,19 +106,21 @@ func Len() int {
 // the derived connection opens, which the caller knows because it put the name
 // into the string.
 //
-// Calling this twice for one connection is the same as calling it once. A
-// second call with a different seed is kept as the first seed: two seeds that
-// build the same connection string are the same server reached two ways, so
-// either seed's catalogue answers for it, and the one already recorded is the
-// one whose cleanup has been reasoning about it.
+// Calling this twice for one connection adds nothing the second time. A second
+// call with a different seed adds that seed: two seeds that build the same
+// connection string reach the same server the same way, so either one's
+// catalogue answers for it, and both have to be able to.
 func Derived(seed, dsn, database string) (string, bool) {
 	id, first := ID(dsn)
 
 	mtx.Lock()
 	defer mtx.Unlock()
-	if _, ok := derived[id]; !ok {
-		derived[id] = parent{seed: seed, database: database}
+	p, ok := derived[id]
+	if !ok {
+		p = parent{seeds: map[string]struct{}{}, database: database}
+		derived[id] = p
 	}
+	p.seeds[seed] = struct{}{}
 	return id, first
 }
 
@@ -124,7 +135,7 @@ func ChildrenOf(seed string) map[string]string {
 	defer mtx.Unlock()
 	out := map[string]string{}
 	for id, p := range derived {
-		if p.seed == seed {
+		if _, ok := p.seeds[seed]; ok {
 			out[id] = p.database
 		}
 	}
