@@ -88,6 +88,12 @@ type databaseRef struct {
 // parsing a connection string.
 type scrapeTarget struct {
 	dsn string
+	// seed is the configured connection this target was discovered through.
+	//
+	// Kept because the databases of one seed are scheduled together: a
+	// schedule handed one seed's members forgets every member of the others,
+	// so each seed needs its own.
+	seed string
 	databaseRef
 }
 
@@ -233,7 +239,7 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 		// because the connection to it is how the query was attempted, and it
 		// is already in the map. Returning nothing here would drop it.
 		d.discovered++
-		return targetsOf(dsns)
+		return targetsOf(seed, dsns)
 	}
 	d.discovered += len(catalog)
 	if name, found := currentName(catalog); found {
@@ -275,16 +281,16 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 		dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: identityOf(dsn)}
 	}
 
-	return targetsOf(dsns)
+	return targetsOf(seed, dsns)
 }
 
 // targetsOf turns the seed's map into targets in a fixed order. Map iteration
 // order is random, and a random order makes a failure report read differently
 // every scrape for no reason.
-func targetsOf(dsns map[string]databaseRef) []scrapeTarget {
+func targetsOf(seed string, dsns map[string]databaseRef) []scrapeTarget {
 	targets := make([]scrapeTarget, 0, len(dsns))
 	for dsn, ref := range dsns {
-		targets = append(targets, scrapeTarget{dsn: dsn, databaseRef: ref})
+		targets = append(targets, scrapeTarget{dsn: dsn, seed: seed, databaseRef: ref})
 	}
 	sortTargets(targets)
 	return targets

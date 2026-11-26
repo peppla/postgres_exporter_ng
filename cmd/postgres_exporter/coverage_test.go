@@ -1699,3 +1699,113 @@ func stalledEndpoint(t *testing.T) (dsn string, stop func()) {
 		<-done
 	}
 }
+
+// TestEachSeedKeepsItsOwnDatabaseSchedule is the fifth draft regression.
+//
+// A scrape that discovers one seed at a time hands the schedule one seed's
+// databases at a time. A schedule told only those members drops every member it
+// is not told about, so the other seed's waiting turns were thrown away and
+// restarted on every request. Over eight requests with three databases in each
+// of two seeds, only two of each seed's three were ever offered first.
+func TestEachSeedKeepsItsOwnDatabaseSchedule(t *testing.T) {
+	const requests = 9
+
+	store := rotation.New()
+	seeds := []string{
+		"postgresql://u:p@host_a:5432/app?sslmode=disable",
+		"postgresql://u:p@host_b:5432/app?sslmode=disable",
+	}
+	e := NewExporter(seeds,
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	batchOf := func(seed, host string) []scrapeTarget {
+		out := targetsForDSN(host, "a", "b", "c")
+		for i := range out {
+			out[i].seed = seed
+		}
+		return out
+	}
+
+	firstOf := map[string]map[string]int{seeds[0]: {}, seeds[1]: {}}
+	for request := 0; request < requests; request++ {
+		// Each seed's databases are handed over on their own, which is what
+		// the interleaved scrape does.
+		for i, host := range []string{"host_a:5432", "host_b:5432"} {
+			batch := e.rotateTargets(batchOf(seeds[i], host))
+			if len(batch) != 3 {
+				t.Fatalf("request %d seed %d returned %d of 3 targets", request, i, len(batch))
+			}
+			firstOf[seeds[i]][batch[0].datname]++
+		}
+	}
+
+	for seed, counts := range firstOf {
+		if len(counts) != 3 {
+			t.Errorf("over %d requests seed %s offered only %v first, want all three databases a turn",
+				requests, seed, counts)
+		}
+	}
+}
+
+// TestTwoSeedsOnOneServerDoNotSelectTheSameDatabaseTwice is the fourth.
+//
+// One shared map across all seeds used to drop the repeat. Per-seed maps
+// appended together do not, so two configured seeds with the same credentials
+// on the same server and different connection databases selected and collected
+// the same database twice.
+func TestTwoSeedsOnOneServerDoNotSelectTheSameDatabaseTwice(t *testing.T) {
+	seen := map[string]struct{}{}
+	var kept []scrapeTarget
+	for _, batch := range [][]scrapeTarget{
+		targetsForDSN("127.0.0.1:1", "app", "shared"),
+		targetsForDSN("127.0.0.1:1", "other", "shared"),
+	} {
+		for _, target := range batch {
+			if _, repeat := seen[target.dsn]; repeat {
+				continue
+			}
+			seen[target.dsn] = struct{}{}
+			kept = append(kept, target)
+		}
+	}
+	if len(kept) != 3 {
+		names := []string{}
+		for _, k := range kept {
+			names = append(names, k.datname)
+		}
+		t.Errorf("two seeds sharing a database yielded %d targets, %v, want 3", len(kept), names)
+	}
+}
+
+// TestAnEarlierSeedKeepsItsOutcomeWhenALaterOneIsSelected is the third.
+//
+// setSelection clears every per-database sample, which is right when the whole
+// selection arrives at once. Called again for the next seed it erased what the
+// seeds before it had already collected, so a database reported as covered by
+// the counts reported 0 for itself.
+func TestAnEarlierSeedKeepsItsOutcomeWhenALaterOneIsSelected(t *testing.T) {
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
+
+	first := targetsForDSN("127.0.0.1:1", "one")
+	c.setSelection(true, true, 1, first, nil, 0)
+	c.setDatabaseOutcome(first[0].databaseRef, "")
+
+	// The next seed arrives and extends the selection.
+	both := append(append([]scrapeTarget{}, first...), targetsForDSN("127.0.0.1:2", "two")...)
+	c.extendSelection(true, true, 2, both, nil, 0)
+
+	g := series(t, c)
+	if g["pg_exporter_database_scrape_success{datname=one,server=127.0.0.1:1}"] != 1 {
+		t.Errorf("the database collected before the next seed was read reports 0: %v", g)
+	}
+	if g["pg_exporter_database_scrape_success{datname=two,server=127.0.0.1:2}"] != 0 {
+		t.Errorf("a database not collected yet does not report 0: %v", g)
+	}
+	if g["pg_exporter_databases_selected"] != 2 {
+		t.Errorf("the selected count is %v, want 2", g["pg_exporter_databases_selected"])
+	}
+}

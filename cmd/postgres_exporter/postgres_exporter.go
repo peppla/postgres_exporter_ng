@@ -884,12 +884,18 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	e.totalScrapes.Inc()
 
-	d := discovery{ok: true, discovered: len(e.dsn)}
 	if e.autoDiscoverDatabases {
+		// Counted from zero, because every database here comes from a
+		// catalogue read. Starting from the seed count adds each seed twice.
+		d := discovery{ok: true}
 		errorsCount, connectionErrorsCount, deferredCount := e.discoverAndCollect(ch, &d)
 		e.finishScrape(d, errorsCount, connectionErrorsCount, deferredCount)
 		return
 	}
+
+	// No discovery, so the seeds themselves are the databases and the count is
+	// how many were configured.
+	d := discovery{ok: true, discovered: len(e.dsn)}
 	{
 		// No discovery, so no catalog and no names. The targets are the
 		// configured DSNs as given, identified by server only.
@@ -930,16 +936,43 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 // The intent is recorded as each seed yields it rather than once at the end, so
 // a scrape cut short still reports what it had meant to cover.
 func (e *Exporter) discoverAndCollect(ch chan<- prometheus.Metric, d *discovery) (failed, connectionFailures, deferred int) {
+	// Settled before any seed is read, and not touched while they are. The
+	// other discovery entry point does this too, and this path does not go
+	// through it.
+	e.masterDSN = masterSeed(e.dsn)
+
+	// Across seeds, not within one. Two configured seeds with the same
+	// credentials on the same server and different connection databases
+	// discover the same databases, and the old single map dropped the repeat.
+	// Per-seed maps appended together do not, so the same database was
+	// selected and collected twice.
+	seen := make(map[string]struct{})
+
+	// Every database this request will walk, as the schedule names them. Each
+	// seed's batch is scheduled against the whole request's membership rather
+	// than against its own, because a key fed one seed's members forgets the
+	// other seed's waiting turns and restarts them.
 	for _, seed := range e.rotateSeeds(e.dsn) {
 		if e.onSeedRead != nil {
 			e.onSeedRead(seed)
 		}
-		targets := e.discoverSeed(seed, d)
-		d.targets = append(d.targets, targets...)
-		sortTargets(d.targets)
-		e.coverage.setSelection(true, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
 
-		f, c, def := e.scrapeTargets(ch, targets)
+		batch := make([]scrapeTarget, 0, 8)
+		for _, t := range e.discoverSeed(seed, d) {
+			if _, repeat := seen[t.dsn]; repeat {
+				continue
+			}
+			seen[t.dsn] = struct{}{}
+			batch = append(batch, t)
+		}
+
+		d.targets = append(d.targets, batch...)
+		sortTargets(d.targets)
+		// Extended, not replaced. Setting the selection again for the next
+		// seed used to clear the outcomes the seeds before it had recorded.
+		e.coverage.extendSelection(true, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
+
+		f, c, def := e.scrapeTargets(ch, batch)
 		failed += f
 		connectionFailures += c
 		deferred += def
@@ -1046,12 +1079,23 @@ func (e *Exporter) rotateTargets(targets []scrapeTarget) []scrapeTarget {
 		return targets
 	}
 
+	// Keyed by the seed these targets came from, not by the whole request.
+	//
+	// A scrape that discovers one seed at a time hands this one seed's
+	// databases at a time, and a schedule told only those members drops every
+	// member it is not told about. So the other seed's waiting turns were
+	// thrown away and restarted on every request, and a third database in each
+	// seed was never offered first across eight of them.
+	//
+	// One schedule per seed keeps each seed's own waiting list, and the seed
+	// order has a schedule of its own above this.
+	seed := targets[0].seed
 	members := make([]string, 0, len(targets))
 	for _, t := range targets {
 		members = append(members, t.identity)
 	}
 
-	key := rotation.Key{Engine: "query", Target: e.scheduleTarget(), Profile: e.collectorName}
+	key := rotation.Key{Engine: "query", Target: e.scheduleTarget() + " " + seed, Profile: e.collectorName}
 	out := make([]scrapeTarget, 0, len(targets))
 	for _, i := range rotation.Order(e.rotation.Next(key, members), len(targets)) {
 		out = append(out, targets[i])
@@ -1088,8 +1132,7 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 	var deferredCount atomic.Int32
 
 	// Rotated, so the database offered the first attempt is not the same one
-	// every scrape. Per server, because one call can carry targets discovered
-	// from several seed DSNs and a schedule is about one server's selected set.
+	// every scrape.
 	targets = e.rotateTargets(targets)
 
 	// A fixed number of workers, each taking the next database as it finishes

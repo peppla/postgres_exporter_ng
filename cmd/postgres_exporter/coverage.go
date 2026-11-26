@@ -112,6 +112,7 @@
 package main
 
 import (
+	"sync"
 	"time"
 
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
@@ -124,7 +125,16 @@ type coverageMetrics struct {
 	// this set of metrics belongs to, because one store serves them all and
 	// they succeed and fail independently.
 	lastSuccess *lastsuccess.Store
-	job         string
+
+	// outcomeKnown names the databases this scrape has already recorded an
+	// outcome for, so a selection that grows one seed at a time does not
+	// overwrite them with the "nothing known yet" value.
+	//
+	// Guarded because the fan-out records outcomes from its workers while the
+	// seed after it is being read.
+	outcomeMu    sync.Mutex
+	outcomeKnown map[databaseRef]struct{}
+	job          string
 
 	discoveryEnabled prometheus.Gauge
 	discoverySuccess prometheus.Gauge
@@ -210,22 +220,54 @@ func newCoverageMetrics(constLabels prometheus.Labels, lastSuccess *lastsuccess.
 // and emits these gauges only after it returns, so a client whose HTTP request
 // times out receives nothing at all -- intent included. Setting the values
 // first keeps them correct with respect to the work, and nothing more.
+// extendSelection records a selection that is still growing, for a scrape that
+// discovers one seed at a time and collects as it goes.
+//
+// It leaves the outcomes already recorded alone. setSelection clears them,
+// which is right when the whole selection arrives at once and wrong here: the
+// seeds read earlier have already been collected, and clearing their samples
+// reports them as uncovered while the aggregate counts them as covered.
+//
+// A database that has gone still stops being reported, because the clear
+// happens once at the start of the scrape rather than once per seed.
+func (c *coverageMetrics) extendSelection(discoveryEnabled, discoverySuccess bool, discovered int, targets []scrapeTarget, excluded []databaseRef, notIncluded int) {
+	c.selectionTotals(discoveryEnabled, discoverySuccess, discovered, targets, excluded, notIncluded)
+	c.selectionSamples(targets, excluded)
+}
+
 func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, discovered int, targets []scrapeTarget, excluded []databaseRef, notIncluded int) {
-	c.discoveryEnabled.Set(boolToFloat(discoveryEnabled))
-	c.discoverySuccess.Set(boolToFloat(discoverySuccess))
-	c.discovered.Set(float64(discovered))
-	c.selected.Set(float64(len(targets)))
-	c.excluded.Set(float64(len(excluded) + notIncluded))
+	c.selectionTotals(discoveryEnabled, discoverySuccess, discovered, targets, excluded, notIncluded)
 
 	// Reset before setting, so a database that is gone stops being reported
 	// instead of keeping the value it had when it was last seen.
+	c.resetDatabaseSamples()
+	c.selectionSamples(targets, excluded)
+}
+
+// resetDatabaseSamples drops every per-database series, so the scrape that
+// follows reports what it finds rather than what was there before.
+func (c *coverageMetrics) resetDatabaseSamples() {
+	c.outcomeMu.Lock()
+	c.outcomeKnown = map[databaseRef]struct{}{}
+	c.outcomeMu.Unlock()
+
 	c.databaseLastSuccess.Reset()
 	c.databaseSelected.Reset()
 	c.databaseSuccess.Reset()
 	c.databaseError.Reset()
 	c.databaseDeferred.Reset()
 	c.databaseExcluded.Reset()
+}
 
+func (c *coverageMetrics) selectionTotals(discoveryEnabled, discoverySuccess bool, discovered int, targets []scrapeTarget, excluded []databaseRef, notIncluded int) {
+	c.discoveryEnabled.Set(boolToFloat(discoveryEnabled))
+	c.discoverySuccess.Set(boolToFloat(discoverySuccess))
+	c.discovered.Set(float64(discovered))
+	c.selected.Set(float64(len(targets)))
+	c.excluded.Set(float64(len(excluded) + notIncluded))
+}
+
+func (c *coverageMetrics) selectionSamples(targets []scrapeTarget, excluded []databaseRef) {
 	for _, t := range targets {
 		if t.datname == "" {
 			// Not known before the connection is open, and a connection that
@@ -248,7 +290,16 @@ func (c *coverageMetrics) setSelection(discoveryEnabled, discoverySuccess bool, 
 		}
 		// Assume nothing until the outcome is known. A scrape cut short
 		// leaves this at 0, which is the honest reading: it was not covered.
-		c.databaseSuccess.WithLabelValues(t.server, t.datname).Set(0)
+		//
+		// Only where nothing is known yet. A seed collected earlier in this
+		// same scrape has its outcome already, and overwriting it would report
+		// a covered database as uncovered while the counts say otherwise.
+		c.outcomeMu.Lock()
+		_, recorded := c.outcomeKnown[t.databaseRef]
+		c.outcomeMu.Unlock()
+		if !recorded {
+			c.databaseSuccess.WithLabelValues(t.server, t.datname).Set(0)
+		}
 	}
 	for _, ref := range excluded {
 		c.databaseExcluded.WithLabelValues(ref.server, ref.datname, reasonExcludeList).Set(1)
@@ -261,6 +312,12 @@ func (c *coverageMetrics) setDatabaseOutcome(ref databaseRef, reason string) {
 	if ref.datname == "" {
 		return
 	}
+	c.outcomeMu.Lock()
+	if c.outcomeKnown == nil {
+		c.outcomeKnown = map[databaseRef]struct{}{}
+	}
+	c.outcomeKnown[ref] = struct{}{}
+	c.outcomeMu.Unlock()
 	if reason == "" {
 		c.databaseSuccess.WithLabelValues(ref.server, ref.datname).Set(1)
 		// Recorded against the connection rather than the host and port,
