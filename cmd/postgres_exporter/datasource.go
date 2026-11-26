@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
@@ -222,6 +223,11 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 	}
 	dsns[seed] = databaseRef{server: fingerprint, identity: identityOf(seed)}
 
+	// Before the read, not after it. What this may authorise forgetting is
+	// what was already there when it began looking, and a read that finishes
+	// late must not erase a record a newer scrape has just written.
+	taken := time.Now()
+
 	catalog, connected, err := e.getDatabaseNames(dsn)
 	if connected {
 		d.connectSuccesses++
@@ -258,6 +264,16 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 		// no name to report it under and inventing one would be worse.
 		d.discovered++
 	}
+
+	// A complete, successful read of every database the server has. Only this
+	// can authorise forgetting one: a name missing from a filtered read may
+	// have lost CONNECT, and a name missing from a failed or partial read was
+	// never looked for. Every path above this returns before reaching here.
+	e.forgetDatabasesTheServerNoLongerHas(lastsuccess.Census{
+		Target:    identityOf(seed),
+		Taken:     taken,
+		Databases: nameSet(inventory(catalog)),
+	})
 
 	sel := dbselect.Apply(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
 	for _, name := range sel.Excluded {
@@ -303,6 +319,27 @@ func targetsOf(seed string, dsns map[string]databaseRef) []scrapeTarget {
 // sortTargets puts targets in a fixed order.
 func sortTargets(targets []scrapeTarget) {
 	sort.Slice(targets, func(i, j int) bool { return targets[i].dsn < targets[j].dsn })
+}
+
+// forgetDatabasesTheServerNoLongerHas hands a census to the stores that keep
+// per-database state.
+//
+// Separate from the read so the refusal is in one place: a caller that has
+// anything less than a complete successful inventory does not reach it.
+func (e *Exporter) forgetDatabasesTheServerNoLongerHas(c lastsuccess.Census) {
+	if removed := e.lastSuccess.Forget(c); removed > 0 {
+		level.Info(logger).Log("msg", "Forgot databases the server no longer has",
+			"target", c.Target, "records", removed)
+	}
+}
+
+// nameSet turns a list of database names into a set.
+func nameSet(names []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		out[name] = struct{}{}
+	}
+	return out
 }
 
 // identityOf returns this process's identity for a connection string, logging

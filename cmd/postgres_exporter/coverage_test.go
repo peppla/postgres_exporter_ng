@@ -1809,3 +1809,68 @@ func TestAnEarlierSeedKeepsItsOutcomeWhenALaterOneIsSelected(t *testing.T) {
 		t.Errorf("the selected count is %v, want 2", g["pg_exporter_databases_selected"])
 	}
 }
+
+// TestOnlyACompleteCatalogueReadAuthorisesForgetting walks the paths through
+// discoverSeed that reach the census and the ones that do not.
+//
+// A database is forgotten only when the server was read completely and
+// successfully and the database was not in what came back. Every other outcome,
+// including a failed read, leaves the history alone, because absence from a
+// read that did not finish is not evidence of anything.
+func TestOnlyACompleteCatalogueReadAuthorisesForgetting(t *testing.T) {
+	store := lastsuccess.New()
+	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	target := identityOf(seed)
+	long := time.Now().Add(-time.Hour)
+	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "gone"}, long)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	e := NewExporter([]string{seed},
+		WithContext(ctx),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		AutoDiscoverDatabases(true),
+		WithLastSuccess(store),
+		CollectorName("exporter"),
+	)
+
+	// Nothing answers at that address, so the catalogue read fails. The
+	// database is absent from a read that did not happen, which authorises
+	// nothing.
+	d := discovery{ok: true}
+	e.discoverSeed(seed, &d)
+
+	if _, ok := store.At(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "gone"}); !ok {
+		t.Error("a failed catalogue read erased a database's history")
+	}
+	if d.ok {
+		t.Fatal("the fixture's read succeeded, so this says nothing about a failed one")
+	}
+}
+
+// TestACensusFromOneConnectionLeavesAnotherAlone is the ownership rule at the
+// level the engine applies it.
+func TestACensusFromOneConnectionLeavesAnotherAlone(t *testing.T) {
+	store := lastsuccess.New()
+	long := time.Now().Add(-time.Hour)
+	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1", Database: "gone"}, long)
+	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "2", Database: "gone"}, long)
+
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
+		WithContext(context.Background()),
+		WithLastSuccess(store),
+		CollectorName("exporter"),
+	)
+	e.forgetDatabasesTheServerNoLongerHas(lastsuccess.Census{
+		Target:    "1",
+		Taken:     time.Now(),
+		Databases: nameSet([]string{"kept"}),
+	})
+
+	if _, ok := store.At(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1", Database: "gone"}); ok {
+		t.Error("the census's own connection kept a database the server does not have")
+	}
+	if _, ok := store.At(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "2", Database: "gone"}); !ok {
+		t.Error("a census read through one connection removed another connection's record")
+	}
+}

@@ -193,3 +193,64 @@ func (s *Store) Len() int {
 	defer s.mtx.Unlock()
 	return len(s.seen)
 }
+
+// Census is one complete, successful reading of what a server contains.
+//
+// It carries the moment it was started rather than the moment it finished,
+// because what it may remove is what was already there when it began looking.
+// A record written or updated while it was reading is newer than anything it
+// saw, and a census that finished late must not erase what a later scrape has
+// just established.
+type Census struct {
+	// Target is the connection this was read through. Removal applies only to
+	// records of that connection: an identical host, port or database name is
+	// not the same connection context and says nothing about its history.
+	Target string
+	// Taken is when the read started.
+	Taken time.Time
+	// Databases is every database the server reported, whether or not this
+	// role may collect from it. A filtered list cannot authorise removal,
+	// because a database that lost CONNECT is absent from it for a reason that
+	// has nothing to do with existing.
+	Databases map[string]struct{}
+}
+
+// Forget removes what a census proves is gone.
+//
+// A record is removed only when all of these hold. Its connection is the one
+// the census was read through. Its database is not in the census. And it has
+// not been touched since the census began, so nothing newer is being discarded.
+//
+// Every profile of that connection is covered, including profiles nothing is
+// scraping now. Leaving a dropped database behind under an idle profile would
+// make the cleanup do nothing in the case it exists for, and a narrow request
+// still cannot remove a wider profile's records, because what decides is the
+// database rather than the selection.
+//
+// It returns how many records it removed, which is what a caller can report.
+func (s *Store) Forget(c Census) int {
+	if s == nil || c.Target == "" || c.Databases == nil {
+		return 0
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	removed := 0
+	for key, when := range s.seen {
+		if key.Target != c.Target || key.Database == "" {
+			continue
+		}
+		if _, present := c.Databases[key.Database]; present {
+			continue
+		}
+		if !when.Before(c.Taken) {
+			// Written or updated since the census began, so the census never
+			// saw whatever this is about.
+			continue
+		}
+		delete(s.seen, key)
+		removed++
+	}
+	return removed
+}
