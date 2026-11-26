@@ -1174,6 +1174,14 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				return
 			}
 			defer permit.Release()
+
+			// Held for as long as this database is being collected. A
+			// catalogue read that started before this work can finish during
+			// it, and its list is then older than whatever this is in the
+			// middle of doing. A database being collected right now is not one
+			// to decide is gone.
+			defer e.lastSuccess.Hold(target.identity)()
+
 			if e.onTargetCollected != nil {
 				e.onTargetCollected(target.dsn)
 			}

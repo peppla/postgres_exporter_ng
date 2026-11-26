@@ -1853,24 +1853,30 @@ func TestOnlyACompleteCatalogueReadAuthorisesForgetting(t *testing.T) {
 func TestACensusFromOneConnectionLeavesAnotherAlone(t *testing.T) {
 	store := lastsuccess.New()
 	long := time.Now().Add(-time.Hour)
-	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1", Database: "gone"}, long)
-	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "2", Database: "gone"}, long)
+	// Two seeds, each with its own connection to a database called gone. The
+	// records are under those connections, which is where a discovered
+	// database's records live.
+	mine := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1/gone", Database: "gone"}
+	theirs := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "2/gone", Database: "gone"}
+	store.Record(mine, long)
+	store.Record(theirs, long)
 
 	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
 		WithContext(context.Background()),
 		WithLastSuccess(store),
 		CollectorName("exporter"),
 	)
-	e.forgetDatabasesTheServerNoLongerHas(lastsuccess.Census{
+	e.applyCensus(lastsuccess.Census{
 		Target:    "1",
+		Children:  map[string]string{"1/gone": "gone"},
 		Taken:     time.Now(),
 		Databases: nameSet([]string{"kept"}),
 	})
 
-	if _, ok := store.At(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1", Database: "gone"}); ok {
+	if _, ok := store.At(mine); ok {
 		t.Error("the census's own connection kept a database the server does not have")
 	}
-	if _, ok := store.At(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "2", Database: "gone"}); !ok {
+	if _, ok := store.At(theirs); !ok {
 		t.Error("a census read through one connection removed another connection's record")
 	}
 }

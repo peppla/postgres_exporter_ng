@@ -50,6 +50,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -3780,8 +3781,20 @@ func (s *IntegrationSuite) TestForgettingIsAuthorisedOnlyByTheServerStillHavingT
 		c.Assert(rec.Code, Equals, 200)
 	}
 
-	target := identityOf(dsn)
-	recorded := func(name string) bool {
+	// A discovered database is collected over its own connection, so its
+	// record is under that connection's identity and not under the seed's.
+	// Looking under the seed finds nothing for any discovered database, which
+	// makes every assertion below pass against a cleanup that removes nothing.
+	seed := identityOf(dsn)
+	connectionTo := func(name string) (string, bool) {
+		for id, database := range targetid.ChildrenOf(seed) {
+			if database == name {
+				return id, true
+			}
+		}
+		return "", false
+	}
+	recorded := func(target, name string) bool {
 		_, ok := stores.LastSuccess.At(lastsuccess.Key{
 			Engine: lastsuccess.EngineQuery, Target: target, Database: name, Collector: "exporter",
 		})
@@ -3790,9 +3803,15 @@ func (s *IntegrationSuite) TestForgettingIsAuthorisedOnlyByTheServerStillHavingT
 
 	// Both collected, so both have a record to lose.
 	scrape()
-	c.Assert(recorded(dropped), Equals, true,
+	droppedTarget, ok := connectionTo(dropped)
+	c.Assert(ok, Equals, true,
+		Commentf("no connection was built for %s, so it was never discovered", dropped))
+	closedTarget, ok := connectionTo(closed)
+	c.Assert(ok, Equals, true,
+		Commentf("no connection was built for %s, so it was never discovered", closed))
+	c.Assert(recorded(droppedTarget, dropped), Equals, true,
 		Commentf("%s was never collected, so this says nothing about forgetting it", dropped))
-	c.Assert(recorded(closed), Equals, true,
+	c.Assert(recorded(closedTarget, closed), Equals, true,
 		Commentf("%s was never collected, so this says nothing about keeping it", closed))
 
 	_, err = admin.Exec("DROP DATABASE " + dropped + " WITH (FORCE)")
@@ -3805,8 +3824,93 @@ func (s *IntegrationSuite) TestForgettingIsAuthorisedOnlyByTheServerStillHavingT
 
 	scrape()
 
-	c.Check(recorded(dropped), Equals, false,
+	c.Check(recorded(droppedTarget, dropped), Equals, false,
 		Commentf("a database the server no longer has kept its history"))
-	c.Check(recorded(closed), Equals, true,
+	c.Check(recorded(closedTarget, closed), Equals, true,
 		Commentf("a database that is still there lost its history because it stopped accepting connections"))
+}
+
+// TestARecreatedDatabaseDoesNotInheritTheOldOnesHistory is the shape the
+// cleanup was found missing in.
+//
+// A database is dropped, a scrape reads a catalogue that confirms it is gone,
+// and then a database of the same name is created. It is a different database:
+// a different object with a different OID and none of the old one's contents.
+// If the drop did not remove the old history, the new database reports a last
+// success it never had, and it reports it while failing.
+func (s *IntegrationSuite) TestARecreatedDatabaseDoesNotInheritTheOldOnesHistory(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	admin, err := sql.Open("postgres", dsn)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const name = "cleanup_recreated"
+	if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+		c.Skip("cannot create databases on this server: " + err.Error())
+	}
+	defer admin.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)") // nolint: errcheck
+
+	previous := *autoDiscoverDatabases
+	*autoDiscoverDatabases = true
+	defer func() { *autoDiscoverDatabases = previous }()
+
+	limits := budget.Defaults()
+	stores := NewStores()
+	h := Handler(log.NewNopLogger(), []string{dsn},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), stores,
+		dbselect.Absent(), dbselect.Absent())
+
+	scrape := func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics?collect[]=exporter", nil))
+		c.Assert(rec.Code, Equals, 200)
+	}
+
+	seed := identityOf(dsn)
+	connectionTo := func(database string) (string, bool) {
+		for id, d := range targetid.ChildrenOf(seed) {
+			if d == database {
+				return id, true
+			}
+		}
+		return "", false
+	}
+	at := func(target string) (time.Time, bool) {
+		return stores.LastSuccess.At(lastsuccess.Key{
+			Engine: lastsuccess.EngineQuery, Target: target, Database: name, Collector: "exporter",
+		})
+	}
+
+	scrape()
+	target, ok := connectionTo(name)
+	c.Assert(ok, Equals, true, Commentf("no connection was built for %s, so it was never discovered", name))
+	before, ok := at(target)
+	c.Assert(ok, Equals, true,
+		Commentf("%s was never collected, so this says nothing about what a recreated one inherits", name))
+
+	_, err = admin.Exec("DROP DATABASE " + name + " WITH (FORCE)")
+	c.Assert(err, IsNil)
+
+	// One complete catalogue read with the database absent. This is what
+	// authorises removing it, and nothing before this point does.
+	scrape()
+	if _, ok := at(target); ok {
+		c.Fatalf("%s kept its history through a scrape that read a catalogue without it", name)
+	}
+
+	_, err = admin.Exec("CREATE DATABASE " + name)
+	c.Assert(err, IsNil)
+
+	// The connection string is the same, so the new database is reached over
+	// the same connection and would read any history left under it.
+	again, ok := connectionTo(name)
+	c.Assert(ok, Equals, true)
+	c.Assert(again, Equals, target,
+		Commentf("the recreated database got a different connection identity, so this no longer tests inheritance"))
+
+	after, ok := at(target)
+	if ok && !after.After(before) {
+		c.Fatalf("the recreated %s reports a last success of %v, which belongs to the database that was dropped", name, after)
+	}
 }

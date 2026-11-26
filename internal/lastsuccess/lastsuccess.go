@@ -106,12 +106,35 @@ const (
 // goroutines at once.
 type Store struct {
 	mtx  sync.Mutex
-	seen map[Key]time.Time
+	seen map[Key]record
+	// held counts the scrapes currently working on each target, so a cleanup
+	// cannot remove the history of work that is still running.
+	held map[string]int
+}
+
+// record is what is kept about one key.
+//
+// The two times answer different questions and only one of them is public. A
+// success is the operator's answer to how long since this worked. A
+// confirmation is this process noting that a complete catalogue still listed
+// the database, which says nothing about whether collecting from it worked.
+//
+// They are separate because a cleanup needs to know the database was still
+// there a moment ago, and the only way to say that with one field would be to
+// move the success time forward on work that did not succeed. The exported
+// staleness would then stop being true at exactly the point an operator is
+// reading it to find out what is broken.
+type record struct {
+	// success is when this key was last collected without error.
+	success time.Time
+	// confirmed is the generation of the newest complete inventory that
+	// listed this key's database.
+	confirmed time.Time
 }
 
 // New returns an empty store.
 func New() *Store {
-	return &Store{seen: make(map[Key]time.Time)}
+	return &Store{seen: make(map[Key]record), held: map[string]int{}}
 }
 
 // Record notes that this key was collected without error at t.
@@ -124,10 +147,12 @@ func (s *Store) Record(key Key, t time.Time) {
 	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if previous, ok := s.seen[key]; ok && !t.After(previous) {
+	previous := s.seen[key]
+	if !previous.success.IsZero() && !t.After(previous.success) {
 		return
 	}
-	s.seen[key] = t
+	previous.success = t
+	s.seen[key] = previous
 }
 
 // At returns when this key last succeeded, and whether it ever has.
@@ -141,8 +166,14 @@ func (s *Store) At(key Key) (time.Time, bool) {
 	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	t, ok := s.seen[key]
-	return t, ok
+	rec, ok := s.seen[key]
+	if !ok || rec.success.IsZero() {
+		// A key that has only ever been confirmed present has never
+		// succeeded, and saying otherwise would publish a zero time as a
+		// collection that worked in 1970.
+		return time.Time{}, false
+	}
+	return rec.success, true
 }
 
 // Latest returns the most recent success for a target and job, with the
@@ -167,12 +198,15 @@ func (s *Store) Latest(engine string, about Level, target, collector string) (st
 	var database string
 	var newest time.Time
 	var found bool
-	for key, t := range s.seen {
+	for key, rec := range s.seen {
 		if key.Engine != engine || key.About != about || key.Target != target || key.Collector != collector {
 			continue
 		}
-		if !found || t.After(newest) {
-			database, newest, found = key.Database, t, true
+		if rec.success.IsZero() {
+			continue
+		}
+		if !found || rec.success.After(newest) {
+			database, newest, found = key.Database, rec.success, true
 		}
 	}
 	return database, newest, found
@@ -202,10 +236,23 @@ func (s *Store) Len() int {
 // saw, and a census that finished late must not erase what a later scrape has
 // just established.
 type Census struct {
-	// Target is the connection this was read through. Removal applies only to
-	// records of that connection: an identical host, port or database name is
-	// not the same connection context and says nothing about its history.
+	// Target is the seed this was read through, as its identity. Its own
+	// records are covered, by the database each one names.
 	Target string
+	// Children is every connection built from that seed, as identity to the
+	// database it opens.
+	//
+	// This is where the authority actually lands. A database is collected
+	// over its own connection, so its records are keyed by that connection's
+	// identity and not by the seed's. Without this the census owned nothing
+	// but the seed's own database, which is the one database a connected
+	// catalogue read can never report missing, so the cleanup could not
+	// remove anything at all.
+	//
+	// Matching on host, port or database name instead would let a catalogue
+	// read through one connection remove the history of another, which may be
+	// a different role seeing a different server.
+	Children map[string]string
 	// Taken is when the read started.
 	Taken time.Time
 	// Databases is every database the server reported, whether or not this
@@ -215,42 +262,119 @@ type Census struct {
 	Databases map[string]struct{}
 }
 
-// Forget removes what a census proves is gone.
+// Hold protects a target while a scrape is working on it, and returns the
+// release.
 //
-// A record is removed only when all of these hold. Its connection is the one
-// the census was read through. Its database is not in the census. And it has
-// not been touched since the census began, so nothing newer is being discarded.
+// A census taken before that work started can finish during it, and its
+// catalogue is then older than whatever the work is in the middle of doing. A
+// target being collected right now is not a target to decide is gone.
 //
-// Every profile of that connection is covered, including profiles nothing is
-// scraping now. Leaving a dropped database behind under an idle profile would
-// make the cleanup do nothing in the case it exists for, and a narrow request
-// still cannot remove a wider profile's records, because what decides is the
-// database rather than the selection.
+// Counted rather than flagged, because several of this process's requests can
+// be working on one target at once and the first to finish must not drop the
+// others' protection. The entry goes when the count reaches zero, so this
+// holds one entry per target being collected rather than one per target ever
+// collected.
+func (s *Store) Hold(target string) func() {
+	if s == nil || target == "" {
+		return func() {}
+	}
+	s.mtx.Lock()
+	s.held[target]++
+	s.mtx.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mtx.Lock()
+			defer s.mtx.Unlock()
+			if s.held[target] <= 1 {
+				delete(s.held, target)
+				return
+			}
+			s.held[target]--
+		})
+	}
+}
+
+// Apply records what a complete inventory saw and removes what it proves gone.
 //
-// It returns how many records it removed, which is what a caller can report.
-func (s *Store) Forget(c Census) int {
+// Both halves are one step under one lock. Between them the store would say a
+// database is absent while still holding its history, and a second census
+// running in that gap would read a state neither census produced.
+//
+// Confirming is what makes an older census safe. A complete inventory that
+// lists a database says the database was there when the inventory was taken,
+// and that is true whether or not collecting from it worked. Without recording
+// it, the only evidence of recent presence is the last success, so a database
+// that exists and keeps failing looks exactly like a database that is gone,
+// and an older census finishing later removes history that a newer one had
+// just confirmed. The confirmation is kept apart from the success time because
+// a failed collection must not be made to look like a successful one in order
+// to protect what it failed at.
+//
+// A record is removed only when all of these hold. The census has authority
+// over its target, which means the target is the seed itself or a connection
+// derived from it. The database that target is about is not in the inventory.
+// Nothing has recorded a success or a newer inventory for it since this census
+// began. And no scrape is working on that target right now.
+//
+// Every profile of an owned connection is covered, including profiles nothing
+// is scraping now. Leaving a dropped database behind under an idle profile
+// would make the cleanup do nothing in the case it exists for, and a narrow
+// request still cannot remove a wider profile's records, because what decides
+// is the connection and its database rather than the selection.
+//
+// It returns how many records it confirmed and how many it removed, which is
+// what a caller can report.
+func (s *Store) Apply(c Census) (confirmed, removed int) {
 	if s == nil || c.Target == "" || c.Databases == nil {
-		return 0
+		return 0, 0
 	}
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	removed := 0
-	for key, when := range s.seen {
-		if key.Target != c.Target || key.Database == "" {
+	for key, rec := range s.seen {
+		database, owned := c.about(key)
+		if !owned {
 			continue
 		}
-		if _, present := c.Databases[key.Database]; present {
+		if _, present := c.Databases[database]; present {
+			if c.Taken.After(rec.confirmed) {
+				rec.confirmed = c.Taken
+				s.seen[key] = rec
+				confirmed++
+			}
 			continue
 		}
-		if !when.Before(c.Taken) {
-			// Written or updated since the census began, so the census never
-			// saw whatever this is about.
+		if !rec.success.Before(c.Taken) || !rec.confirmed.Before(c.Taken) {
+			// Written, or confirmed present, since this census began. The
+			// census never saw whatever that is about.
+			continue
+		}
+		if s.held[key.Target] > 0 {
 			continue
 		}
 		delete(s.seen, key)
 		removed++
 	}
-	return removed
+	return confirmed, removed
+}
+
+// about says which database a key is about and whether this census may act on
+// it.
+//
+// A derived connection is about the database it was built to open, which is
+// recorded where it was built rather than read back out of the record. A
+// record under the seed's own connection is about the database it names, and
+// one that names none is about the connection itself, which no catalogue can
+// report missing.
+func (c Census) about(key Key) (string, bool) {
+	if database, ok := c.Children[key.Target]; ok {
+		return database, true
+	}
+	if key.Target == c.Target {
+		return key.Database, key.Database != ""
+	}
+	return "", false
 }

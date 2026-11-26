@@ -221,7 +221,8 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 	if err != nil {
 		level.Error(logger).Log("msg", "Unable to identify the server for a DSN", "dsn", loggableDSN(dsn), "err", err)
 	}
-	dsns[seed] = databaseRef{server: fingerprint, identity: identityOf(seed)}
+	seedID := identityOf(seed)
+	dsns[seed] = databaseRef{server: fingerprint, identity: seedID}
 
 	// Before the read, not after it. What this may authorise forgetting is
 	// what was already there when it began looking, and a read that finishes
@@ -253,7 +254,7 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 	// put templates into a coverage denominator that never had them.
 	d.discovered += len(eligible(catalog))
 	if name, found := currentName(catalog); found {
-		dsns[seed] = databaseRef{server: fingerprint, datname: name, identity: identityOf(seed)}
+		dsns[seed] = databaseRef{server: fingerprint, datname: name, identity: seedID}
 	} else {
 		// The connection database is not in its own catalog. The query
 		// also filters out templates and databases this role has no
@@ -264,16 +265,6 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 		// no name to report it under and inventing one would be worse.
 		d.discovered++
 	}
-
-	// A complete, successful read of every database the server has. Only this
-	// can authorise forgetting one: a name missing from a filtered read may
-	// have lost CONNECT, and a name missing from a failed or partial read was
-	// never looked for. Every path above this returns before reaching here.
-	e.forgetDatabasesTheServerNoLongerHas(lastsuccess.Census{
-		Target:    identityOf(seed),
-		Taken:     taken,
-		Databases: nameSet(inventory(catalog)),
-	})
 
 	sel := dbselect.Apply(otherThanCurrent(catalog), e.excludeDatabases, e.includeDatabases)
 	for _, name := range sel.Excluded {
@@ -298,8 +289,25 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 			// just append new dbname to override.
 			dsn = fmt.Sprintf("%s dbname=%s", dsnConnstring, databaseName)
 		}
-		dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: identityOf(dsn)}
+		dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: derivedIdentityOf(seedID, dsn, databaseName)}
 	}
+
+	// A complete, successful read of every database the server has. Only this
+	// can authorise forgetting one: a name missing from a filtered read may
+	// have lost CONNECT, and a name missing from a failed or partial read was
+	// never looked for. Every path above this returns before reaching here.
+	//
+	// After the connections above are built, not before. What a catalogue
+	// authorises acting on is the state held under those connections, and
+	// this scrape's are registered as its own in the loop. Running first
+	// would leave a database created since the last scrape unconfirmed, so
+	// an older census finishing later could remove it.
+	e.applyCensus(lastsuccess.Census{
+		Target:    seedID,
+		Children:  targetid.ChildrenOf(seedID),
+		Taken:     taken,
+		Databases: nameSet(inventory(catalog)),
+	})
 
 	return targetsOf(seed, dsns)
 }
@@ -321,13 +329,15 @@ func sortTargets(targets []scrapeTarget) {
 	sort.Slice(targets, func(i, j int) bool { return targets[i].dsn < targets[j].dsn })
 }
 
-// forgetDatabasesTheServerNoLongerHas hands a census to the stores that keep
-// per-database state.
+// applyCensus hands a census to the stores that keep per-database state.
 //
 // Separate from the read so the refusal is in one place: a caller that has
 // anything less than a complete successful inventory does not reach it.
-func (e *Exporter) forgetDatabasesTheServerNoLongerHas(c lastsuccess.Census) {
-	if removed := e.lastSuccess.Forget(c); removed > 0 {
+//
+// Only removals are logged. A confirmation happens on every scrape of every
+// database and says nothing happened, which is not worth a line in a log.
+func (e *Exporter) applyCensus(c lastsuccess.Census) {
+	if _, removed := e.lastSuccess.Apply(c); removed > 0 {
 		level.Info(logger).Log("msg", "Forgot databases the server no longer has",
 			"target", c.Target, "records", removed)
 	}
@@ -347,6 +357,21 @@ func nameSet(names []string) map[string]struct{} {
 // connection an identity stands for.
 func identityOf(dsn string) string {
 	id, first := targetid.ID(dsn)
+	if first {
+		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(dsn))
+	}
+	return id
+}
+
+// derivedIdentityOf returns this process's identity for a connection built
+// from a seed to open one of its databases, recording where it came from.
+//
+// The lineage is what lets that seed's catalogue decide this connection's
+// state is gone. Recorded here rather than worked out later, because here is
+// where the connection string is built and so the only place that knows the
+// relation without taking a connection string apart again.
+func derivedIdentityOf(seed, dsn, database string) string {
+	id, first := targetid.Derived(seed, dsn, database)
 	if first {
 		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(dsn))
 	}
