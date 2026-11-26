@@ -1294,18 +1294,15 @@ func TestHealthAnswersForWorkThatNeverStarted(t *testing.T) {
 // TestGetServerReturnsWithoutWaitingAfterItsLastAttempt exercises the
 // connection getter itself.
 //
-// An earlier version of this test checked only the helper that names the
-// condition, so removing the guards from both error paths in GetServer left it
-// passing. It was a test that could not fail for the thing it was written for,
-// which is the defect this project keeps finding, here in my own test.
-//
 // One attempt is allowed and the count is raised before the limit is checked,
 // so the loop returns on its next turn and a wait before that return precedes
 // no retry. The wait is attempt seconds, cut short only by the context ending,
-// and in discovery it is spent holding a connection permit. So the measurement
-// is the time GetServer takes to come back from a connection that fails at
-// once, against a context with plenty of time left: with the guards it returns
-// immediately, and without them it sits for about a second.
+// and in discovery it is spent holding a connection permit.
+//
+// So the measurement is how long GetServer takes to come back from a connection
+// that fails at once, against a context with plenty of time left. Testing the
+// helper that names the condition is not enough: the guards are at the call
+// site and the helper answers the same whether they are there or not.
 func TestGetServerReturnsWithoutWaitingAfterItsLastAttempt(t *testing.T) {
 	// Long enough that the context cannot be what cuts the wait short, which
 	// would make this pass for the wrong reason.
@@ -1354,12 +1351,12 @@ func TestLastAttemptNamesTheCondition(t *testing.T) {
 	}
 }
 
-// TestASeedThatConnectedKeepsTheServerUp is ChatGPT's mixed-seed case.
+// TestASeedThatConnectedKeepsTheServerUp covers one seed connecting and
+// another being refused.
 //
-// One configured seed connects and lists the catalogue, a second is refused,
-// and the fan-out has no budget left so nothing is attempted. The scrape did
-// reach the server, and reporting it as down discards an observation this
-// scrape made.
+// The scrape reached the server, so reporting it as down discards an
+// observation the scrape made. The answer must also not change with how many
+// targets the budget admitted.
 func TestASeedThatConnectedKeepsTheServerUp(t *testing.T) {
 	// Four selected databases, none attempted, and discovery saw one
 	// connection work and one refused.
@@ -1377,10 +1374,9 @@ func TestASeedThatConnectedKeepsTheServerUp(t *testing.T) {
 		t.Errorf("a refused login alone gives up %v and error %v, want 0 and 1", up, failed)
 	}
 
-	// The counterexample that showed an earlier version of this rule wrong.
-	// Four targets, three deferred, and the one that was admitted failed at
-	// the connection. The good seed's own targets were never retried, so its
-	// success stands, and the failure is reported by the error signal and the
+	// Four targets, three deferred, and the one admitted failed at the
+	// connection. The seed that connected was never retried, so its success
+	// stands, and the failure is reported by the error signal and the
 	// per-database outcomes rather than by unmaking it.
 	up, failed = health(4, 3, 1, 1, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
 	if up != 1 || failed != 1 {

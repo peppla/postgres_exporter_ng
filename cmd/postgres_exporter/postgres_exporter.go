@@ -921,13 +921,10 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 // wrong, discovery included.
 //
 // A connection that worked counts whenever it happened, in discovery or in the
-// fan-out. An earlier version let discovery's success count only where the
-// fan-out attempted nothing, which made the answer depend on how much budget
-// was left rather than on what was observed: with four targets deferred the
-// same observations gave up 1, and admitting one target that then failed to
-// connect turned it into up 0, while the seed that had connected was never
-// retried. One context failing does not unmake another context's success, and
-// the per-database outcomes and failed below are what report the failure.
+// fan-out, and one connection context failing does not unmake another's
+// success. Anything less makes the answer depend on how much budget was left
+// rather than on what the scrape observed. What went wrong is reported by
+// failed below and by the per-database outcomes.
 func health(targets, deferred, connectionErrors, errors int, d discovery) (up, failed float64) {
 	// A target that was attempted and did not fail at the connection is one
 	// that connected, and so is a seed whose catalogue this scrape read.
