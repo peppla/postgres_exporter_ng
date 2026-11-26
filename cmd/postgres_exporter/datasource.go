@@ -112,13 +112,17 @@ type discovery struct {
 	notIncluded int
 	ok          bool
 	// connectFailures counts the seeds whose connection itself did not work,
-	// as against a catalogue query that failed on a connection that did.
+	// and connectSuccesses the seeds whose connection did, whatever the
+	// catalogue read then came to.
 	//
-	// Kept apart because the two say different things to an operator. A
+	// Both, because either on its own loses an observation this scrape made. A
 	// scrape that could not log in used to report the server as up, because
-	// the fan-out after it attempted nothing and so reported no failure of
-	// its own, and nothing carried what discovery had already seen.
-	connectFailures int
+	// the fan-out after it attempted nothing and so reported no failure of its
+	// own. Counting only the failures then lost the other half: one seed that
+	// connected and another that was refused reported the server as down,
+	// while the first connection had worked and its catalogue had been read.
+	connectFailures  int
+	connectSuccesses int
 }
 
 func (e *Exporter) discoverDatabaseDSNs() discovery {
@@ -166,7 +170,10 @@ func (e *Exporter) discoverDatabaseDSNs() discovery {
 		// If autoDiscoverDatabases is true, set first dsn as master database (Default: false)
 		e.masterDSN = dsn
 
-		catalog, err := e.getDatabaseNames(dsn)
+		catalog, connected, err := e.getDatabaseNames(dsn)
+		if connected {
+			d.connectSuccesses++
+		}
 		if err != nil {
 			var connectErr *ErrorConnectToServer
 			if errors.As(err, &connectErr) {
@@ -244,11 +251,20 @@ func identityOf(dsn string) string {
 	return id
 }
 
-func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
+// getDatabaseNames reads one seed's catalogue, and says separately whether its
+// connection worked.
+//
+// Separately because the two are different observations and a scrape can make
+// one without the other. A connection that worked is a connection that worked
+// even if the catalogue read after it failed, and losing that leaves the
+// exporter reporting a server as unreachable that it had just reached.
+func (e *Exporter) getDatabaseNames(dsn string) (names []catalogDatabase, connected bool, err error) {
 	if e.connSema != nil {
 		if err := e.connSema.Acquire(e.ctx, 1); err != nil {
 			level.Warn(logger).Log("msg", "Failed to acquire semaphore", "err", err)
-			return nil, err
+			// No connection was attempted, so nothing was observed about the
+			// server either way.
+			return nil, false, err
 		}
 		defer e.connSema.Release(1)
 	}
@@ -259,17 +275,17 @@ func (e *Exporter) getDatabaseNames(dsn string) ([]catalogDatabase, error) {
 		// Typed, so the caller can tell a connection that did not work from a
 		// catalogue query that failed on one that did. scrapeDSN reports the
 		// same distinction for the same reason.
-		return nil, &ErrorConnectToServer{fmt.Sprintf("Error opening connection to database (%s): %s", loggableDSN(dsn), err.Error())}
+		return nil, false, &ErrorConnectToServer{fmt.Sprintf("Error opening connection to database (%s): %s", loggableDSN(dsn), err.Error())}
 	}
 	defer server.Close()
 
 	dbNames, err := queryDatabases(e.ctx, server)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error querying databases", "dsn", loggableDSN(dsn), "err", err)
-		return nil, err
+		return nil, true, err
 	}
 
-	return dbNames, nil
+	return dbNames, true, nil
 }
 
 // scrapeDSN collects one target. It writes the database name back into the

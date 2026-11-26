@@ -704,6 +704,9 @@ func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt)
 
 		server, err = NewServer(dsn, opts...)
 		if err != nil {
+			if lastAttempt(errCount, retries) {
+				return nil, err
+			}
 			if werr := waitBeforeRetry(ctx, errCount); werr != nil {
 				return nil, err
 			}
@@ -712,6 +715,9 @@ func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt)
 
 		if err = server.Ping(ctx); err != nil {
 			server.Close()
+			if lastAttempt(errCount, retries) {
+				return nil, err
+			}
 			if werr := waitBeforeRetry(ctx, errCount); werr != nil {
 				return nil, err
 			}
@@ -720,6 +726,18 @@ func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt)
 		break
 	}
 	return server, nil
+}
+
+// lastAttempt says whether the attempt that just failed was the final one.
+//
+// The loop returns on its next turn when the count passes the limit, so waiting
+// after the last attempt buys nothing: no further attempt follows it. The wait
+// is a second, cut short only by the request ending, and discovery holds a
+// connection permit throughout it. A login refused immediately could therefore
+// spend the rest of a short budget doing nothing, leaving the whole fan-out
+// deferred.
+func lastAttempt(errCount, retries int) bool {
+	return errCount >= retries
 }
 
 func (e *Exporter) setupInternalMetrics() {
@@ -901,13 +919,25 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 // nothing succeeded, and 1 when nothing tried, because work that never started
 // says nothing about the server either way. failed is 1 when anything went
 // wrong, discovery included.
+//
+// Discovery's successful connection counts only where the fan-out attempted
+// nothing. Where the fan-out did attempt and every attempt failed at the
+// connection, that is what the scrape observed of the databases and it is not
+// overridden by the catalogue read having worked.
 func health(targets, deferred, connectionErrors, errors int, d discovery) (up, failed float64) {
 	// A target that was attempted and did not fail at the connection is one
 	// that connected.
-	connected := targets - deferred - connectionErrors
+	attempted := targets - deferred
+	fanOutConnected := attempted - connectionErrors
 
 	switch {
-	case connected > 0:
+	case fanOutConnected > 0:
+		up = 1
+	case attempted == 0 && d.connectSuccesses > 0:
+		// Nothing was attempted, so the only connection this scrape made is
+		// discovery's, and it worked. Without this a seed that connected and
+		// listed its databases, followed by a second seed that was refused and
+		// a fan-out with no budget left, reported the server as down.
 		up = 1
 	case connectionErrors > 0 || d.connectFailures > 0:
 		up = 0

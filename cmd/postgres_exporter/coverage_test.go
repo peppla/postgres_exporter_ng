@@ -1281,3 +1281,60 @@ func TestHealthAnswersForWorkThatNeverStarted(t *testing.T) {
 		})
 	}
 }
+
+// TestNoWaitAfterTheLastAttempt covers the retry loop's terminal wait.
+//
+// The loop returns on its next turn once the count passes the limit, so a wait
+// after the final attempt is time spent on a retry that never happens. In
+// discovery that time is spent holding a connection permit, so a login refused
+// immediately could consume the rest of a short budget and leave the whole
+// fan-out deferred.
+func TestNoWaitAfterTheLastAttempt(t *testing.T) {
+	for _, c := range []struct {
+		name              string
+		errCount, retries int
+		wantLast          bool
+	}{
+		{"the only attempt, with no retry allowed", 1, 1, true},
+		{"the first of two attempts", 1, 2, false},
+		{"the second of two attempts", 2, 2, true},
+		{"past the limit", 3, 2, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := lastAttempt(c.errCount, c.retries); got != c.wantLast {
+				t.Errorf("lastAttempt(%d, %d) is %v, want %v", c.errCount, c.retries, got, c.wantLast)
+			}
+		})
+	}
+}
+
+// TestASeedThatConnectedKeepsTheServerUp is ChatGPT's mixed-seed case.
+//
+// One configured seed connects and lists the catalogue, a second is refused,
+// and the fan-out has no budget left so nothing is attempted. The scrape did
+// reach the server, and reporting it as down discards an observation this
+// scrape made.
+func TestASeedThatConnectedKeepsTheServerUp(t *testing.T) {
+	// Four selected databases, none attempted, and discovery saw one
+	// connection work and one refused.
+	up, failed := health(4, 4, 0, 0, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
+	if up != 1 {
+		t.Errorf("pg_up is %v after a seed connected and read its catalogue, want 1", up)
+	}
+	if failed != 1 {
+		t.Errorf("last_scrape_error is %v after a refused login, want 1", failed)
+	}
+
+	// The single refused seed keeps the answer it had.
+	up, failed = health(1, 1, 0, 0, discovery{ok: false, connectFailures: 1})
+	if up != 0 || failed != 1 {
+		t.Errorf("a refused login alone gives up %v and error %v, want 0 and 1", up, failed)
+	}
+
+	// A fan-out that attempted and failed at every connection is still down,
+	// whatever discovery managed before it.
+	up, _ = health(2, 0, 2, 2, discovery{ok: true, connectSuccesses: 1})
+	if up != 0 {
+		t.Errorf("pg_up is %v when every attempted database failed at the connection, want 0", up)
+	}
+}
