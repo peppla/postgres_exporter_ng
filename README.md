@@ -168,6 +168,60 @@ what limits the set, in `monitoring.databases`.
 deprecated, and setting both is refused at startup rather than resolved by a
 precedence rule.
 
+### state
+
+This section bounds how much the exporter remembers between scrapes.
+
+Most of what it remembers is bounded by what a server says it has, and a
+complete catalogue read is what removes the rest: a database that is dropped
+takes its records with it once a read confirms it is gone. Two things have no
+such authority. A collection profile is whatever set of collectors a request
+asks for in `collect[]`, and a probe connection is whatever target a request
+names, so both are minted by whoever can reach the endpoint.
+
+```yaml
+state:
+  profiles: 64
+  probe_connections: 256
+  idle: 24h
+```
+
+| key | default | what it bounds | takes effect |
+| --- | --- | --- | --- |
+| `profiles` | none | distinct `collect[]` selections whose per-database history is kept | restart |
+| `probe_connections` | none | distinct `/probe` targets whose history and schedule are kept | restart |
+| `idle` | none | how long a profile or probe connection keeps its place without being asked for | restart |
+
+**There is no default.** With the section left out, nothing is refused and
+nothing is released, and the state behind profiles and probe connections grows
+for as long as the process runs. The three values are an operational decision
+that has not been made, and leaving them out is how this exporter behaves
+until it is.
+
+A name that has a place keeps it until it goes quiet for longer than `idle`. A
+name arriving when every place is taken is refused before any SQL runs, with
+503 and a reason, and `pg_exporter_collection_profiles_rejected_total` or
+`pg_exporter_probe_connections_rejected_total` counts it. Refused rather than
+served, because a profile with no place has no schedule either, and a selection
+that does not fit the scrape budget would then be offered the same first
+database on every request.
+
+What this guarantees is that a profile already being scraped cannot lose its
+history to any volume of new ones. Nothing another requester does takes a place
+away. The only thing that frees one is its own holder going quiet.
+
+That guarantee holds only within `idle`. A job whose interval is longer than
+the window loses its place between its own requests, every time, and then
+competes for admission like a newcomer, so `idle` belongs above the longest
+interval anything scrapes this exporter at.
+
+Writing a limit without `idle` is refused at startup. Nothing would ever
+release a place, so the first names to arrive would hold theirs for the life of
+the process and every later one would be refused for as long as it ran. Writing
+`idle` on its own is allowed: it releases what has gone quiet without refusing
+anything. Writing any of the three as zero is refused, because read as a limit
+a zero means no limit, which is the opposite of what writing one looks like.
+
 ### monitoring
 
 This section configures built-in monitoring. `databases` says which databases

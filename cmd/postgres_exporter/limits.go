@@ -22,6 +22,7 @@ import (
 
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
+	"github.com/percona/postgres_exporter/internal/slots"
 )
 
 // resolveLimits settles the operational budget from the configuration file and
@@ -49,4 +50,20 @@ func resolveLimits(cfg *config.Config, maxConnectionsSet bool, maxConnections in
 		return budget.Limits{}, fmt.Errorf("limits: %w", err)
 	}
 	return limits, nil
+}
+
+// resolveState settles how much the exporter may remember between scrapes.
+//
+// Nothing to overlay onto, unlike the budget. These have no approved defaults,
+// so a file that says nothing leaves them zero, and zero is no limit
+// configured: nothing is refused and nothing is released. That is what this
+// exporter does until the three values are chosen.
+func resolveState(cfg *config.Config) (slots.Limits, error) {
+	if cfg == nil {
+		return slots.Limits{}, nil
+	}
+	if err := cfg.State.Validate(); err != nil {
+		return slots.Limits{}, fmt.Errorf("state: %w", err)
+	}
+	return cfg.State.Slots(), nil
 }

@@ -45,6 +45,9 @@ type Config struct {
 	Limits Limits `yaml:"limits"`
 	// Monitoring configures built-in monitoring. See selection.go.
 	Monitoring Monitoring `yaml:"monitoring"`
+	// State is how much the exporter may remember between scrapes, for the
+	// two things no catalogue read can bound. See state.go.
+	State State `yaml:"state"`
 }
 
 type AuthModule struct {
@@ -92,7 +95,7 @@ func (ch *Handler) ReloadConfig(f string, logger log.Logger) error {
 		return fmt.Errorf("error opening config file %q: %s", f, err)
 	}
 
-	if err = rejectNullKeys(content, limitKeyPaths()...); err != nil {
+	if err = rejectNullKeys(content, append(limitKeyPaths(), stateKeyPaths()...)...); err != nil {
 		return fmt.Errorf("error parsing config file %q: %s", f, err)
 	}
 	// A separate pass for the selection lists, which need their own message:
