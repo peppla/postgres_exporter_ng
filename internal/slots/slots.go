@@ -45,6 +45,7 @@
 package slots
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -77,6 +78,31 @@ type Limits struct {
 	Profiles int
 	Contexts int
 	Idle     time.Duration
+}
+
+// Validate checks the values and the relationship between them.
+//
+// At startup rather than at admission time. A configuration that cannot work
+// should stop the exporter starting, not produce refusals nobody connects to
+// what was written.
+func (l Limits) Validate() error {
+	if l.Profiles < 0 {
+		return fmt.Errorf("profiles is %d: it cannot be negative", l.Profiles)
+	}
+	if l.Contexts < 0 {
+		return fmt.Errorf("probe_connections is %d: it cannot be negative", l.Contexts)
+	}
+	if l.Idle < 0 {
+		return fmt.Errorf("idle is %s: it cannot be negative", l.Idle)
+	}
+	if (l.Profiles > 0 || l.Contexts > 0) && l.Idle == 0 {
+		// A cap with no window never gives a slot back, so the first names to
+		// arrive hold theirs for the life of the process and every later one
+		// is refused for ever. That is not a limit, it is a lockout.
+		return fmt.Errorf("a limit is set and idle is not: without it no slot is ever released, " +
+			"so once the limit is reached every new profile or probe connection is refused for as long as the process runs")
+	}
+	return nil
 }
 
 // Store holds the slots.

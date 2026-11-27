@@ -18,8 +18,11 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +30,7 @@ import (
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
+	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
@@ -396,5 +400,145 @@ func TestTheRetirementHappensInsideTheAnswer(t *testing.T) {
 	}
 	if _, ok := stores.LastSuccess.At(key); ok {
 		t.Error("the deferred retirement never happened at all")
+	}
+}
+
+// writeStateFile puts a configuration file where a test can load it.
+func writeStateFile(t *testing.T, body string) *config.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "postgres_exporter.yml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing the fixture: %s", err)
+	}
+	var h config.Handler
+	if err := h.ReloadConfig(path, nil); err != nil {
+		t.Fatalf("loading %q: %s", body, err)
+	}
+	return h.GetConfig()
+}
+
+// TestWhatTheFileSaysReachesTheEndpoint is the binding, end to end.
+//
+// Parsing the file and building the store from a literal both pass without
+// anything joining them up, and what an operator cares about is whether the
+// number they wrote changes what the endpoint does.
+func TestWhatTheFileSaysReachesTheEndpoint(t *testing.T) {
+	state, err := resolveState(writeStateFile(t, "state:\n  profiles: 1\n  idle: 1h\n"))
+	if err != nil {
+		t.Fatalf("resolving: %s", err)
+	}
+	if state.Profiles != 1 || state.Idle != time.Hour {
+		t.Fatalf("the file gave %+v, want one profile and an hour", state)
+	}
+
+	enableDefaultCollectors(t)
+	limits := budget.Defaults()
+	const dsn = "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	stores := NewStoresWithLimits(state, []string{dsn})
+	h := Handler(log.NewNopLogger(), []string{dsn},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), stores,
+		dbselect.Absent(), dbselect.Absent())
+
+	if code, body := get(t, h, profileQuery("stat_user_tables")); code != http.StatusOK {
+		t.Fatalf("the first profile was answered %d: %s", code, body)
+	}
+	code, body := get(t, h, profileQuery("stat_user_indexes"))
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("a second profile was answered %d with profiles: 1 in the file: %s", code, body)
+	}
+}
+
+// TestAnOmittedSectionLeavesTheEndpointAsItIs is the production behaviour this
+// change has to preserve.
+func TestAnOmittedSectionLeavesTheEndpointAsItIs(t *testing.T) {
+	state, err := resolveState(writeStateFile(t, "limits:\n  connections: 5\n"))
+	if err != nil {
+		t.Fatalf("resolving: %s", err)
+	}
+	if state != (slots.Limits{}) {
+		t.Fatalf("a file with no state section gave %+v, want everything unset", state)
+	}
+
+	enableDefaultCollectors(t)
+	limits := budget.Defaults()
+	const dsn = "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	stores := NewStoresWithLimits(state, []string{dsn})
+	h := Handler(log.NewNopLogger(), []string{dsn},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), stores,
+		dbselect.Absent(), dbselect.Absent())
+
+	for _, collectors := range [][]string{
+		{"stat_user_tables"}, {"stat_user_indexes"}, {"statio_user_tables"},
+		{"stat_user_tables", "stat_user_indexes"},
+	} {
+		if code, body := get(t, h, profileQuery(collectors...)); code != http.StatusOK {
+			t.Errorf("%v was answered %d with no state section: %s", collectors, code, body)
+		}
+	}
+}
+
+// TestABadStateSectionStopsTheExporter covers the values that have to fail
+// where an operator sees them.
+func TestABadStateSectionStopsTheExporter(t *testing.T) {
+	for _, body := range []string{
+		"state:\n  profiles: 4\n",
+		"state:\n  probe_connections: 4\n",
+		"state:\n  profiles: 0\n  idle: 1h\n",
+		"state:\n  idle: 0s\n",
+		"state:\n  profiles: -1\n  idle: 1h\n",
+	} {
+		if _, err := resolveState(writeStateFile(t, body)); err == nil {
+			t.Errorf("%q was accepted", body)
+		}
+	}
+}
+
+// TestNoFileAtAllIsUnset covers the exporter run without a configuration file.
+func TestNoFileAtAllIsUnset(t *testing.T) {
+	state, err := resolveState(nil)
+	if err != nil {
+		t.Fatalf("resolving with no file: %s", err)
+	}
+	if state != (slots.Limits{}) {
+		t.Errorf("no file gave %+v, want everything unset", state)
+	}
+}
+
+// TestDatabasesDoNotSpendTheLimits keeps this away from the thing it is not.
+//
+// A profile is a set of collectors and a connection context is a connection.
+// Neither counts databases, and a server with many of them must not consume
+// what a scraper's selections are allowed.
+func TestDatabasesDoNotSpendTheLimits(t *testing.T) {
+	stores := NewStoresWithLimits(slots.Limits{Profiles: 1, Contexts: 1, Idle: time.Hour}, nil)
+
+	// One profile and one connection, with a hundred databases discovered
+	// under that connection.
+	release, _, ok := stores.Slots.Admit(
+		slots.Key{Kind: slots.Profile, Name: "collector:stat_user_tables"},
+		slots.Key{Kind: slots.Context, Name: "one"})
+	if !ok {
+		t.Fatal("one profile and one connection did not fit in one of each")
+	}
+	defer release()
+
+	for i := 0; i < 100; i++ {
+		name := fmt.Sprintf("db%03d", i)
+		stores.LastSuccess.Own("one", "one/"+name, name)()
+		stores.LastSuccess.Record(lastsuccess.Key{
+			Engine: lastsuccess.EngineCollector, Target: "one/" + name, Database: name,
+			Collector: "stat_user_tables"}, time.Now())
+	}
+
+	if held := stores.Slots.Held(slots.Profile); held != 1 {
+		t.Errorf("%d profile slots after a hundred databases, want 1", held)
+	}
+	if held := stores.Slots.Held(slots.Context); held != 1 {
+		t.Errorf("%d connection slots after a hundred databases, want 1", held)
+	}
+	if len(stores.LastSuccess.Owned("one")) != 100 {
+		t.Errorf("%d databases are owned, so the fixture did not discover a hundred", len(stores.LastSuccess.Owned("one")))
 	}
 }

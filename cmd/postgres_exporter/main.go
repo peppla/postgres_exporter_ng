@@ -221,9 +221,21 @@ func main() {
 	queryCache := querycache.New()
 	// What no single scrape can answer: when each database was last collected
 	// without error, and where the last scrape of a profile got to.
+	state, err := resolveState(c.GetConfig())
+	if err != nil {
+		level.Error(logger).Log("msg", "Invalid state limits", "err", err.Error())
+		os.Exit(1)
+	}
+	if state == (slots.Limits{}) {
+		level.Info(logger).Log("msg", "No state limits configured, so no collection profile or probe connection is refused and none is released")
+	} else {
+		level.Info(logger).Log("msg", "State limits", "profiles", state.Profiles,
+			"probe_connections", state.Contexts, "idle", state.Idle)
+	}
+
 	// The configured connections go in, so a probe of one of them losing its
 	// slot does not take the configuration's own state with it.
-	stores := NewStoresWithLimits(slots.Limits{}, dsns)
+	stores := NewStoresWithLimits(state, dsns)
 	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache, stores,
 		excludeSelection, includeSelection))
 

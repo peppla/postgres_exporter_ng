@@ -300,3 +300,74 @@ func TestRetirementAndReadmissionAreOrdered(t *testing.T) {
 		t.Error("a name was readmitted while what it was keeping was still being dropped")
 	}
 }
+
+// TestALimitWithNoWindowIsRefused is the configuration that looks like a limit
+// and is a lockout.
+//
+// Nothing releases a slot but the idle window. With a cap and no window the
+// first names to arrive hold theirs for the life of the process, and every
+// later one is refused for as long as it runs, however quiet the holders go.
+func TestALimitWithNoWindowIsRefused(t *testing.T) {
+	for _, l := range []Limits{
+		{Profiles: 4},
+		{Contexts: 4},
+		{Profiles: 4, Contexts: 4},
+	} {
+		if err := l.Validate(); err == nil {
+			t.Errorf("%+v was accepted, and it refuses every newcomer for ever", l)
+		}
+	}
+}
+
+// TestNothingConfiguredIsValid is the state this ships in.
+func TestNothingConfiguredIsValid(t *testing.T) {
+	if err := (Limits{}).Validate(); err != nil {
+		t.Errorf("an unconfigured admission was rejected: %s", err)
+	}
+	// A window on its own releases what has gone quiet without refusing
+	// anything, which is a smaller thing to ask for and is allowed.
+	if err := (Limits{Idle: time.Hour}).Validate(); err != nil {
+		t.Errorf("a window with no limit was rejected: %s", err)
+	}
+}
+
+// TestNegativeValuesAreRefused covers what a number cannot be.
+func TestNegativeValuesAreRefused(t *testing.T) {
+	for _, l := range []Limits{
+		{Profiles: -1, Idle: time.Hour},
+		{Contexts: -1, Idle: time.Hour},
+		{Profiles: 1, Idle: -time.Hour},
+	} {
+		if err := l.Validate(); err == nil {
+			t.Errorf("%+v was accepted", l)
+		}
+	}
+}
+
+// TestAWindowOnItsOwnStillReleases is what that configuration buys.
+func TestAWindowOnItsOwnStillReleases(t *testing.T) {
+	c := newClock()
+	var released []Key
+	s := New(Limits{Idle: time.Minute}, func(k Key, _ map[Key]struct{}) {
+		released = append(released, k)
+	}).WithClock(c.now)
+
+	for i := 0; i < 20; i++ {
+		release, _, ok := s.Admit(profile(string(rune('a' + i))))
+		if !ok {
+			t.Fatalf("request %d was refused with no limit configured", i)
+		}
+		release()
+	}
+	if held := s.Held(Profile); held != 20 {
+		t.Fatalf("%d profiles hold a slot, want 20", held)
+	}
+
+	c.advance(time.Hour)
+	if n := s.Sweep(); n != 20 {
+		t.Errorf("a sweep released %d of 20 quiet slots", n)
+	}
+	if len(released) != 20 {
+		t.Errorf("the owner was told about %d of them", len(released))
+	}
+}
