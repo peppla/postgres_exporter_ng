@@ -888,6 +888,9 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		// Counted from zero, because every database here comes from a
 		// catalogue read. Starting from the seed count adds each seed twice.
 		d := discovery{ok: true}
+		// Released when this request is finished with the connections it
+		// discovered, after the last thing that can record under one of them.
+		defer d.done()
 		errorsCount, connectionErrorsCount, deferredCount := e.discoverAndCollect(ch, &d)
 		e.finishScrape(d, errorsCount, connectionErrorsCount, deferredCount)
 		return

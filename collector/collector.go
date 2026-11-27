@@ -509,10 +509,14 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	var sel dbSelection
 	if databaseLocal {
 		var err error
-		sel, err = selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases)
+		sel, err = selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases, p.lastSuccess)
 		if err != nil {
 			level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
 		}
+		// Held until this request is finished with these connections, so a
+		// catalogue read in another request cannot retire one while this one
+		// is still recording under it.
+		defer sel.done()
 		p.applyCensus(inst.dsn, sel)
 	}
 	p.reportSelection(ch, inst.name, sel, databaseLocal)
@@ -781,7 +785,6 @@ func (p PostgresCollector) applyCensus(dsn string, sel dbSelection) {
 	}
 	_, removed := p.lastSuccess.Apply(lastsuccess.Census{
 		Target:    seed,
-		Children:  targetid.ChildrenOf(seed),
 		Taken:     sel.taken,
 		Databases: databases,
 	})

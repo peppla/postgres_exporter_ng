@@ -113,6 +113,11 @@ type scrapeTarget struct {
 type discovery struct {
 	targets    []scrapeTarget
 	discovered int
+	// release ends the holds this pass took on the connections it built.
+	// Called when the request is done with them, which is not when one
+	// database's collection finishes: a request can record under a connection
+	// at any point before it ends.
+	release []func()
 	// excluded holds the databases the operator's exclude list matched.
 	excluded []databaseRef
 	// notIncluded counts databases a non-empty include list left out.
@@ -168,6 +173,14 @@ func masterSeed(dsns []string) string {
 		}
 	}
 	return master
+}
+
+// done ends every hold this pass took on the connections it built.
+func (d *discovery) done() {
+	for _, release := range d.release {
+		release()
+	}
+	d.release = nil
 }
 
 func (e *Exporter) discoverDatabaseDSNs() discovery {
@@ -289,7 +302,14 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 			// just append new dbname to override.
 			dsn = fmt.Sprintf("%s dbname=%s", dsnConnstring, databaseName)
 		}
-		dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: derivedIdentityOf(seedID, dsn, databaseName)}
+		id := identityOf(dsn)
+		// Registered as built from this seed, and held until this request is
+		// done with it. The relation is what lets this seed's catalogue
+		// decide the connection's state is gone, and the hold is what stops
+		// another request's catalogue read retiring it while this one is
+		// still recording under it.
+		d.release = append(d.release, e.lastSuccess.Own(seedID, id, databaseName))
+		dsns[dsn] = databaseRef{server: fingerprint, datname: databaseName, identity: id}
 	}
 
 	// A complete, successful read of every database the server has. Only this
@@ -304,7 +324,6 @@ func (e *Exporter) discoverSeed(dsn string, d *discovery) []scrapeTarget {
 	// an older census finishing later could remove it.
 	e.applyCensus(lastsuccess.Census{
 		Target:    seedID,
-		Children:  targetid.ChildrenOf(seedID),
 		Taken:     taken,
 		Databases: nameSet(inventory(catalog)),
 	})
@@ -357,21 +376,6 @@ func nameSet(names []string) map[string]struct{} {
 // connection an identity stands for.
 func identityOf(dsn string) string {
 	id, first := targetid.ID(dsn)
-	if first {
-		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(dsn))
-	}
-	return id
-}
-
-// derivedIdentityOf returns this process's identity for a connection built
-// from a seed to open one of its databases, recording where it came from.
-//
-// The lineage is what lets that seed's catalogue decide this connection's
-// state is gone. Recorded here rather than worked out later, because here is
-// where the connection string is built and so the only place that knows the
-// relation without taking a connection string apart again.
-func derivedIdentityOf(seed, dsn, database string) string {
-	id, first := targetid.Derived(seed, dsn, database)
 	if first {
 		level.Debug(logger).Log("msg", "Assigned a target identity", "target", id, "dsn", loggableDSN(dsn))
 	}

@@ -50,7 +50,6 @@ import (
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
-	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -3787,7 +3786,7 @@ func (s *IntegrationSuite) TestForgettingIsAuthorisedOnlyByTheServerStillHavingT
 	// makes every assertion below pass against a cleanup that removes nothing.
 	seed := identityOf(dsn)
 	connectionTo := func(name string) (string, bool) {
-		for id, database := range targetid.ChildrenOf(seed) {
+		for id, database := range stores.LastSuccess.Owned(seed) {
 			if database == name {
 				return id, true
 			}
@@ -3869,7 +3868,7 @@ func (s *IntegrationSuite) TestARecreatedDatabaseDoesNotInheritTheOldOnesHistory
 
 	seed := identityOf(dsn)
 	connectionTo := func(database string) (string, bool) {
-		for id, d := range targetid.ChildrenOf(seed) {
+		for id, d := range stores.LastSuccess.Owned(seed) {
 			if d == database {
 				return id, true
 			}
@@ -3902,8 +3901,11 @@ func (s *IntegrationSuite) TestARecreatedDatabaseDoesNotInheritTheOldOnesHistory
 	_, err = admin.Exec("CREATE DATABASE " + name)
 	c.Assert(err, IsNil)
 
-	// The connection string is the same, so the new database is reached over
-	// the same connection and would read any history left under it.
+	// Scraped again so the connection is built for the new database. The
+	// connection string is the same one, so it has the same identity, and
+	// anything the drop had left under it would be read here.
+	scrape()
+
 	again, ok := connectionTo(name)
 	c.Assert(ok, Equals, true)
 	c.Assert(again, Equals, target,

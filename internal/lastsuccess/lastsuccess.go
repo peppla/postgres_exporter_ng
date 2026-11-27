@@ -110,6 +110,29 @@ type Store struct {
 	// held counts the scrapes currently working on each target, so a cleanup
 	// cannot remove the history of work that is still running.
 	held map[string]int
+	// edges says which seeds built each derived connection and which database
+	// it opens.
+	//
+	// Here rather than beside the identities, because a catalogue read can
+	// only act on a record through this relation, and the two have to move
+	// together. Registering an edge next to publishing a record is two
+	// moments, and a cleanup running between them leaves a record nothing
+	// owns, which no later catalogue read can reach. One lock over both
+	// closes that.
+	edges map[string]edge
+}
+
+// edge is the seeds a derived connection was built from and the database it
+// opens.
+//
+// Every seed is kept, not the first. Two seeds on one server as one role build
+// the same connection string for the same database, and that is one connection
+// with two ways into it, so either one's catalogue has to be able to answer
+// for it. Keeping only the first leaves the cleanup working just while that
+// seed is scraped.
+type edge struct {
+	seeds    map[string]struct{}
+	database string
 }
 
 // record is what is kept about one key.
@@ -134,7 +157,7 @@ type record struct {
 
 // New returns an empty store.
 func New() *Store {
-	return &Store{seen: make(map[Key]record), held: map[string]int{}}
+	return &Store{seen: make(map[Key]record), held: map[string]int{}, edges: map[string]edge{}}
 }
 
 // Record notes that this key was collected without error at t.
@@ -239,20 +262,6 @@ type Census struct {
 	// Target is the seed this was read through, as its identity. Its own
 	// records are covered, by the database each one names.
 	Target string
-	// Children is every connection built from that seed, as identity to the
-	// database it opens.
-	//
-	// This is where the authority actually lands. A database is collected
-	// over its own connection, so its records are keyed by that connection's
-	// identity and not by the seed's. Without this the census owned nothing
-	// but the seed's own database, which is the one database a connected
-	// catalogue read can never report missing, so the cleanup could not
-	// remove anything at all.
-	//
-	// Matching on host, port or database name instead would let a catalogue
-	// read through one connection remove the history of another, which may be
-	// a different role seeing a different server.
-	Children map[string]string
 	// Taken is when the read started.
 	Taken time.Time
 	// Databases is every database the server reported, whether or not this
@@ -287,13 +296,78 @@ func (s *Store) Hold(target string) func() {
 		once.Do(func() {
 			s.mtx.Lock()
 			defer s.mtx.Unlock()
-			if s.held[target] <= 1 {
-				delete(s.held, target)
-				return
-			}
-			s.held[target]--
+			s.release(target)
 		})
 	}
+}
+
+// Own registers that target is the connection seed built to open database, and
+// holds it until the returned release is called.
+//
+// The two happen together because they have to. A request reads a connection's
+// identity while discovering it and records under that identity later, and a
+// catalogue read finishing in between would remove the relation, leaving a
+// record no later catalogue read can reach. Registering and holding under one
+// lock means a connection a request is working with cannot be retired
+// underneath it, so a record without an owner cannot exist whatever the order
+// of events.
+//
+// The hold is released when the request that discovered the connection is
+// done with it, not when one database's collection finishes. A request that
+// discovers a connection may record under it at any point before it ends.
+//
+// Calling this twice for one connection adds the second seed rather than
+// replacing the first.
+func (s *Store) Own(seed, target, database string) func() {
+	if s == nil || seed == "" || target == "" {
+		return func() {}
+	}
+
+	s.mtx.Lock()
+	e, ok := s.edges[target]
+	if !ok {
+		e = edge{seeds: map[string]struct{}{}, database: database}
+		s.edges[target] = e
+	}
+	e.seeds[seed] = struct{}{}
+	s.held[target]++
+	s.mtx.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mtx.Lock()
+			defer s.mtx.Unlock()
+			s.release(target)
+		})
+	}
+}
+
+// Owned returns the connections one seed built, as identity to the database
+// each opens. For the tests that check what a catalogue read has authority
+// over.
+func (s *Store) Owned(seed string) map[string]string {
+	if s == nil {
+		return nil
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	out := map[string]string{}
+	for target, e := range s.edges {
+		if _, ok := e.seeds[seed]; ok {
+			out[target] = e.database
+		}
+	}
+	return out
+}
+
+// release drops one hold on a target. The caller holds the lock.
+func (s *Store) release(target string) {
+	if s.held[target] <= 1 {
+		delete(s.held, target)
+		return
+	}
+	s.held[target]--
 }
 
 // Apply records what a complete inventory saw and removes what it proves gone.
@@ -335,7 +409,7 @@ func (s *Store) Apply(c Census) (confirmed, removed int) {
 	defer s.mtx.Unlock()
 
 	for key, rec := range s.seen {
-		database, owned := c.about(key)
+		database, owned := s.about(c, key)
 		if !owned {
 			continue
 		}
@@ -358,7 +432,47 @@ func (s *Store) Apply(c Census) (confirmed, removed int) {
 		delete(s.seen, key)
 		removed++
 	}
+
+	// Then the relations themselves, which are state too and would otherwise
+	// be the thing that grows.
+	//
+	// A relation goes only when every record under its connection has gone
+	// with it. One profile's record being removed says nothing about another
+	// profile's record under the same connection, and a record protected by a
+	// newer inventory or by work in flight is still a record. Dropping the
+	// relation under it would leave that record with no owner, which is the
+	// state nothing can reach.
+	//
+	// A connection a scrape is holding is left alone, relation and all. That
+	// is a removal deferred rather than done, and the next complete inventory
+	// after the work finishes is what does it.
+	for target, e := range s.edges {
+		if _, built := e.seeds[c.Target]; !built {
+			continue
+		}
+		if _, present := c.Databases[e.database]; present {
+			continue
+		}
+		if s.held[target] > 0 {
+			continue
+		}
+		if s.anyRecordUnder(target) {
+			continue
+		}
+		delete(s.edges, target)
+	}
 	return confirmed, removed
+}
+
+// anyRecordUnder says whether anything is still held about a connection. The
+// caller holds the lock.
+func (s *Store) anyRecordUnder(target string) bool {
+	for key := range s.seen {
+		if key.Target == target {
+			return true
+		}
+	}
+	return false
 }
 
 // about says which database a key is about and whether this census may act on
@@ -369,9 +483,12 @@ func (s *Store) Apply(c Census) (confirmed, removed int) {
 // record under the seed's own connection is about the database it names, and
 // one that names none is about the connection itself, which no catalogue can
 // report missing.
-func (c Census) about(key Key) (string, bool) {
-	if database, ok := c.Children[key.Target]; ok {
-		return database, true
+func (s *Store) about(c Census, key Key) (string, bool) {
+	if e, ok := s.edges[key.Target]; ok {
+		if _, built := e.seeds[c.Target]; built {
+			return e.database, true
+		}
+		return "", false
 	}
 	if key.Target == c.Target {
 		return key.Database, key.Database != ""

@@ -46,9 +46,10 @@ func catalogueThatLoses(current string, others *[]string, eligible map[string]bo
 	}
 }
 
-// connectionTo finds the connection a seed built to open one of its databases.
-func connectionTo(seed, database string) (string, bool) {
-	for id, name := range targetid.ChildrenOf(seed) {
+// connectionTo finds the connection a seed built to open one of its databases,
+// as the store that holds the records knows it.
+func connectionTo(store *lastsuccess.Store, seed, database string) (string, bool) {
+	for id, name := range store.Owned(seed) {
 		if name == database {
 			return id, true
 		}
@@ -81,7 +82,7 @@ func TestBuiltInCollectionMaintainsItsOwnState(t *testing.T) {
 	collectEngine(t, e)
 
 	seed, _ := targetid.ID(e.instance.dsn)
-	target, built := connectionTo(seed, "other")
+	target, built := connectionTo(store, seed, "other")
 	if !built {
 		t.Fatal("no connection was built for other, so it was never discovered")
 	}
@@ -121,7 +122,7 @@ func TestBuiltInCollectionKeepsADatabaseItCanNoLongerReach(t *testing.T) {
 	collectEngine(t, e)
 
 	seed, _ := targetid.ID(e.instance.dsn)
-	target, built := connectionTo(seed, "other")
+	target, built := connectionTo(store, seed, "other")
 	if !built {
 		t.Fatal("no connection was built for other, so it was never discovered")
 	}

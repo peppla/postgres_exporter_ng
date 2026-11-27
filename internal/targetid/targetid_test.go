@@ -18,6 +18,7 @@
 package targetid
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -111,55 +112,55 @@ func TestConcurrentAssignmentIsSafe(t *testing.T) {
 	}
 }
 
-// TestATwiceDerivedConnectionBelongsToBothSeeds is what keeps a cleanup from
-// depending on one seed.
+// TestTwoProcessesDoNotAgree is what the private key buys.
 //
-// Two seeds can open the same server as the same role, differing only in which
-// database the seed itself connects to. Each builds the same connection string
-// for a third database, which is therefore one connection reached two ways.
-// Recorded under only the first seed, the second's catalogue says nothing
-// about it: a newer complete inventory read through the second cannot confirm
-// the connection is still there, so an older inventory read through the first,
-// finishing late, removes its history. It also leaves the cleanup working only
-// while the first seed keeps being scraped.
-func TestATwiceDerivedConnectionBelongsToBothSeeds(t *testing.T) {
+// An identity is published in a label. If it were a plain digest of the
+// connection string, anyone reading the label could digest a guessed password
+// and compare. Under a key this process reads at startup and never discloses,
+// the same connection string gives a different identity in another process,
+// so nothing outside it can relate the two.
+func TestTwoProcessesDoNotAgree(t *testing.T) {
 	Clear()
 	defer Clear()
 
-	const child = "postgresql://reader:secret@db:5432/app?sslmode=disable"
-	first, _ := Derived("A", child, "app")
-	again, _ := Derived("B", child, "app")
-	if again != first {
-		t.Fatalf("one connection string was given two identities, %q and %q", first, again)
-	}
+	const dsn = "postgresql://reader:secret@db:5432/app?sslmode=disable"
+	before, _ := ID(dsn)
 
-	for _, seed := range []string{"A", "B"} {
-		children := ChildrenOf(seed)
-		if database, ok := children[first]; !ok || database != "app" {
-			t.Errorf("seed %s has children %v, and the connection it built for app is not among them", seed, children)
-		}
+	Rekey()
+	defer Rekey()
+	after, _ := ID(dsn)
+
+	if before == after {
+		t.Errorf("one connection string gave the identity %q under two keys", before)
 	}
-	if children := ChildrenOf("C"); len(children) != 0 {
-		t.Errorf("a seed that derived nothing has children %v", children)
+	if len(before) != Width || len(after) != Width {
+		t.Errorf("identities are %d and %d characters, want %d", len(before), len(after), Width)
 	}
 }
 
-// TestADerivedConnectionIsNotConfusedWithAnother keeps the relation narrow.
-func TestADerivedConnectionIsNotConfusedWithAnother(t *testing.T) {
+// TestNothingIsKeptPerConnection bounds this package.
+//
+// It holds no map from connection strings to identities, so the only thing
+// that can grow is the record of what has been logged, and that is capped.
+// Past the cap the mapping stops being logged and nothing else changes.
+func TestNothingIsKeptPerConnection(t *testing.T) {
 	Clear()
 	defer Clear()
 
-	mine, _ := Derived("A", "postgresql://reader:secret@db:5432/app?sslmode=disable", "app")
-	// The same server and database as a different role. A role sees different
-	// tables, so this is a different connection context and its own identity.
-	theirs, _ := Derived("B", "postgresql://other:secret@db:5432/app?sslmode=disable", "app")
-	if mine == theirs {
-		t.Fatalf("two roles on one database share the identity %q", mine)
+	for i := 0; i < loggedCap*2; i++ {
+		dsn := "postgresql://u:p@db:5432/d" + strconv.Itoa(i) + "?sslmode=disable"
+		id, first := ID(dsn)
+		if len(id) != Width {
+			t.Fatalf("identity %q is %d characters, want %d", id, len(id), Width)
+		}
+		if i < loggedCap && !first {
+			t.Fatalf("connection %d was not reported as new", i)
+		}
+		if i >= loggedCap && first {
+			t.Fatalf("connection %d was reported as new past the cap", i)
+		}
 	}
-	if _, ok := ChildrenOf("A")[theirs]; ok {
-		t.Error("one seed's children include a connection another seed built")
-	}
-	if _, ok := ChildrenOf("B")[mine]; ok {
-		t.Error("one seed's children include a connection another seed built")
+	if Len() > loggedCap {
+		t.Errorf("%d identities remembered, want at most %d", Len(), loggedCap)
 	}
 }

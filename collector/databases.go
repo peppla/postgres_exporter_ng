@@ -33,6 +33,7 @@ import (
 
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
 )
 
@@ -62,6 +63,9 @@ const catalogQuery = `SELECT datname, datname = current_database() AS is_current
 type dbTarget struct {
 	datname string
 	dsn     string
+	// target is the identity of this database's connection, which is what its
+	// records are keyed by.
+	target string
 	// control marks the database the configured connection is on. Its
 	// connection is the one cluster-wide collectors use, so it is opened
 	// whether or not it is in the selected set.
@@ -110,6 +114,18 @@ type dbSelection struct {
 	// inventory. Before the read rather than after it: what it may authorise
 	// forgetting is what was already there when it started looking.
 	taken time.Time
+	// release ends the holds this selection took on the connections it built.
+	// Called when the request is done with them, which is not when one
+	// database's collection finishes: a request can record under a connection
+	// at any point before it ends.
+	release []func()
+}
+
+// done ends every hold this selection took.
+func (s dbSelection) done() {
+	for _, release := range s.release {
+		release()
+	}
 }
 
 // selectDatabases reads the catalog over the control connection and applies
@@ -120,7 +136,7 @@ type dbSelection struct {
 // by marking it, not by dropping it: its connection is what the cluster-wide
 // collectors run on, and §4.0b says cluster-wide collection keeps working when
 // database-local collection for that database does not.
-func selectDatabases(ctx context.Context, inst *instance, exclude, include dbselect.List) (dbSelection, error) {
+func selectDatabases(ctx context.Context, inst *instance, exclude, include dbselect.List, store *lastsuccess.Store) (dbSelection, error) {
 	controlName, _ := config.DatabaseFromDSN(inst.dsn)
 	seed, _ := targetid.ID(inst.dsn)
 
@@ -204,10 +220,12 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 			continue
 		}
 		// Registered as built from this connection, which is what lets this
-		// server's catalogue decide its state is gone. Recorded here because
-		// here is where the connection string is built.
-		targetid.Derived(seed, dsn, name)
-		sel.targets = append(sel.targets, dbTarget{datname: name, dsn: dsn})
+		// server's catalogue decide its state is gone, and held until this
+		// request is done with it. Registered here because here is where the
+		// connection string is built.
+		id, _ := targetid.ID(dsn)
+		sel.release = append(sel.release, store.Own(seed, id, name))
+		sel.targets = append(sel.targets, dbTarget{datname: name, dsn: dsn, target: id})
 	}
 
 	return sel, nil

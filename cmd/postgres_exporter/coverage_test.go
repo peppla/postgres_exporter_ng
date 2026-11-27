@@ -1823,6 +1823,7 @@ func TestOnlyACompleteCatalogueReadAuthorisesForgetting(t *testing.T) {
 	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
 	target := identityOf(seed)
 	long := time.Now().Add(-time.Hour)
+	store.Own(target, target+"/gone", "gone")()
 	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "gone"}, long)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1867,9 +1868,12 @@ func TestACensusFromOneConnectionLeavesAnotherAlone(t *testing.T) {
 		WithLastSuccess(store),
 		CollectorName("exporter"),
 	)
+	// Only the first seed built its connection, which is what gives this
+	// census authority over one record and not the other.
+	store.Own("1", "1/gone", "gone")()
+	store.Own("2", "2/gone", "gone")()
 	e.applyCensus(lastsuccess.Census{
 		Target:    "1",
-		Children:  map[string]string{"1/gone": "gone"},
 		Taken:     time.Now(),
 		Databases: nameSet([]string{"kept"}),
 	})
@@ -1949,12 +1953,11 @@ func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T)
 	const child = "postgresql://reader:secret@db:5432/shared?sslmode=disable"
 	seedA := identityOf("postgresql://reader:secret@db:5432/one?sslmode=disable")
 	seedB := identityOf("postgresql://reader:secret@db:5432/two?sslmode=disable")
-	target := derivedIdentityOf(seedA, child, "shared")
-	if again := derivedIdentityOf(seedB, child, "shared"); again != target {
-		t.Fatalf("one connection string was given two identities, %q and %q", target, again)
-	}
+	target := identityOf(child)
 
 	store := lastsuccess.New()
+	store.Own(seedA, target, "shared")()
+	store.Own(seedB, target, "shared")()
 	long := time.Now().Add(-time.Hour)
 	key := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "shared"}
 	store.Record(key, long)
@@ -1969,7 +1972,6 @@ func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T)
 	// collected from it since, so its last success is still the old one.
 	e.applyCensus(lastsuccess.Census{
 		Target:    seedB,
-		Children:  targetid.ChildrenOf(seedB),
 		Taken:     time.Now().Add(-time.Minute),
 		Databases: nameSet([]string{"shared", "two"}),
 	})
@@ -1978,7 +1980,6 @@ func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T)
 	// not list the database.
 	e.applyCensus(lastsuccess.Census{
 		Target:    seedA,
-		Children:  targetid.ChildrenOf(seedA),
 		Taken:     time.Now().Add(-30 * time.Minute),
 		Databases: nameSet([]string{"one"}),
 	})

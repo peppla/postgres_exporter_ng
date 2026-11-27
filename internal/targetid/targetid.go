@@ -25,129 +25,121 @@
 // connections to one database as one role can set different search_path
 // values and read different tables through identical SQL.
 //
-// The identity is a number assigned on first use rather than a digest of the
-// connection string, because that string holds a password and a digest of a
-// password can be guessed at. It is stable while the process runs and is not
-// stable across restarts, which is what a process-owned identity costs.
+// The identity is the first 128 bits of HMAC-SHA-256 over the whole connection
+// string, under a key this process reads from crypto/rand at startup, written
+// as 32 hexadecimal characters.
+//
+// A plain digest would not do. The connection string holds a password, the
+// identity appears in a published label, and a digest of a guess can be
+// compared with a digest of the real thing. A publicly salted digest has the
+// same problem, since the salt is published with it. Under a key that never
+// leaves the process, nothing outside it can relate an identity to a
+// connection string.
+//
+// Deriving rather than assigning is what keeps this package from holding
+// anything. An assigned number needs a map from every connection string ever
+// seen, that map grows for as long as the process runs, and removing an entry
+// from it means a later lookup of the same string gets a different number
+// while records and schedules still refer to the old one. A function has none
+// of those questions: one connection string has one identity for the life of
+// the process, whether or not anything is still using it.
+//
+// It is not stable across restarts, which is what a process-owned identity
+// costs, and what the key buys.
 package targetid
 
 import (
-	"strconv"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"sync"
 )
 
+// Width is how many hexadecimal characters an identity has.
+//
+// 128 bits of the digest. The identity goes in a label, so shorter is better,
+// and a collision would merge two connection contexts into one series, so it
+// has to stay out of reach. At this width it is, for any number of connections
+// an exporter will see.
+const Width = 32
+
+// loggedCap is how many identities this package will remember having logged.
+//
+// ID says whether its caller is the first to ask for an identity, which is
+// what stops the mapping being logged on every scrape. Without an assignment
+// map there is nothing that knows, so this holds the answer and nothing else.
+//
+// Capped because it is the one thing here that could grow. Past the cap the
+// mapping stops being logged, which loses a debug line for connections beyond
+// the first few thousand and loses nothing else. A log line is a smaller thing
+// than an identity, and this is the trade the cap exists to make.
+const loggedCap = 4096
+
 var (
-	mtx      sync.Mutex
-	assigned = map[string]string{}
-	last     int
-	// derived records which seeds a connection was built from and which
-	// database it opens, keyed by the derived identity.
-	//
-	// Kept because a seed's complete catalogue is the only thing that can
-	// authorise forgetting a database, and what it authorises forgetting is
-	// the state held under that database's own connection identity rather
-	// than under the seed's. Without the link from one to the other, a
-	// cleanup holding a seed's inventory has nothing it is allowed to touch,
-	// and matching on host, port or database name instead would let one
-	// connection context remove another's history.
-	derived = map[string]parent{}
+	mtx    sync.Mutex
+	logged = map[string]struct{}{}
+	key    = newKey()
 )
 
-// parent is the seeds a derived connection came from and the database it
-// opens.
+// newKey reads the process's key.
 //
-// Every seed is kept, not the first. Two seeds on one server as one role build
-// the same connection string for the same database, and that is one connection
-// with two ways into it. Keeping only the first makes the second seed's
-// catalogue unable to say anything about it, so a newer inventory read through
-// the second cannot protect the connection from an older inventory read
-// through the first, and the whole cleanup then depends on the first seed
-// continuing to be scraped.
-type parent struct {
-	seeds    map[string]struct{}
-	database string
+// A process that cannot read one does not start. Falling back to a fixed key,
+// or to a counter, would quietly give back the property the key is there for,
+// and it would do it in exactly the deployments whose random source is
+// unusual.
+func newKey() []byte {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		panic("targetid: cannot read a key for target identities: " + err.Error())
+	}
+	return k
 }
 
-// ID returns the identity of a connection string, assigning one if this
-// process has not seen it before. The second return reports whether it was
-// assigned now, so a caller can record the mapping once rather than per
-// scrape.
+// ID returns this process's identity for a connection string, and whether this
+// is the first time it has been asked for one.
+//
+// The second return is for the caller that logs which connection an identity
+// stands for. It is true at most once per connection string, and it is false
+// once this package has stopped remembering, which is the cap above.
 func ID(dsn string) (string, bool) {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(dsn)) // nolint: errcheck // hash.Hash never returns an error
+	id := hex.EncodeToString(mac.Sum(nil))[:Width]
+
 	mtx.Lock()
 	defer mtx.Unlock()
-
-	if id, ok := assigned[dsn]; ok {
+	if _, seen := logged[id]; seen {
 		return id, false
 	}
-	last++
-	id := strconv.Itoa(last)
-	assigned[dsn] = id
+	if len(logged) >= loggedCap {
+		return id, false
+	}
+	logged[id] = struct{}{}
 	return id, true
 }
 
-// Len reports how many identities have been assigned.
-//
-// One entry per connection string the process has seen. Discovery produces one
-// per database, so a server whose databases come and go grows this by a
-// connection string and a number each, and nothing drops them: an identity
-// that was reused after being forgotten would relabel another target's series.
+// Len is how many identities this package has remembered logging, for the
+// tests that bound it. It is not how many connections exist.
 func Len() int {
 	mtx.Lock()
 	defer mtx.Unlock()
-	return len(assigned)
+	return len(logged)
 }
 
-// Derived assigns the identity for a connection built from a seed by opening a
-// different database on the same server as the same role, and records where it
-// came from.
-//
-// seed is the seed's own identity rather than its connection string, so the
-// string does not travel any further than it already has. database is the name
-// the derived connection opens, which the caller knows because it put the name
-// into the string.
-//
-// Calling this twice for one connection adds nothing the second time. A second
-// call with a different seed adds that seed: two seeds that build the same
-// connection string reach the same server the same way, so either one's
-// catalogue answers for it, and both have to be able to.
-func Derived(seed, dsn, database string) (string, bool) {
-	id, first := ID(dsn)
-
-	mtx.Lock()
-	defer mtx.Unlock()
-	p, ok := derived[id]
-	if !ok {
-		p = parent{seeds: map[string]struct{}{}, database: database}
-		derived[id] = p
-	}
-	p.seeds[seed] = struct{}{}
-	return id, first
-}
-
-// ChildrenOf returns the connections derived from one seed, as identity to the
-// database each opens.
-//
-// This is what relates a seed's catalogue to the records it may remove. A
-// caller holding a complete inventory read through that seed may act on the
-// children whose database the inventory does not list, and on nothing else.
-func ChildrenOf(seed string) map[string]string {
-	mtx.Lock()
-	defer mtx.Unlock()
-	out := map[string]string{}
-	for id, p := range derived {
-		if _, ok := p.seeds[seed]; ok {
-			out[id] = p.database
-		}
-	}
-	return out
-}
-
-// Clear forgets every identity. For tests, which would otherwise see the
-// numbers another test assigned.
+// Clear forgets what has been logged, for tests. It does not change any
+// identity, because no identity is stored.
 func Clear() {
 	mtx.Lock()
 	defer mtx.Unlock()
-	assigned = map[string]string{}
-	derived = map[string]parent{}
-	last = 0
+	logged = map[string]struct{}{}
+}
+
+// Rekey replaces the process key, for the tests that check two processes do
+// not agree. Nothing in production calls it.
+func Rekey() {
+	mtx.Lock()
+	defer mtx.Unlock()
+	key = newKey()
+	logged = map[string]struct{}{}
 }

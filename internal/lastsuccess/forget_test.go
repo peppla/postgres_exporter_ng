@@ -23,22 +23,37 @@ func childOf(seed, database string) string { return seed + "/" + database }
 // connection for in the past and the server no longer has: they are still
 // among the seed's connections, which is what gives the census anything to act
 // on.
-func census(seed string, taken time.Time, present []string, gone ...string) Census {
+func census(seed string, taken time.Time, present []string, _ ...string) Census {
 	set := make(map[string]struct{}, len(present))
-	children := map[string]string{}
 	for _, n := range present {
 		set[n] = struct{}{}
-		children[childOf(seed, n)] = n
 	}
-	for _, n := range gone {
-		children[childOf(seed, n)] = n
+	return Census{Target: seed, Taken: taken, Databases: set}
+}
+
+// own registers the connections a seed built, the way discovery does, and
+// returns the release for the holds that come with them.
+//
+// The store keeps the relation now, so a census carries only what the server
+// said. A fixture that did not register its connections would hand the store
+// an inventory it has no authority over, which is a census that removes
+// nothing, which is the defect these cases exist for.
+func own(s *Store, seed string, databases ...string) func() {
+	releases := make([]func(), 0, len(databases))
+	for _, name := range databases {
+		releases = append(releases, s.Own(seed, childOf(seed, name), name))
 	}
-	return Census{Target: seed, Children: children, Taken: taken, Databases: set}
+	return func() {
+		for _, release := range releases {
+			release()
+		}
+	}
 }
 
 // recordChild notes a success for a database under the connection built to
 // reach it.
 func recordChild(s *Store, seed, database string, at time.Time) Key {
+	own(s, seed, database)()
 	key := Key{Engine: EngineQuery, Target: childOf(seed, database), Database: database}
 	s.Record(key, at)
 	return key
@@ -224,6 +239,7 @@ func TestOnlyTheCensusOwnConnectionIsTouched(t *testing.T) {
 func TestEveryProfileOfThatConnectionIsCovered(t *testing.T) {
 	s := New()
 	long := time.Now().Add(-time.Hour)
+	own(s, "1", "gone")()
 	target := childOf("1", "gone")
 	// The same database under two profiles and both engines, one of them a
 	// whole-selection record nothing is scraping now.
@@ -251,7 +267,7 @@ func TestAnIncompleteCensusAuthorisesNothing(t *testing.T) {
 		name string
 		c    Census
 	}{
-		{"no databases at all", Census{Target: "1", Children: map[string]string{childOf("1", "gone"): "gone"}, Taken: time.Now()}},
+		{"no databases at all", Census{Target: "1", Taken: time.Now()}},
 		{"no connection named", Census{Taken: time.Now(), Databases: map[string]struct{}{}}},
 	} {
 		if _, removed := s.Apply(c.c); removed != 0 {
@@ -263,8 +279,8 @@ func TestAnIncompleteCensusAuthorisesNothing(t *testing.T) {
 	}
 }
 
-// TestACensusWithNoConnectionsOfItsOwnRemovesNothing is the state a process
-// is in before it has discovered anything.
+// TestACensusWithNoConnectionsOfItsOwnRemovesNothing is the state a seed is in
+// when it has discovered nothing.
 //
 // It is also what the cleanup looked like in production for every discovered
 // database: the census named the seed, every record was under a connection
@@ -274,9 +290,8 @@ func TestACensusWithNoConnectionsOfItsOwnRemovesNothing(t *testing.T) {
 	s := New()
 	recordChild(s, "1", "gone", time.Now().Add(-time.Hour))
 
-	c := census("1", time.Now(), []string{"kept"})
-	c.Children = nil
-	if _, removed := s.Apply(c); removed != 0 {
+	// A census read through a seed that built nothing.
+	if _, removed := s.Apply(census("2", time.Now(), []string{"kept"})); removed != 0 {
 		t.Errorf("%d records removed, want 0", removed)
 	}
 }
@@ -317,6 +332,7 @@ func TestAClusterRecordOnTheSeedIsLeftAlone(t *testing.T) {
 // cluster-wide or not, so nothing kept under it is an answer to any question.
 func TestAClusterRecordOnADroppedDatabasesConnectionGoes(t *testing.T) {
 	s := New()
+	own(s, "1", "gone")()
 	s.Record(Key{Engine: EngineCollector, Target: childOf("1", "gone"), Collector: "stat_bgwriter"},
 		time.Now().Add(-time.Hour))
 
@@ -365,5 +381,158 @@ func TestCensusesAndCollectionOverlap(t *testing.T) {
 	}
 	if _, ok := s.At(Key{Engine: EngineQuery, Target: childOf("1", "gone"), Database: "gone"}); ok {
 		t.Error("a database every census said was absent kept its record")
+	}
+}
+
+// TestAConnectionBuiltByTwoSeedsBelongsToBoth keeps a cleanup from depending
+// on one of them.
+//
+// Two seeds can be the same server and the same role, differing only in which
+// database the seed itself opens, and each then builds the same connection
+// string for a third database. That is one connection with two ways into it,
+// so either seed's catalogue has to be able to answer for it. Keeping only the
+// first leaves the cleanup working just while that seed is scraped.
+func TestAConnectionBuiltByTwoSeedsBelongsToBoth(t *testing.T) {
+	s := New()
+	target := "shared"
+	s.Own("A", target, "app")()
+	s.Own("B", target, "app")()
+
+	for _, seed := range []string{"A", "B"} {
+		if database, ok := s.Owned(seed)[target]; !ok || database != "app" {
+			t.Errorf("seed %s owns %v, and the connection it built for app is not among them", seed, s.Owned(seed))
+		}
+	}
+	if owned := s.Owned("C"); len(owned) != 0 {
+		t.Errorf("a seed that built nothing owns %v", owned)
+	}
+}
+
+// TestANewerInventoryThroughEitherSeedProtectsASharedConnection is the other
+// half of that, at the point it matters.
+func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T) {
+	s := New()
+	const target = "shared"
+	s.Own("A", target, "app")()
+	s.Own("B", target, "app")()
+
+	long := time.Now().Add(-time.Hour)
+	key := Key{Engine: EngineQuery, Target: target, Database: "app"}
+	s.Record(key, long)
+
+	// The newer read, through the second seed, saw the database.
+	if confirmed, _ := s.Apply(Census{Target: "B", Taken: time.Now().Add(-time.Minute),
+		Databases: map[string]struct{}{"app": {}}}); confirmed != 1 {
+		t.Fatalf("the newer inventory confirmed %d records, want 1", confirmed)
+	}
+	// The older read, through the first, began earlier and does not list it.
+	if _, removed := s.Apply(Census{Target: "A", Taken: time.Now().Add(-30 * time.Minute),
+		Databases: map[string]struct{}{}}); removed != 0 {
+		t.Errorf("an older inventory removed %d records after a newer one through the other seed confirmed the database", removed)
+	}
+	if _, ok := s.At(key); !ok {
+		t.Error("a shared connection lost its history to the seed that was read first")
+	}
+}
+
+// TestOwningAConnectionHoldsIt is what closes the window between discovering a
+// connection and recording under it.
+//
+// A request reads a connection's identity while discovering it and records
+// under that identity later. A catalogue read finishing in between would
+// retire the relation, and what the request then records would have no owner,
+// where no later catalogue read can reach it. Registering and holding together
+// means the connection cannot be retired while the request still has it.
+func TestOwningAConnectionHoldsIt(t *testing.T) {
+	s := New()
+	const target = "1/gone"
+	release := s.Own("1", target, "gone")
+
+	key := Key{Engine: EngineQuery, Target: target, Database: "gone"}
+	s.Record(key, time.Now().Add(-time.Hour))
+
+	if _, removed := s.Apply(census("1", time.Now(), nil)); removed != 0 {
+		t.Errorf("%d records removed while the request still had the connection", removed)
+	}
+	if _, ok := s.Owned("1")[target]; !ok {
+		t.Error("the relation was retired while the request still had the connection")
+	}
+
+	release()
+	if _, removed := s.Apply(census("1", time.Now(), nil)); removed != 1 {
+		t.Errorf("%d records removed once the request let go, want 1", removed)
+	}
+	if _, ok := s.Owned("1")[target]; ok {
+		t.Error("the relation outlived every record under it")
+	}
+}
+
+// TestAPublicationDuringCleanupIsNotOrphaned is the interleaving the hold
+// exists for.
+//
+// An old request publishes while a catalogue read that began before it is
+// removing what that read proved gone. The record it writes must still be
+// reachable by a later catalogue read, which means the relation under it has
+// to survive the first one.
+func TestAPublicationDuringCleanupIsNotOrphaned(t *testing.T) {
+	s := New()
+	const target = "1/gone"
+
+	// The request discovers the connection and holds it.
+	release := s.Own("1", target, "gone")
+
+	// A catalogue read taken before the request began finishes now, with the
+	// database absent.
+	taken := time.Now().Add(-time.Minute)
+	if _, removed := s.Apply(Census{Target: "1", Taken: taken, Databases: map[string]struct{}{}}); removed != 0 {
+		t.Fatalf("%d records removed, and there were none to remove", removed)
+	}
+
+	// The request publishes afterwards, for work it did before that read
+	// finished.
+	key := Key{Engine: EngineQuery, Target: target, Database: "gone"}
+	s.Record(key, taken.Add(-time.Second))
+	if _, ok := s.Owned("1")[target]; !ok {
+		t.Fatal("the record was published under a connection nothing owns")
+	}
+
+	// The request ends, and the next complete read is what removes it.
+	release()
+	_, removed := s.Apply(Census{Target: "1", Taken: time.Now(), Databases: map[string]struct{}{}})
+	if removed != 1 {
+		t.Errorf("%d records removed by the read after the request ended, want 1", removed)
+	}
+	if s.Len() != 0 || len(s.Owned("1")) != 0 {
+		t.Errorf("%d records and %d relations remain", s.Len(), len(s.Owned("1")))
+	}
+}
+
+// TestARelationOutlivesOneProfilesRecord is why removing a record does not
+// authorise retiring the connection it was about.
+//
+// Two profiles collect the same database. One profile's record is old enough
+// for a census to remove and the other has just been written, so it stays.
+// Retiring the relation on the strength of the first would leave the second
+// with no owner.
+func TestARelationOutlivesOneProfilesRecord(t *testing.T) {
+	s := New()
+	const target = "1/gone"
+	s.Own("1", target, "gone")()
+
+	old := Key{Engine: EngineQuery, Target: target, Database: "gone", Collector: "quiet"}
+	busy := Key{Engine: EngineQuery, Target: target, Database: "gone", Collector: "busy"}
+	s.Record(old, time.Now().Add(-time.Hour))
+
+	taken := time.Now()
+	s.Record(busy, taken.Add(time.Second))
+
+	if _, removed := s.Apply(Census{Target: "1", Taken: taken, Databases: map[string]struct{}{}}); removed != 1 {
+		t.Errorf("%d records removed, want the one the census is older than", removed)
+	}
+	if _, ok := s.Owned("1")[target]; !ok {
+		t.Error("the relation was retired while another profile's record under it survived")
+	}
+	if _, ok := s.At(busy); !ok {
+		t.Error("the record a census could not remove was removed anyway")
 	}
 }
