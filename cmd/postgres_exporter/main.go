@@ -27,9 +27,9 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/percona/postgres_exporter/config"
-	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/slots"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	vc "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -219,10 +219,12 @@ func main() {
 	// One cache for the process, so a result a query file asked to keep
 	// survives the request that collected it.
 	queryCache := querycache.New()
-	// When each database was last collected without error, which no single
-	// scrape can answer.
-	lastSuccess := lastsuccess.New()
-	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache, lastSuccess,
+	// What no single scrape can answer: when each database was last collected
+	// without error, and where the last scrape of a profile got to.
+	// The configured connections go in, so a probe of one of them losing its
+	// slot does not take the configuration's own state with it.
+	stores := NewStoresWithLimits(slots.Limits{}, dsns)
+	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache, stores,
 		excludeSelection, includeSelection))
 
 	if *metricsPath != "/" && *metricsPath != "" {
@@ -245,7 +247,7 @@ func main() {
 		http.Handle("/", landingPage)
 	}
 
-	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema, limits, collectionGate))
+	http.HandleFunc("/probe", handleProbe(logger, excludedDatabases, connSema, limits, collectionGate, stores))
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *webConfig.WebListenAddresses)
 	// A backstop under the per-request write deadline. A handler sets its own

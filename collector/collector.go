@@ -30,6 +30,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/fanout"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -265,6 +266,11 @@ type PostgresCollector struct {
 	// lastSuccess outlives one scrape: how long a collector has been failing
 	// on a database cannot be answered from the scrape that is failing.
 	lastSuccess *lastsuccess.Store
+
+	// rotation outlives one scrape too, and for the same kind of reason: where
+	// the last scrape started is the one thing a new one cannot work out for
+	// itself. Nil means no rotation, so the order is the sorted one.
+	rotation *rotation.Store
 }
 
 type Option func(*PostgresCollector) error
@@ -394,6 +400,19 @@ func WithConnectionsSemaphore(sem *semaphore.Weighted, connections int64) Option
 	}
 }
 
+// WithRotation sets the process-owned schedule of which selected database is
+// offered the first attempt.
+//
+// Without one the order is the sorted order every scrape, which is what left a
+// selected set that does not fit the budget giving the same prefix every
+// opportunity and the rest none.
+func WithRotation(store *rotation.Store) Option {
+	return func(c *PostgresCollector) error {
+		c.rotation = store
+		return nil
+	}
+}
+
 // WithLastSuccess sets the process-owned record of when each collector last
 // ran without error on each database.
 func WithLastSuccess(store *lastsuccess.Store) Option {
@@ -490,18 +509,21 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	var sel dbSelection
 	if databaseLocal {
 		var err error
-		sel, err = selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases)
+		sel, err = selectDatabases(p.ctx, inst, p.excludeDatabases, p.includeDatabases, p.lastSuccess)
 		if err != nil {
 			level.Error(p.logger).Log("msg", "Error listing databases", "err", err)
 		}
+		// Held until this request is finished with these connections, so a
+		// catalogue read in another request cannot retire one while this one
+		// is still recording under it.
+		defer sel.done()
+		p.applyCensus(inst.dsn, sel)
 	}
 	p.reportSelection(ch, inst.name, sel, databaseLocal)
 	selected := localSelected(sel, databaseLocal)
 
-	// The control connection is held for the cluster-wide work and released
-	// before the fan-out, so the per-database connections are bounded by the
-	// same semaphore rather than competing with a permit this call is sitting
-	// on.
+	// The cluster-wide collectors run on the connection that is already open,
+	// once per server, which is what they describe.
 	wg := sync.WaitGroup{}
 	wg.Add(len(cluster))
 	for name, c := range cluster {
@@ -510,34 +532,28 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 			execute(p.ctx, name, c, inst, ch, p.logger, "", p.lastSuccess)
 		}(name, c)
 	}
+	wg.Wait()
 
-	// The control database's own database-local collectors run on the
-	// connection that is already open, so it is not opened twice.
-	//
-	// Their successes are counted because completion is all of them, not the
-	// ones that ran: a database whose collection was partly left out is not a
-	// database this scrape covered.
-	control := sel.controlTarget()
-	controlLocal := control != nil && !control.skipDatabaseLocal
 	// The selection this request made, which is the context its database-level
 	// freshness belongs to. A narrow request records and reads its own, so it
 	// neither claims a wider selection's coverage nor goes without a time of
 	// its own.
 	selection := selectionOf(local)
-	controlBegin := time.Now()
-	var controlOutcome localOutcome
-	if controlLocal {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			controlOutcome = runLocalCollectors(p.ctx, local, inst, ch, p.logger, control.datname, p.lastSuccess)
-		}()
-	}
-	wg.Wait()
+	control := sel.controlTarget()
+
+	// Released before any database-local work, including the configured
+	// connection database's own. This connection was opened for the cluster
+	// collectors and the catalogue read, and holding it through the fan-out
+	// would keep a permit from a database whose turn has come.
+	//
+	// It is what lets the configured connection database take its turn in order
+	// rather than always first. Its database-local collectors used to run here,
+	// on this connection, before any other database was offered one, so a
+	// selected set whose first database spends the budget left the rest with no
+	// opportunity however the rest were ordered.
 	inst.Close()
 	permit.Release()
 
-	// The control connection worked, whatever was selected to run over it.
 	// Without a catalog read there is no target to take the name from, so it
 	// comes from the connection string, which is where reportControlFailure
 	// takes it from on the paths where the connection did not work.
@@ -545,26 +561,12 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 	if control != nil {
 		upName = control.datname
 	}
-	ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, upName)
-
-	// A collector that failed on the control database is that database not
-	// covered, exactly as it is for the databases the fan-out opens. The
-	// connection worked, so database_up above stays 1 and the diagnostic
-	// beside it says what did not.
-	controlFailed := 0
-	if controlLocal && controlOutcome.ran != len(local) {
-		controlFailed = 1
-		reportIncompleteDatabase(ch, inst.name, upName, controlOutcome)
-	}
-	if controlLocal {
-		controlTarget, _ := targetid.ID(inst.dsn)
-		if controlFailed == 0 {
-			p.lastSuccess.Record(databaseKey(controlTarget, upName, selection), controlBegin)
-		}
-		p.publishDatabaseFreshness(ch, controlTarget, upName, selection)
-	}
 
 	if !databaseLocal {
+		// The observation from the cluster-wide work. No database-local turn
+		// is coming on this path, so this is the one sample for this database.
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, upName)
+
 		// Nothing was selected, so nothing was attempted, covered, failed or
 		// deferred. Reported as four zeros rather than left out: a
 		// cluster-only request already publishes a selected count of zero,
@@ -577,23 +579,74 @@ func (p PostgresCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	// The databases this fan-out opens a connection for. The control database
-	// is not among them: its database-local collectors ran above, on the
-	// connection that was already open.
+	// Every selected database the fan-out opens a connection for, the
+	// configured connection database among them. It is an ordinary member here
+	// so that there is one path for what a database-local attempt comes to and
+	// one accounting of its freshness, rather than a second copy of both for
+	// one database.
+	//
+	// It costs one connection and one session setup for that database on every
+	// scrape that selects it for database-local work, including a server with
+	// one database, because the connection opened for the cluster work has been
+	// released by now.
 	pending := make([]dbTarget, 0, len(sel.targets))
+	controlPending := false
 	for _, t := range sel.targets {
-		if t.control || t.skipDatabaseLocal {
+		if t.skipDatabaseLocal {
 			continue
+		}
+		if t.control {
+			// Its connection was made and it worked. A deferral of its local
+			// work must not say otherwise.
+			t.baselineConnected = true
+			controlPending = true
 		}
 		pending = append(pending, t)
 	}
-	failed, deferred := p.collectDatabases(ch, pending, local, inst.name, selection)
+
+	// The observation from the cluster-wide work, published here only when no
+	// local turn of its own will publish one. One sample per database per
+	// scrape: a second would be two answers under the same labels.
+	if !controlPending {
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 1, inst.name, upName)
+	}
+
+	// Rotated, so the database offered the first attempt is not the same one
+	// every scrape. The order is a rotation and not a selection: every database
+	// here is still visited, and the ones that get no attempt are still named
+	// as deferred.
+	//
+	// The schedule is given the names, not a count, because it remembers which
+	// database it chose rather than how many scrapes have been. A database that
+	// stays selected while others come and go is otherwise stepped over
+	// indefinitely.
+	members := make([]string, 0, len(pending))
+	for _, t := range pending {
+		members = append(members, t.datname)
+	}
+	order := rotation.Order(p.rotation.Next(p.rotationKey(inst.dsn, selection), members), len(pending))
+	rotated := make([]dbTarget, 0, len(pending))
+	for _, i := range order {
+		rotated = append(rotated, pending[i])
+	}
+
+	failed, deferred := p.collectDatabases(ch, rotated, local, inst.name, selection)
 
 	// After the fan-out, because it is the only point where the numbers are
 	// known. Published even when they are zero, so that a scrape which
 	// deferred nothing says so rather than leaving a reader to wonder whether
 	// the series is missing or the exporter kept up.
-	p.reportOutcome(ch, inst.name, selected, failed+controlFailed, deferred)
+	p.reportOutcome(ch, inst.name, selected, failed, deferred)
+}
+
+// rotationKey is the schedule this request's database-local work belongs to.
+//
+// Scoped by engine, by the connection, and by the selection, so two collection
+// profiles walking different sets do not advance each other's turn and the
+// query engine's schedule is its own.
+func (p PostgresCollector) rotationKey(dsn, selection string) rotation.Key {
+	target, _ := targetid.ID(dsn)
+	return rotation.Key{Engine: "collector", Target: target, Profile: selection}
 }
 
 // collectDatabases runs the database-local work across the databases the
@@ -709,6 +762,38 @@ const (
 	outcomeDeferred
 )
 
+// applyCensus hands the server's own catalogue to the store that keeps
+// per-database state, which is what authorises forgetting a database.
+//
+// This engine applies its own. The query engine applies one too, but only a
+// request that runs application queries reaches that code, and a deployment
+// collecting nothing but built-in metrics never does. State that built-in
+// monitoring creates has to be maintained by built-in monitoring.
+//
+// Only a complete, successful, unfiltered read gets this far. A read that
+// failed leaves no inventory, and a filtered one is missing a database that
+// lost CONNECT, which is absent for a reason that has nothing to do with
+// existing.
+func (p PostgresCollector) applyCensus(dsn string, sel dbSelection) {
+	if !sel.catalogRead || sel.inventory == nil {
+		return
+	}
+	seed, _ := targetid.ID(dsn)
+	databases := make(map[string]struct{}, len(sel.inventory))
+	for _, name := range sel.inventory {
+		databases[name] = struct{}{}
+	}
+	_, removed := p.lastSuccess.Apply(lastsuccess.Census{
+		Target:    seed,
+		Taken:     sel.taken,
+		Databases: databases,
+	})
+	if removed > 0 {
+		level.Info(p.logger).Log("msg", "Forgot databases the server no longer has",
+			"target", seed, "records", removed)
+	}
+}
+
 // collectDatabase opens one database and runs the database-local collectors
 // against it.
 //
@@ -728,8 +813,10 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		// Deferred, not failed. Nothing was connected to and nothing was
 		// tried, so this says the exporter ran out of room rather than that
 		// something is wrong with this database, and an alert on the error
-		// series must not fire for it. database_up is still 0: it was not
-		// reached.
+		// series must not fire for it. database_up is 0 because it was not
+		// reached, except for the configured connection database, whose
+		// connection this scrape already made for the cluster-wide work. For
+		// that one the observation stands.
 		//
 		// The reason says which of the three was observed: no permit
 		// available to this work, the scrape's time gone, or the scrape
@@ -738,7 +825,11 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		// fallback, the caps and the parent context together.
 		reason := deferralReason(decision)
 		level.Warn(p.logger).Log("msg", "Deferred a database", "datname", t.datname, "reason", reason)
-		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, 0, server, t.datname)
+		up := 0.0
+		if t.baselineConnected {
+			up = 1
+		}
+		ch <- prometheus.MustNewConstMetric(collectorDatabaseUpDesc, prometheus.GaugeValue, up, server, t.datname)
 		ch <- prometheus.MustNewConstMetric(collectorDeferredDatabaseDesc, prometheus.GaugeValue, 1,
 			server, t.datname, reason)
 		p.publishRetained(ch, local, target, t.datname)
@@ -746,6 +837,12 @@ func (p PostgresCollector) collectDatabase(ch chan<- prometheus.Metric, t dbTarg
 		return outcomeDeferred
 	}
 	defer permit.Release()
+
+	// Held for as long as this database is being collected. A catalogue read
+	// that started before this work can finish during it, and its list is then
+	// older than whatever this is in the middle of doing. Both engines share
+	// the store, so both have to protect their work the same way.
+	defer p.lastSuccess.Hold(target)()
 
 	dbInst, err := newInstance(t.dsn)
 	if err == nil {
@@ -831,7 +928,7 @@ func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, 
 		if database == "" || !p.controlSelected(database) {
 			continue
 		}
-		p.publishRetainedOne(ch, target, database, name)
+		publishRetainedOne(ch, p.lastSuccess, target, database, name)
 	}
 
 	// The database as a whole, resolved the same way and gated the same way,
@@ -898,20 +995,30 @@ func (p PostgresCollector) publishDatabaseFreshness(ch chan<- prometheus.Metric,
 // that has never succeeded here, and nothing is recorded: this says what was
 // already known.
 func (p PostgresCollector) publishRetained(ch chan<- prometheus.Metric, collectors map[string]Collector, target, datname string) {
+	publishRetained(ch, p.lastSuccess, collectors, target, datname)
+}
+
+// publishRetained publishes what each collector last did on one connection.
+//
+// A free function because the probe endpoint needs the same thing on its own
+// early returns and is not a PostgresCollector. A path that runs no collector
+// has to say what was already known, or the freshness series goes missing at
+// the moment it is being read to find out how long something has been broken.
+func publishRetained(ch chan<- prometheus.Metric, store *lastsuccess.Store, collectors map[string]Collector, target, datname string) {
 	for name := range collectors {
-		p.publishRetainedOne(ch, target, datname, name)
+		publishRetainedOne(ch, store, target, datname, name)
 	}
 }
 
 // publishRetainedOne publishes what one collector last did on one database.
-func (p PostgresCollector) publishRetainedOne(ch chan<- prometheus.Metric, target, datname, name string) {
+func publishRetainedOne(ch chan<- prometheus.Metric, store *lastsuccess.Store, target, datname, name string) {
 	key := lastsuccess.Key{
 		Engine:    lastsuccess.EngineCollector,
 		Target:    target,
 		Database:  datname,
 		Collector: name,
 	}
-	if when, ok := p.lastSuccess.At(key); ok {
+	if when, ok := store.At(key); ok {
 		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
 			float64(when.UnixNano())/1e9, name, datname, target)
 	}
@@ -932,6 +1039,18 @@ func (p PostgresCollector) byScope() (cluster, local map[string]Collector) {
 		cluster[name] = c
 	}
 	return cluster, local
+}
+
+// Profile is the canonical set of database-local collectors this request
+// selected, which is the name its retained per-database state is kept under.
+//
+// Exported so the handler can ask for the slot that state needs before
+// serving the request, which is before any SQL. Empty when nothing
+// database-local was selected, and then there is no per-database state and
+// nothing to admit.
+func (p PostgresCollector) Profile() string {
+	_, local := p.byScope()
+	return selectionOf(local)
 }
 
 // selectionOf is the canonical form of the database-local collectors a request

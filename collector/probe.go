@@ -19,6 +19,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -30,6 +32,15 @@ type ProbeCollector struct {
 	instance   *instance
 	connSema   *semaphore.Weighted
 	ctx        context.Context
+	// lastSuccess is when each collector last worked on this connection.
+	//
+	// The probe builds an exporter per request, so anything remembered
+	// between requests has to come from the process. An earlier version
+	// passed nothing, on the reasoning that a target named in a request has
+	// nothing for a record to belong to. A recurring probe target is a
+	// Prometheus target with a stable connection context, which is the same
+	// thing the admission below it now counts, so there is.
+	lastSuccess *lastsuccess.Store
 }
 
 // NewProbeCollector builds the collector behind the probe endpoint.
@@ -39,7 +50,7 @@ type ProbeCollector struct {
 // from the DSN threw those away, so the probe's own connection had no bound
 // on how long it could spend being established while the rest of the request
 // was budgeted.
-func NewProbeCollector(ctx context.Context, logger log.Logger, excludeDatabases []string, registry *prometheus.Registry, connectionString string, connSema *semaphore.Weighted) (*ProbeCollector, error) {
+func NewProbeCollector(ctx context.Context, logger log.Logger, excludeDatabases []string, registry *prometheus.Registry, connectionString string, connSema *semaphore.Weighted, lastSuccess *lastsuccess.Store) (*ProbeCollector, error) {
 	collectors := make(map[string]Collector)
 	initiatedCollectorsMtx.Lock()
 	defer initiatedCollectorsMtx.Unlock()
@@ -73,12 +84,13 @@ func NewProbeCollector(ctx context.Context, logger log.Logger, excludeDatabases 
 	}
 
 	return &ProbeCollector{
-		registry:   registry,
-		collectors: collectors,
-		logger:     logger,
-		instance:   instance,
-		connSema:   connSema,
-		ctx:        ctx,
+		registry:    registry,
+		collectors:  collectors,
+		logger:      logger,
+		instance:    instance,
+		connSema:    connSema,
+		ctx:         ctx,
+		lastSuccess: lastSuccess,
 	}, nil
 }
 
@@ -86,8 +98,18 @@ func (pc *ProbeCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
+	// Held from here, so a cleanup cannot retire this connection's history
+	// underneath the work that is reading or writing it.
+	target, _ := targetid.ID(pc.instance.dsn)
+	defer pc.lastSuccess.Hold(target)()
+
 	if err := pc.connSema.Acquire(pc.ctx, 1); err != nil {
 		level.Warn(pc.logger).Log("msg", "Failed to acquire semaphore", "err", err)
+		// No collector runs, so each one's last success is what is still
+		// known about it. Returning silently dropped the freshness series at
+		// exactly the moment an operator reads it to find out how long this
+		// has been going on.
+		publishRetained(ch, pc.lastSuccess, pc.collectors, target, "")
 		return
 	}
 	defer pc.connSema.Release(1)
@@ -96,6 +118,7 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	err := pc.instance.setup(pc.ctx)
 	if err != nil {
 		level.Error(pc.logger).Log("msg", "Error opening connection to database", "err", err)
+		publishRetained(ch, pc.lastSuccess, pc.collectors, target, "")
 		return
 	}
 	defer pc.instance.Close()
@@ -104,10 +127,7 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	wg.Add(len(pc.collectors))
 	for name, c := range pc.collectors {
 		go func(name string, c Collector) {
-			// No store: the probe endpoint collects one target named in the
-			// request, so there is nothing for a process-owned record to
-			// belong to between requests.
-			execute(pc.ctx, name, c, pc.instance, ch, pc.logger, "", nil)
+			execute(pc.ctx, name, c, pc.instance, ch, pc.logger, "", pc.lastSuccess)
 			wg.Done()
 		}(name, c)
 	}

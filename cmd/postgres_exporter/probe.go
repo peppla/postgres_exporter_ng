@@ -24,12 +24,14 @@ import (
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
+	"github.com/percona/postgres_exporter/internal/slots"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
 )
 
-func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semaphore.Weighted, limits budget.Limits, gate *semaphore.Weighted) http.HandlerFunc {
+func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semaphore.Weighted, limits budget.Limits, gate *semaphore.Weighted, stores Stores) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The probe collects, so it spends the same budget as /metrics. It
 		// used to take neither the admission slot nor a deadline, so the
@@ -88,7 +90,33 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 
 		// TODO(@sysadmind): Timeout
 
-		tl := log.With(logger, "target", target)
+		// A slot for this connection, taken before any SQL and after the
+		// target has been validated above.
+		//
+		// This endpoint's target comes from the request, so nothing
+		// configures how many distinct connections it will be asked about. It
+		// keeps a schedule and a last-success history per connection, which is
+		// what makes it a Prometheus target rather than a one-off check, and
+		// which is also what grows without a limit here.
+		//
+		// Named by the connection's identity rather than by the target
+		// string, so two spellings of one connection are one slot and a
+		// connection string does not end up in a map key.
+		id, _ := targetid.ID(dsn.GetConnectionString())
+		held, refused, admitted := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: id})
+		if !admitted {
+			contextsRejected.Inc()
+			level.Warn(logger).Log("msg", "Refused a probe connection", "target", loggableTarget(target))
+			http.Error(w, "probe connection refused: every connection slot is held by one that is still being probed, "+refused.Name,
+				http.StatusServiceUnavailable)
+			return
+		}
+		defer held()
+		defer stores.Slots.Sweep()
+
+		// Redacted, because this label is attached to every line this request
+		// logs and the target comes from the request.
+		tl := log.With(logger, "target", loggableTarget(target))
 
 		registry := prometheus.NewRegistry()
 
@@ -102,6 +130,19 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 			IncludeDatabases(*includeDatabases),
 			WithContext(ctx),
 			WithConnectionsSemaphore(connSema, limits.Connections),
+			// This endpoint builds an exporter for each request, so anything
+			// it needs to remember between requests has to come from the
+			// process. Without the schedule its rotation pointer was nil,
+			// which is no rotation at all, and discovery here can offer
+			// several databases, so its selected set had the same database
+			// offered the first attempt every time.
+			WithRotation(stores.Rotation),
+			// Without this the freshness series still appeared, because the
+			// time of a success is published from the success itself. What was
+			// lost was every earlier time: a request that could not connect
+			// published no freshness at all, where it should report when each
+			// database last worked. That is what the store is for.
+			WithLastSuccess(stores.LastSuccess),
 		}
 
 		// Both engines on this endpoint open through the same clamping
@@ -115,7 +156,7 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		registry.MustRegister(exporter)
 
 		// Run the probe
-		pc, err := collector.NewProbeCollector(ctx, tl, excludeDatabases, registry, dsns[0], connSema)
+		pc, err := collector.NewProbeCollector(ctx, tl, excludeDatabases, registry, dsns[0], connSema, stores.LastSuccess)
 		if err != nil {
 			level.Error(logger).Log("msg", "Error creating probe collector", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)

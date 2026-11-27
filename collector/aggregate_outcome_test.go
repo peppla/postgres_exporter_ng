@@ -128,9 +128,13 @@ func catalogueOf(current string, others ...string) func(int, sqlmock.Sqlmock) {
 		mock.ExpectPing()
 		mock.ExpectQuery("SELECT version").WillReturnRows(
 			sqlmock.NewRows([]string{"version"}).AddRow("PostgreSQL 18.0 on x86_64-pc-linux-gnu"))
-		rows := sqlmock.NewRows([]string{"datname", "is_current"}).AddRow(current, true)
+		// Three columns, because the read is unfiltered now: it returns every
+		// database and says which of them this role may collect from. A
+		// fixture with two columns describes the filtered read, which cannot
+		// authorise forgetting a database.
+		rows := sqlmock.NewRows([]string{"datname", "is_current", "eligible"}).AddRow(current, true, true)
 		for _, name := range others {
-			rows.AddRow(name, false)
+			rows.AddRow(name, false, true)
 		}
 		mock.ExpectQuery("FROM pg_database").WillReturnRows(rows)
 	}

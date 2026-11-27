@@ -19,14 +19,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-kit/log"
+	"github.com/percona/postgres_exporter/internal/budget"
+	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/rotation"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -583,9 +594,14 @@ func TestUnattemptedWorkIsNamedNotAttempted(t *testing.T) {
 func targetsForDSN(hostport string, names ...string) []scrapeTarget {
 	out := make([]scrapeTarget, 0, len(names))
 	for _, n := range names {
+		dsn := "postgresql://u:p@" + hostport + "/" + n + "?sslmode=disable"
 		out = append(out, scrapeTarget{
-			dsn:         "postgresql://u:p@" + hostport + "/" + n + "?sslmode=disable",
-			databaseRef: databaseRef{server: hostport, datname: n},
+			dsn: dsn,
+			// identity as the engine assigns it. Without it every target here
+			// shares the empty string, which is exactly the collision the
+			// schedule has to avoid, so a fixture missing it would hide the
+			// thing these tests are for.
+			databaseRef: databaseRef{server: hostport, datname: n, identity: identityOf(dsn)},
 		})
 	}
 	return out
@@ -994,5 +1010,1073 @@ func TestWorkThatNeverReachedTheLimiterNamesTheDeadline(t *testing.T) {
 		if g[key(name, reasonNoPermit)] != 0 {
 			t.Errorf("%s never asked for a permit and is named for one", name)
 		}
+	}
+}
+
+// TestEveryTargetInTheRequestGetsATurn covers the schedule this engine keeps.
+//
+// One schedule over everything the request selected, across servers as well as
+// within them. An earlier version grouped by server and rotated inside each
+// group, which keeps the first server ahead of every other on every request:
+// the groups' own schedules advance and nothing moves between them, so a later
+// server is never attempted when the first consumes the budget.
+func TestEveryTargetInTheRequestGetsATurn(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{
+		"postgresql://u:p@127.0.0.1:1/a?sslmode=disable",
+		"postgresql://u:p@127.0.0.1:2/x?sslmode=disable",
+	},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := append(targetsForDSN("127.0.0.1:1", "a", "b", "c"),
+		targetsForDSN("127.0.0.1:2", "x", "y")...)
+
+	firstOf := map[string]int{}
+	for scrape := 0; scrape < len(targets); scrape++ {
+		got := e.rotateTargets(targets)
+		if len(got) != len(targets) {
+			t.Fatalf("scrape %d returned %d of %d targets: a rotation must not drop one", scrape, len(got), len(targets))
+		}
+
+		// Every target still there, whatever the order.
+		seen := map[string]bool{}
+		for _, target := range got {
+			seen[target.dsn] = true
+		}
+		if len(seen) != len(targets) {
+			t.Fatalf("scrape %d returned %d distinct targets of %d", scrape, len(seen), len(targets))
+		}
+		firstOf[got[0].dsn]++
+	}
+
+	// As many scrapes as there are targets, so each has been first once.
+	if len(firstOf) != len(targets) {
+		t.Errorf("over %d scrapes only %d of the %d targets was ever offered the first attempt: %v",
+			len(targets), len(firstOf), len(targets), firstOf)
+	}
+}
+
+// TestTheTwoEnginesDoNotShareASchedule keeps one engine's turn out of the
+// other's for the same server.
+func TestTheTwoEnginesDoNotShareASchedule(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/one?sslmode=disable"},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+	targets := targetsForDSN("127.0.0.1:1", "a", "b")
+
+	// The collector engine takes several turns against the same server.
+	for i := 0; i < 3; i++ {
+		store.Next(rotation.Key{Engine: "collector", Target: "127.0.0.1:1", Profile: "all"},
+			[]string{"a", "b"})
+	}
+
+	got := e.rotateTargets(targets)
+	if got[0].datname != "a" {
+		t.Errorf("the query engine's first scrape starts at %s, want a: the other engine moved its schedule", got[0].datname)
+	}
+}
+
+// TestTheDatabaseOfferedTheFirstAttemptChangesBetweenScrapes goes through
+// scrapeTargets rather than the rotation helper, so it fails if the fan-out
+// takes the targets in the order it was handed rather than the scheduled one.
+//
+// One worker and a held permit, so exactly one database asks the limiter and
+// waits, reporting no_connection_permit, while the rest are reached after the
+// time has gone and report scrape_deadline. The database that asked is the one
+// the schedule put first, and over three scrapes it has to be a different one
+// each time.
+func TestTheDatabaseOfferedTheFirstAttemptChangesBetweenScrapes(t *testing.T) {
+	names := []string{"first", "second", "third"}
+	store := rotation.New()
+
+	asked := make([]string, 0, len(names))
+	for scrape := 0; scrape < len(names); scrape++ {
+		held := semaphore.NewWeighted(1)
+		if !held.TryAcquire(1) {
+			t.Fatal("the fixture could not take the only permit")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		targets := targetsForDSN("127.0.0.1:1", names...)
+		e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/first?sslmode=disable"},
+			WithContext(ctx),
+			WithConnectionsSemaphore(held, 1),
+			WithRotation(store),
+			CollectorName("exporter"),
+		)
+		e.coverage.setSelection(true, true, len(names), targets, nil, 0)
+
+		ch, stop := drain()
+		_, _, deferred := e.scrapeTargets(ch, targets)
+		stop()
+		cancel()
+		held.Release(1)
+
+		if deferred != len(names) {
+			t.Fatalf("scrape %d deferred %d of %d databases", scrape, deferred, len(names))
+		}
+
+		g := series(t, e.coverage)
+		for _, name := range names {
+			if g["pg_exporter_database_deferred{datname="+name+",reason="+reasonNoPermit+",server=127.0.0.1:1}"] == 1 {
+				asked = append(asked, name)
+			}
+		}
+	}
+
+	// The premise. Without exactly one database asking per scrape, the order
+	// cannot be read off the reasons at all.
+	if len(asked) != len(names) {
+		t.Fatalf("%d databases asked the limiter across %d scrapes, want one each: %v", len(asked), len(names), asked)
+	}
+	seen := map[string]bool{}
+	for _, name := range asked {
+		if seen[name] {
+			t.Errorf("the databases offered the first attempt were %v, want a different one each scrape", asked)
+			break
+		}
+		seen[name] = true
+	}
+}
+
+// TestTwoConnectionsToOneDatabaseBothGetATurn is the collision a host and port
+// cannot see.
+//
+// Two configured connections differing only in role, over the same endpoint and
+// the same database. Keyed and named by host, port and database they are the
+// same member, so the first target matching that name is chosen every time and
+// the other never gets a turn. Both are always returned, so this is starvation
+// rather than a dropped target.
+func TestTwoConnectionsToOneDatabaseBothGetATurn(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{"postgresql://role_a@127.0.0.1:1/app?sslmode=disable"},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := []scrapeTarget{}
+	for _, role := range []string{"role_a", "role_b"} {
+		dsn := "postgresql://" + role + "@127.0.0.1:1/app?sslmode=disable"
+		targets = append(targets, scrapeTarget{
+			dsn:         dsn,
+			databaseRef: databaseRef{server: "127.0.0.1:1", datname: "app", identity: identityOf(dsn)},
+		})
+	}
+
+	firstOf := map[string]int{}
+	for call := 0; call < 12; call++ {
+		got := e.rotateTargets(targets)
+		if len(got) != len(targets) {
+			t.Fatalf("call %d returned %d of %d targets", call, len(got), len(targets))
+		}
+		firstOf[got[0].dsn]++
+	}
+
+	if len(firstOf) != len(targets) {
+		t.Errorf("over twelve calls only %d of the two connections was ever first: %v", len(firstOf), firstOf)
+	}
+}
+
+// TestASecondServerGetsATurn is the other half. Rotating inside each server's
+// own group moves nothing between servers, so when the first server's attempt
+// consumes the budget the second is never attempted.
+func TestASecondServerGetsATurn(t *testing.T) {
+	store := rotation.New()
+	e := NewExporter([]string{
+		"postgresql://u:p@host_a:5432/app?sslmode=disable",
+		"postgresql://u:p@host_b:5432/app?sslmode=disable",
+	},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := append(targetsForDSN("host_a:5432", "app"), targetsForDSN("host_b:5432", "app")...)
+
+	firstOf := map[string]int{}
+	for call := 0; call < 12; call++ {
+		got := e.rotateTargets(targets)
+		if len(got) != len(targets) {
+			t.Fatalf("call %d returned %d of %d targets", call, len(got), len(targets))
+		}
+		firstOf[got[0].server]++
+	}
+
+	if len(firstOf) != 2 {
+		t.Errorf("over twelve calls only %v was ever first, so a later server never gets an opportunity", firstOf)
+	}
+}
+
+// TestHealthAnswersForWorkThatNeverStarted covers the rule that decides pg_up
+// and pg_exporter_last_scrape_error.
+//
+// The case that was wrong: a role that cannot log in. Discovery's connection
+// fails, so the fan-out has only the seed and defers it, and the fan-out's own
+// counts are all zero. Reading only those reported the server as up and the
+// scrape as clean, while the server log recorded the refused login.
+func TestHealthAnswersForWorkThatNeverStarted(t *testing.T) {
+	for _, c := range []struct {
+		name                                  string
+		targets, deferred, connErrors, errors int
+		d                                     discovery
+		wantUp, wantFailed                    float64
+	}{
+		{
+			name: "a login that was refused, with nothing attempted after it",
+			// What ChatGPT measured: 1/0/0/0/1, discovery_success 0.
+			targets: 1, deferred: 1,
+			d:      discovery{ok: false, connectFailures: 1},
+			wantUp: 0, wantFailed: 1,
+		},
+		{
+			name:    "every target failed at the connection",
+			targets: 2, connErrors: 2, errors: 2,
+			d:      discovery{ok: true},
+			wantUp: 0, wantFailed: 1,
+		},
+		{
+			name: "one target failed at the connection while a seed had connected",
+			// The seed that connected was not retried, so its observation
+			// stands. What went wrong is in the error signal and in the
+			// per-database outcomes.
+			targets: 4, deferred: 3, connErrors: 1, errors: 1,
+			d:      discovery{ok: false, connectSuccesses: 1, connectFailures: 1},
+			wantUp: 1, wantFailed: 1,
+		},
+		{
+			name:    "one target connected and another did not",
+			targets: 2, connErrors: 1, errors: 1,
+			d:      discovery{ok: true},
+			wantUp: 1, wantFailed: 1,
+		},
+		{
+			name:    "a query failed on a connection that worked",
+			targets: 1, errors: 1,
+			d:      discovery{ok: true},
+			wantUp: 1, wantFailed: 1,
+		},
+		{
+			name: "everything was deferred and nothing tried to connect",
+			// Nothing observed the server either way, so this says nothing
+			// about it. The deferral is what reports the shortfall.
+			targets: 3, deferred: 3,
+			d:      discovery{ok: true},
+			wantUp: 1, wantFailed: 0,
+		},
+		{
+			name:    "a healthy scrape",
+			targets: 3,
+			d:       discovery{ok: true},
+			wantUp:  1, wantFailed: 0,
+		},
+		{
+			name: "discovery's catalogue query failed on a connection that worked",
+			// Not a connection failure, so the server is up, but the scrape
+			// did not do what it meant to.
+			targets: 1,
+			d:       discovery{ok: false},
+			wantUp:  1, wantFailed: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up, failed := health(c.targets, c.deferred, c.connErrors, c.errors, c.d)
+			if up != c.wantUp {
+				t.Errorf("pg_up is %v, want %v", up, c.wantUp)
+			}
+			if failed != c.wantFailed {
+				t.Errorf("last_scrape_error is %v, want %v", failed, c.wantFailed)
+			}
+		})
+	}
+}
+
+// TestGetServerReturnsWithoutWaitingAfterItsLastAttempt exercises the
+// connection getter itself.
+//
+// One attempt is allowed and the count is raised before the limit is checked,
+// so the loop returns on its next turn and a wait before that return precedes
+// no retry. The wait is attempt seconds, cut short only by the context ending,
+// and in discovery it is spent holding a connection permit.
+//
+// So the measurement is how long GetServer takes to come back from a connection
+// that fails at once, against a context with plenty of time left. Testing the
+// helper that names the condition is not enough: the guards are at the call
+// site and the helper answers the same whether they are there or not.
+func TestGetServerReturnsWithoutWaitingAfterItsLastAttempt(t *testing.T) {
+	// Long enough that the context cannot be what cuts the wait short, which
+	// would make this pass for the wrong reason.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
+		WithContext(ctx),
+		CollectorName("exporter"),
+	)
+
+	begin := time.Now()
+	server, err := e.GetServer(ctx, "postgresql://u:p@127.0.0.1:1/app?sslmode=disable")
+	took := time.Since(begin)
+
+	// The premise. Without a failure there is no final attempt to return from.
+	if err == nil {
+		if server != nil {
+			server.Close()
+		}
+		t.Fatal("the connection to a closed port succeeded, so this case proves nothing")
+	}
+	if took >= time.Second {
+		t.Errorf("the final failed attempt took %v to come back, so it waited for a retry that never happens", took)
+	}
+}
+
+// TestLastAttemptNamesTheCondition covers the comparison on its own. It is not
+// what protects the fix: the case above is.
+func TestLastAttemptNamesTheCondition(t *testing.T) {
+	for _, c := range []struct {
+		name              string
+		errCount, retries int
+		wantLast          bool
+	}{
+		{"the only attempt, with no retry allowed", 1, 1, true},
+		{"the first of two attempts", 1, 2, false},
+		{"the second of two attempts", 2, 2, true},
+		{"past the limit", 3, 2, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := lastAttempt(c.errCount, c.retries); got != c.wantLast {
+				t.Errorf("lastAttempt(%d, %d) is %v, want %v", c.errCount, c.retries, got, c.wantLast)
+			}
+		})
+	}
+}
+
+// TestASeedThatConnectedKeepsTheServerUp covers one seed connecting and
+// another being refused.
+//
+// The scrape reached the server, so reporting it as down discards an
+// observation the scrape made. The answer must also not change with how many
+// targets the budget admitted.
+func TestASeedThatConnectedKeepsTheServerUp(t *testing.T) {
+	// Four selected databases, none attempted, and discovery saw one
+	// connection work and one refused.
+	up, failed := health(4, 4, 0, 0, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
+	if up != 1 {
+		t.Errorf("pg_up is %v after a seed connected and read its catalogue, want 1", up)
+	}
+	if failed != 1 {
+		t.Errorf("last_scrape_error is %v after a refused login, want 1", failed)
+	}
+
+	// The single refused seed keeps the answer it had.
+	up, failed = health(1, 1, 0, 0, discovery{ok: false, connectFailures: 1})
+	if up != 0 || failed != 1 {
+		t.Errorf("a refused login alone gives up %v and error %v, want 0 and 1", up, failed)
+	}
+
+	// Four targets, three deferred, and the one admitted failed at the
+	// connection. The seed that connected was never retried, so its success
+	// stands, and the failure is reported by the error signal and the
+	// per-database outcomes rather than by unmaking it.
+	up, failed = health(4, 3, 1, 1, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
+	if up != 1 || failed != 1 {
+		t.Errorf("one failed target among three deferred gives up %v and error %v, want 1 and 1", up, failed)
+	}
+
+	// The same observations with nothing admitted have to give the same
+	// answer. An aggregate that changes with how much budget was left is
+	// reporting the budget rather than the server.
+	deferredUp, _ := health(4, 4, 0, 0, discovery{ok: false, connectSuccesses: 1, connectFailures: 1})
+	if deferredUp != up {
+		t.Errorf("pg_up is %v with one target admitted and %v with none, from the same connection observations", up, deferredUp)
+	}
+
+	// A fan-out that failed at every connection with no successful discovery
+	// behind it is still down.
+	up, _ = health(2, 0, 2, 2, discovery{ok: true})
+	if up != 0 {
+		t.Errorf("pg_up is %v when every attempted database failed and nothing else connected, want 0", up)
+	}
+}
+
+// brokenCollector returns a metric whose label count does not match its
+// descriptor, which is what an application query that names a label column its
+// SQL does not select used to produce.
+type brokenCollector struct{ desc *prometheus.Desc }
+
+func (b brokenCollector) Describe(ch chan<- *prometheus.Desc) { ch <- b.desc }
+
+func (b brokenCollector) Collect(ch chan<- prometheus.Metric) {
+	// One label value for a descriptor that declares two. The gatherer rejects
+	// this and drops the family.
+	ch <- prometheus.NewInvalidMetric(b.desc, errors.New("inconsistent label cardinality"))
+}
+
+// TestAGatherErrorIsCountedThroughTheHandler covers the one failure this
+// endpoint used to report nowhere.
+//
+// A collector that returns an invalid metric has its family dropped by the
+// gatherer and the request still answers 200. The collection the health signals
+// describe worked, so pg_up stays 1 and last_scrape_error stays 0: what failed
+// was turning the collection into a response. Without a count of gather
+// failures the family simply vanishes from the output.
+//
+// It goes through Handler, because the wiring under test is the one Handler
+// builds. A test that constructs its own promhttp handler tests its own
+// options: removing Registry from the production HandlerOpts leaves such a test
+// passing, which is what the first version of this did.
+func TestAGatherErrorIsCountedThroughTheHandler(t *testing.T) {
+	// An invalid metric, which takes its whole family with it. Other gather
+	// failures reject less: duplicate samples leave the family in place with
+	// the samples that survived. What they have in common is that something
+	// asked for is missing and the response does not say so.
+	broken := brokenCollector{
+		desc: prometheus.NewDesc("pg_fixture_broken", "a family this one takes with it",
+			[]string{"one", "two"}, nil),
+	}
+	// A healthy collector under another name, so a request can be made that
+	// gathers cleanly through the same handler. Every name a request selects
+	// has to have a collector here, since the registry registers whatever the
+	// filter names.
+	healthy := prometheus.NewGauge(prometheus.GaugeOpts{Name: "pg_fixture_healthy", Help: "a family that gathers"})
+	healthy.Set(1)
+
+	limits := budget.Defaults()
+	h := Handler(log.NewNopLogger(), []string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
+		semaphore.NewWeighted(limits.Connections),
+		map[string]prometheus.Collector{"standard.go": broken, "version": healthy},
+		limits, NewCollectionGate(limits), querycache.New(), NewStores(),
+		dbselect.Absent(), dbselect.Absent())
+
+	// standard.go is where the broken collector was registered, so a request
+	// that selects it gathers a failure and a request that selects something
+	// else does not. Without that difference every request here fails and the
+	// claim about surviving a clean one is never exercised.
+	get := func(selected string) string {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/metrics?collect[]="+selected, nil)
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("the %s request answered %d, want 200: a rejected metric is not an error to the client", selected, w.Code)
+		}
+		return w.Body.String()
+	}
+
+	first := get("standard.go")
+	if strings.Contains(first, "pg_fixture_broken") {
+		t.Fatal("the broken family was served, so the gatherer did not drop it and this proves nothing")
+	}
+
+	// The hook increments after gathering, so this request's own failure lands
+	// in the count after its response has been built. The operator sees it on
+	// the next scrape.
+	gathering := func(body string) string {
+		for _, line := range strings.Split(body, "\n") {
+			if strings.HasPrefix(line, `promhttp_metric_handler_errors_total{cause="gathering"}`) {
+				return strings.TrimSpace(line)
+			}
+		}
+		return ""
+	}
+
+	// The second failing request carries the first one's failure.
+	second := gathering(get("standard.go"))
+	if second == "" {
+		t.Fatalf("no count of gather failures is served, so a rejected metric is invisible")
+	}
+	if !strings.HasSuffix(second, " 1") {
+		t.Errorf("after one failed gather the count is %q, want 1", second)
+	}
+
+	// Two requests have now failed, and these two gather cleanly because they
+	// do not select the broken collector. The count has to hold at 2 across
+	// both: a reset would lose the record, and an increment on a clean gather
+	// would report a failure that did not happen.
+	for i, request := range []string{"version", "version"} {
+		clean := gathering(get(request))
+		if clean == "" {
+			t.Fatalf("clean request %d serves no count at all", i+1)
+		}
+		if !strings.HasSuffix(clean, " 2") {
+			t.Errorf("clean request %d carries %q, want 2 retained from the two failed gathers", i+1, clean)
+		}
+	}
+}
+
+// TestTheMasterSeedDoesNotMoveWithTheVisitingOrder covers which seed carries
+// the queries that run once per server rather than once per database.
+//
+// It used to be assigned inside the seed loop, so it was whichever seed the
+// loop reached last. That is a data race the moment discovery and collection
+// overlap, and it would move the placement as soon as the visiting order is
+// scheduled rather than fixed. The behaviour is deliberately unchanged: it is
+// still the last seed that parses, taken from the configured list instead of
+// from the order of execution.
+func TestTheMasterSeedDoesNotMoveWithTheVisitingOrder(t *testing.T) {
+	first := "postgresql://u:p@127.0.0.1:1/a?sslmode=disable"
+	second := "host=127.0.0.1 port=2 dbname=b"
+	third := "postgresql://u:p@127.0.0.1:3/c?sslmode=disable"
+
+	if got := masterSeed([]string{first, second, third}); got != third {
+		t.Errorf("the master seed is %q, want the last that parses, %q", got, third)
+	}
+
+	// A seed that parses as neither form is not a candidate, exactly as the
+	// loop skips it.
+	if got := masterSeed([]string{first, "nonsense"}); got != first {
+		t.Errorf("the master seed is %q with an unparseable seed last, want %q", got, first)
+	}
+	if got := masterSeed([]string{"nonsense"}); got != "" {
+		t.Errorf("the master seed is %q with nothing parseable, want empty", got)
+	}
+	if got := masterSeed(nil); got != "" {
+		t.Errorf("the master seed is %q with no seeds, want empty", got)
+	}
+
+	// The answer is a function of the configured list, so no visiting order
+	// can change it. Reversing the list is a different configuration and is
+	// allowed to differ; the same list must not.
+	configured := []string{first, second, third}
+	want := masterSeed(configured)
+	for i := 0; i < 8; i++ {
+		if got := masterSeed(configured); got != want {
+			t.Fatalf("the same configured list gave %q and then %q", want, got)
+		}
+	}
+}
+
+// TestDiscoverySettlesTheMasterSeedBeforeItVisitsAnything is the half that
+// matters for concurrency: the field is written once, before any seed is read,
+// rather than as each one is reached.
+//
+// It does not detect putting the assignment back inside the loop. While the
+// loop is sequential and visits the configured order, the last seed it reaches
+// is the last seed configured, so both give the same answer. What separates
+// them is a visiting order that is scheduled rather than fixed, and a reader
+// running at the same time, neither of which exists yet. The regression for
+// that belongs with the interleaving change that introduces both.
+func TestDiscoverySettlesTheMasterSeedBeforeItVisitsAnything(t *testing.T) {
+	seeds := []string{
+		"postgresql://u:p@127.0.0.1:1/a?sslmode=disable",
+		"postgresql://u:p@127.0.0.1:2/b?sslmode=disable",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	e := NewExporter(seeds,
+		WithContext(ctx),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		AutoDiscoverDatabases(true),
+		CollectorName("exporter"),
+	)
+
+	// Nothing answers at either address, so every seed fails to connect and
+	// the field cannot have been set by a successful read.
+	d := e.discoverDatabaseDSNs()
+	if d.ok {
+		t.Fatal("discovery reported success against addresses that do not answer")
+	}
+	if e.masterDSN != seeds[len(seeds)-1] {
+		t.Errorf("the master seed is %q after a discovery where nothing connected, want %q",
+			e.masterDSN, seeds[len(seeds)-1])
+	}
+}
+
+// TestAHealthySeedIsCollectedBeforeAStalledOneIsRead is the ordering the whole
+// interleaving exists for.
+//
+// Discovery used to finish for every seed before any collection began, so one
+// seed that stalls spent the budget and the databases already found waited
+// behind it. Enqueuing every seed read and appending collection behind it is
+// the same defect with more machinery, so what this asserts is the order the
+// work actually happened in, not that both appear in one queue.
+//
+// The recorder is the connection attempt itself: the healthy seed's databases
+// are at a closed port, so each attempt fails at once and is recorded, and the
+// stalled seed is an address that accepts nothing and burns the remaining
+// budget.
+func TestAHealthySeedIsCollectedBeforeAStalledOneIsRead(t *testing.T) {
+	stalled, stop := stalledEndpoint(t)
+	defer stop()
+
+	var mu sync.Mutex
+	var order []string
+	recordAttempt := func(what string) {
+		mu.Lock()
+		order = append(order, what)
+		mu.Unlock()
+	}
+
+	// A healthy seed whose databases do not answer, and a stalled seed. The
+	// healthy one is read first here, which is the case that used to collect
+	// nothing at all.
+	healthy := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	seeds := []string{healthy, stalled}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e := NewExporter(seeds,
+		WithContext(ctx),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		AutoDiscoverDatabases(true),
+		WithRotation(rotation.New()),
+		CollectorName("exporter"),
+	)
+	e.onSeedRead = func(seed string) { recordAttempt("read " + seed) }
+	e.onTargetCollected = func(target string) { recordAttempt("collect " + target) }
+
+	ch, drainStop := drain()
+	d := discovery{ok: true}
+	e.discoverAndCollect(ch, &d)
+	drainStop()
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+
+	// The premise: both seeds were read, so this is about the order and not
+	// about one of them never happening.
+	reads := 0
+	for _, step := range got {
+		if strings.HasPrefix(step, "read ") {
+			reads++
+		}
+	}
+	if reads != len(seeds) {
+		t.Fatalf("%d of %d seeds were read: %v", reads, len(seeds), got)
+	}
+
+	// The healthy seed's collection has to come before the stalled seed's read.
+	stalledRead, firstCollect := -1, -1
+	for i, step := range got {
+		if step == "read "+stalled {
+			stalledRead = i
+		}
+		if firstCollect < 0 && strings.HasPrefix(step, "collect ") {
+			firstCollect = i
+		}
+	}
+	if firstCollect < 0 {
+		t.Fatalf("nothing was collected at all: %v", got)
+	}
+	if stalledRead >= 0 && firstCollect > stalledRead {
+		t.Errorf("the stalled seed was read before anything was collected: %v", got)
+	}
+}
+
+// stalledEndpoint is a listener that accepts connections and answers nothing,
+// which is how a seed consumes a budget without failing.
+func stalledEndpoint(t *testing.T) (dsn string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %s", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Held open and never answered.
+			go func() { <-done; conn.Close() }()
+		}
+	}()
+	return "postgresql://u:p@" + ln.Addr().String() + "/app?sslmode=disable", func() {
+		ln.Close()
+		<-done
+	}
+}
+
+// TestEachSeedKeepsItsOwnDatabaseSchedule is the fifth draft regression.
+//
+// A scrape that discovers one seed at a time hands the schedule one seed's
+// databases at a time. A schedule told only those members drops every member it
+// is not told about, so the other seed's waiting turns were thrown away and
+// restarted on every request. Over eight requests with three databases in each
+// of two seeds, only two of each seed's three were ever offered first.
+func TestEachSeedKeepsItsOwnDatabaseSchedule(t *testing.T) {
+	const requests = 9
+
+	store := rotation.New()
+	seeds := []string{
+		"postgresql://u:p@host_a:5432/app?sslmode=disable",
+		"postgresql://u:p@host_b:5432/app?sslmode=disable",
+	}
+	e := NewExporter(seeds,
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	batchOf := func(seed, host string) []scrapeTarget {
+		out := targetsForDSN(host, "a", "b", "c")
+		for i := range out {
+			out[i].seed = seed
+		}
+		return out
+	}
+
+	firstOf := map[string]map[string]int{seeds[0]: {}, seeds[1]: {}}
+	for request := 0; request < requests; request++ {
+		// Each seed's databases are handed over on their own, which is what
+		// the interleaved scrape does.
+		for i, host := range []string{"host_a:5432", "host_b:5432"} {
+			batch := e.rotateTargets(batchOf(seeds[i], host))
+			if len(batch) != 3 {
+				t.Fatalf("request %d seed %d returned %d of 3 targets", request, i, len(batch))
+			}
+			firstOf[seeds[i]][batch[0].datname]++
+		}
+	}
+
+	for seed, counts := range firstOf {
+		if len(counts) != 3 {
+			t.Errorf("over %d requests seed %s offered only %v first, want all three databases a turn",
+				requests, seed, counts)
+		}
+	}
+}
+
+// TestTwoSeedsOnOneServerDoNotSelectTheSameDatabaseTwice is the fourth.
+//
+// One shared map across all seeds used to drop the repeat. Per-seed maps
+// appended together do not, so two configured seeds with the same credentials
+// on the same server and different connection databases selected and collected
+// the same database twice.
+func TestTwoSeedsOnOneServerDoNotSelectTheSameDatabaseTwice(t *testing.T) {
+	seen := map[string]struct{}{}
+	var kept []scrapeTarget
+	for _, batch := range [][]scrapeTarget{
+		targetsForDSN("127.0.0.1:1", "app", "shared"),
+		targetsForDSN("127.0.0.1:1", "other", "shared"),
+	} {
+		for _, target := range batch {
+			if _, repeat := seen[target.dsn]; repeat {
+				continue
+			}
+			seen[target.dsn] = struct{}{}
+			kept = append(kept, target)
+		}
+	}
+	if len(kept) != 3 {
+		names := []string{}
+		for _, k := range kept {
+			names = append(names, k.datname)
+		}
+		t.Errorf("two seeds sharing a database yielded %d targets, %v, want 3", len(kept), names)
+	}
+}
+
+// TestAnEarlierSeedKeepsItsOutcomeWhenALaterOneIsSelected is the third.
+//
+// setSelection clears every per-database sample, which is right when the whole
+// selection arrives at once. Called again for the next seed it erased what the
+// seeds before it had already collected, so a database reported as covered by
+// the counts reported 0 for itself.
+func TestAnEarlierSeedKeepsItsOutcomeWhenALaterOneIsSelected(t *testing.T) {
+	c := newCoverageMetrics(nil, lastsuccess.New(), "exporter")
+
+	first := targetsForDSN("127.0.0.1:1", "one")
+	c.setSelection(true, true, 1, first, nil, 0)
+	c.setDatabaseOutcome(first[0].databaseRef, "")
+
+	// The next seed arrives and extends the selection.
+	both := append(append([]scrapeTarget{}, first...), targetsForDSN("127.0.0.1:2", "two")...)
+	c.extendSelection(true, true, 2, both, nil, 0)
+
+	g := series(t, c)
+	if g["pg_exporter_database_scrape_success{datname=one,server=127.0.0.1:1}"] != 1 {
+		t.Errorf("the database collected before the next seed was read reports 0: %v", g)
+	}
+	if g["pg_exporter_database_scrape_success{datname=two,server=127.0.0.1:2}"] != 0 {
+		t.Errorf("a database not collected yet does not report 0: %v", g)
+	}
+	if g["pg_exporter_databases_selected"] != 2 {
+		t.Errorf("the selected count is %v, want 2", g["pg_exporter_databases_selected"])
+	}
+}
+
+// TestOnlyACompleteCatalogueReadAuthorisesForgetting walks the paths through
+// discoverSeed that reach the census and the ones that do not.
+//
+// A database is forgotten only when the server was read completely and
+// successfully and the database was not in what came back. Every other outcome,
+// including a failed read, leaves the history alone, because absence from a
+// read that did not finish is not evidence of anything.
+func TestOnlyACompleteCatalogueReadAuthorisesForgetting(t *testing.T) {
+	store := lastsuccess.New()
+	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	target := identityOf(seed)
+	long := time.Now().Add(-time.Hour)
+	store.Own(target, target+"/gone", "gone")()
+	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "gone"}, long)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	e := NewExporter([]string{seed},
+		WithContext(ctx),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		AutoDiscoverDatabases(true),
+		WithLastSuccess(store),
+		CollectorName("exporter"),
+	)
+
+	// Nothing answers at that address, so the catalogue read fails. The
+	// database is absent from a read that did not happen, which authorises
+	// nothing.
+	d := discovery{ok: true}
+	e.discoverSeed(seed, &d)
+
+	if _, ok := store.At(lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "gone"}); !ok {
+		t.Error("a failed catalogue read erased a database's history")
+	}
+	if d.ok {
+		t.Fatal("the fixture's read succeeded, so this says nothing about a failed one")
+	}
+}
+
+// TestACensusFromOneConnectionLeavesAnotherAlone is the ownership rule at the
+// level the engine applies it.
+func TestACensusFromOneConnectionLeavesAnotherAlone(t *testing.T) {
+	store := lastsuccess.New()
+	long := time.Now().Add(-time.Hour)
+	// Two seeds, each with its own connection to a database called gone. The
+	// records are under those connections, which is where a discovered
+	// database's records live.
+	mine := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "1/gone", Database: "gone"}
+	theirs := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: "2/gone", Database: "gone"}
+	store.Record(mine, long)
+	store.Record(theirs, long)
+
+	e := NewExporter([]string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
+		WithContext(context.Background()),
+		WithLastSuccess(store),
+		CollectorName("exporter"),
+	)
+	// Only the first seed built its connection, which is what gives this
+	// census authority over one record and not the other.
+	store.Own("1", "1/gone", "gone")()
+	store.Own("2", "2/gone", "gone")()
+	e.applyCensus(lastsuccess.Census{
+		Target:    "1",
+		Taken:     time.Now(),
+		Databases: nameSet([]string{"kept"}),
+	})
+
+	if _, ok := store.At(mine); ok {
+		t.Error("the census's own connection kept a database the server does not have")
+	}
+	if _, ok := store.At(theirs); !ok {
+		t.Error("a census read through one connection removed another connection's record")
+	}
+}
+
+// TestNoScheduleKeyCarriesAConnectionString keeps credentials out of state that
+// lives as long as the process.
+//
+// The per-seed schedule is keyed by the seed its targets were discovered
+// through. That key held the seed's connection string, password and all, and
+// the map it keys is never emptied, so a process that discovered ten seeds held
+// ten passwords for as long as it ran. Nothing exported them and nothing had
+// to: a heap dump, a core file or a map printed by a panic is enough.
+//
+// The password is checked for in every field rather than in the one that held
+// it, so moving the string into another field does not pass.
+func TestNoScheduleKeyCarriesAConnectionString(t *testing.T) {
+	const password = "hunter2-correct-horse"
+	seed := "postgresql://u:" + password + "@127.0.0.1:1/one?sslmode=disable"
+
+	store := rotation.New()
+	e := NewExporter([]string{seed},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	targets := targetsForDSN("127.0.0.1:1", "a", "b")
+	for i := range targets {
+		targets[i].seed = seed
+	}
+	if got := e.rotateTargets(targets); len(got) != len(targets) {
+		t.Fatalf("the rotation returned %d of %d targets", len(got), len(targets))
+	}
+
+	keys := store.Keys()
+	if len(keys) == 0 {
+		t.Fatal("no schedule was created, so this proves nothing about what a key carries")
+	}
+	for _, key := range keys {
+		for field, value := range map[string]string{
+			"Engine":  key.Engine,
+			"Target":  key.Target,
+			"Profile": key.Profile,
+		} {
+			if strings.Contains(value, password) {
+				t.Errorf("the schedule key's %s field is %q, which carries the seed's password", field, value)
+			}
+			if strings.Contains(value, "postgresql://") {
+				t.Errorf("the schedule key's %s field is %q, which carries a connection string", field, value)
+			}
+		}
+	}
+}
+
+// TestANewerInventoryThroughEitherSeedProtectsASharedConnection is the case
+// where one connection is reached two ways.
+//
+// Two seeds can be the same server and the same role, differing only in the
+// database the seed itself opens. Each builds the same connection string for a
+// third database, so that is one connection with two seeds able to report on
+// it. If only one of them is recorded as having built it, the other's complete
+// catalogue cannot confirm it is still there, and the first one's catalogue,
+// read earlier and finishing later, removes its history.
+func TestANewerInventoryThroughEitherSeedProtectsASharedConnection(t *testing.T) {
+	targetid.Clear()
+	defer targetid.Clear()
+
+	const child = "postgresql://reader:secret@db:5432/shared?sslmode=disable"
+	seedA := identityOf("postgresql://reader:secret@db:5432/one?sslmode=disable")
+	seedB := identityOf("postgresql://reader:secret@db:5432/two?sslmode=disable")
+	target := identityOf(child)
+
+	store := lastsuccess.New()
+	store.Own(seedA, target, "shared")()
+	store.Own(seedB, target, "shared")()
+	long := time.Now().Add(-time.Hour)
+	key := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: target, Database: "shared"}
+	store.Record(key, long)
+
+	e := NewExporter([]string{"postgresql://reader:secret@db:5432/one?sslmode=disable"},
+		WithContext(context.Background()),
+		WithLastSuccess(store),
+		CollectorName("exporter"),
+	)
+
+	// The newer read, through the second seed, saw the database. Nothing has
+	// collected from it since, so its last success is still the old one.
+	e.applyCensus(lastsuccess.Census{
+		Target:    seedB,
+		Taken:     time.Now().Add(-time.Minute),
+		Databases: nameSet([]string{"shared", "two"}),
+	})
+
+	// The older read, through the first seed, began before that one and does
+	// not list the database.
+	e.applyCensus(lastsuccess.Census{
+		Target:    seedA,
+		Taken:     time.Now().Add(-30 * time.Minute),
+		Databases: nameSet([]string{"one"}),
+	})
+
+	if _, ok := store.At(key); !ok {
+		t.Error("an older catalogue removed a connection that a newer catalogue, read through the other seed that built it, had just confirmed")
+	}
+}
+
+// TestTheScheduleDoesNotGrowWithDatabasesComingAndGoing bounds this store on
+// the axis a catalogue read would otherwise have to prune.
+//
+// A schedule is keyed by the engine, the configured connections and the
+// profile, so what a server does to its databases cannot add one. The names
+// inside a schedule are rebuilt from the members it is handed on every call,
+// so a database that leaves the selection leaves the schedule with it rather
+// than waiting for something to come and remove it.
+//
+// This is why the cleanup for this store is the cap on profiles and not a
+// census: there is nothing here for a census to own.
+func TestTheScheduleDoesNotGrowWithDatabasesComingAndGoing(t *testing.T) {
+	store := rotation.New()
+	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	e := NewExporter([]string{seed},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	const scrapes = 50
+	for i := 0; i < scrapes; i++ {
+		// One database that stays and one that is replaced every scrape.
+		targets := targetsForDSN("127.0.0.1:1", "stays", fmt.Sprintf("churn%03d", i))
+		for j := range targets {
+			targets[j].seed = seed
+		}
+		if got := e.rotateTargets(targets); len(got) != len(targets) {
+			t.Fatalf("scrape %d returned %d of %d targets", i, len(got), len(targets))
+		}
+	}
+
+	keys := store.Keys()
+	if len(keys) != 1 {
+		t.Errorf("%d scrapes with a different database each time left %d schedules, want 1: %v",
+			scrapes, len(keys), keys)
+	}
+	for _, key := range keys {
+		if waiting := store.Waiting(key); waiting > 2 {
+			t.Errorf("a schedule over two databases is holding %d names after %d scrapes",
+				waiting, scrapes)
+		}
+	}
+}
+
+// TestTheEngineReconcilesASelectionThatCollapses is the same bound at the call
+// site, which is where it was missing.
+//
+// rotateTargets returned before reaching the schedule when it had fewer than
+// two targets, so a seed whose selection fell to one database kept every name
+// it had been handed before. The store-level case cannot catch that: the
+// schedule is never told, so there is nothing for it to get wrong.
+func TestTheEngineReconcilesASelectionThatCollapses(t *testing.T) {
+	store := rotation.New()
+	seed := "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	e := NewExporter([]string{seed},
+		WithContext(context.Background()),
+		WithConnectionsSemaphore(semaphore.NewWeighted(1), 1),
+		WithRotation(store),
+		CollectorName("exporter"),
+	)
+
+	names := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		names = append(names, fmt.Sprintf("db%04d", i))
+	}
+	big := targetsForDSN("127.0.0.1:1", names...)
+	for i := range big {
+		big[i].seed = seed
+	}
+	e.rotateTargets(big)
+
+	keys := store.Keys()
+	if len(keys) != 1 {
+		t.Fatalf("%d schedules after one scrape, want 1", len(keys))
+	}
+	if waiting := store.Waiting(keys[0]); waiting != len(big)-1 {
+		t.Fatalf("a thousand targets left %d waiting, so the fixture is not what this is about", waiting)
+	}
+
+	// The server is down to one database, and stays there.
+	for i := 0; i < 10; i++ {
+		if got := e.rotateTargets(big[:1]); len(got) != 1 {
+			t.Fatalf("one target in, %d out", len(got))
+		}
+	}
+	if waiting := store.Waiting(keys[0]); waiting != 0 {
+		t.Errorf("a seed down to one database is holding %d names in its schedule", waiting)
 	}
 }

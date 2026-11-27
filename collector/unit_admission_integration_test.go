@@ -39,6 +39,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
@@ -47,8 +48,10 @@ import (
 // controlName is the database every case here connects to, and controlUp is
 // its own database_up entry rather than whichever database published last.
 const (
-	controlName = "postgres"
-	controlUp   = "pg_collector_database_up/" + controlName + "/"
+	controlName   = "postgres"
+	controlUp     = "pg_collector_database_up/" + controlName + "/"
+	attempted     = "pg_collector_databases_attempted//"
+	deferredCount = "pg_collector_databases_deferred//"
 )
 
 func liveDSN(t *testing.T) string {
@@ -143,10 +146,12 @@ func TestOnARealConnectionTheHealthyCaseRunsAndTheEndedCaseDoesNot(t *testing.T)
 // against the server, rather than the function it calls.
 //
 // The healthy run proves the path reaches real SQL on a database the fan-out
-// opened for itself. The ended run proves the same path stops before any SQL
-// and reports the database as an incomplete attempt with the budget as its
-// cause, keeping database_up at 1 because the connection is not what went
-// wrong.
+// opened for itself. The ended run is the earlier boundary, the database's own
+// admission check: the scrape's time is gone before the database is reached, so
+// nothing is connected to and the database is deferred rather than attempted.
+// The boundary this component protects, where the connection opens and the
+// collectors are then deferred, is in
+// TestTheFanOutPathDefersUnitsAfterItsConnectionWorked.
 func TestTheOtherDatabasePathReachesItsCollectors(t *testing.T) {
 	dsn := liveDSN(t)
 
@@ -351,11 +356,18 @@ func TestTheFanOutPathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 }
 
 // TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked is the same
-// boundary on the other path, the control connection inside Collect.
+// boundary for the configured connection database, through the whole engine:
+// admission, the baseline connection, the catalogue read, the scope split and
+// the rotated fan-out. There is no separate control-local path any more, so
+// what this covers is that database taking its turn like the others.
 //
-// This one goes through the whole engine: admission, the connection, the
-// catalogue read and the scope split, which is what a test calling the shared
-// runner cannot show.
+// There are two different boundaries for it and this one is the later. The
+// earlier is the baseline connection succeeding and the database's own
+// admission then finding no time left, which gives a deferred database that
+// keeps the connection observation, up 1, and attempts nothing. The predicate
+// below therefore requires an attempt as well as an open connection and no
+// collector run, because without that it stops at the earlier boundary and
+// then asserts things only the later one produces.
 func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T) {
 	dsn := liveDSN(t)
 	collectorScopes["stat_fixture_live"] = scopeDatabase
@@ -396,17 +408,41 @@ func TestTheControlDatabasePathDefersUnitsAfterItsConnectionWorked(t *testing.T)
 		t.Fatalf("the healthy run did not report the control connection as up: %v", healthy)
 	}
 
+	// The earlier boundary has to be reachable too, and it has its own
+	// assertions. Finding it first is also what shows the predicate below is
+	// choosing between two real outcomes rather than taking the only one there
+	// is.
+	earlier := int64(-1)
+	for n := int64(1); n <= atRun.Load()+8; n++ {
+		p, ran, _ := run(n)
+		if p[controlUp].value == 1 && ran.Load() == 0 && p[attempted].value == 0 {
+			earlier = n
+			if p[deferredCount].value != 1 {
+				t.Errorf("the baseline connection worked and no local attempt started, and %v databases are deferred, want 1: %v",
+					p[deferredCount].value, p)
+			}
+			if _, found := p["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonDeadline]; found {
+				t.Error("nothing was attempted and the database reports an incomplete attempt")
+			}
+			break
+		}
+	}
+	if earlier < 0 {
+		t.Fatalf("the baseline connection and a database never attempted is not reachable, searching up to %d context reads", atRun.Load()+8)
+	}
+	t.Logf("the earlier boundary, a baseline connection whose local turn never started, is at context read %d", earlier)
+
 	var published map[string]MetricResult
 	boundary := int64(-1)
 	for n := int64(1); n <= atRun.Load()+8; n++ {
 		p, ran, _ := run(n)
-		if p[controlUp].value == 1 && ran.Load() == 0 {
+		if p[controlUp].value == 1 && ran.Load() == 0 && p[attempted].value == 1 {
 			published, boundary = p, n
 			break
 		}
 	}
 	if boundary < 0 {
-		t.Fatalf("no boundary between a control connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
+		t.Fatalf("no boundary between a local connection that opened and a collector that started, searching up to %d context reads", atRun.Load()+8)
 	}
 	t.Logf("the scrape ends at context read %d, after the control connection is open and before its collectors start", boundary)
 	if published["pg_collector_database_error/"+controlName+"/"+dbselect.ReasonDeadline].value != 1 {
@@ -447,4 +483,112 @@ func publishedByFamilyAndReason(emit func(ch chan<- prometheus.Metric)) map[stri
 		out[familyName(m)+"/"+r.labels["datname"]+"/"+r.labels["reason"]] = r
 	}
 	return out
+}
+
+// orderRecordingCollector records which database each run was against, in the
+// order the runs happened.
+type orderRecordingCollector struct {
+	mu    *sync.Mutex
+	order *[]string
+}
+
+func (c orderRecordingCollector) Update(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+	var name string
+	if err := inst.getDB().QueryRowContext(ctx, "SELECT current_database()").Scan(&name); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	*c.order = append(*c.order, name)
+	c.mu.Unlock()
+	return nil
+}
+
+// TestCollectOffersADifferentDatabaseFirstEachScrape goes through Collect, so
+// it fails if the engine takes its selected set in the order discovery returned
+// rather than the order the schedule says.
+//
+// One worker, so the fan-out is serial and the first database to run is the
+// first one offered an attempt. The budget is generous, because what is being
+// measured is the order of offers and not what fits.
+//
+// The configured connection database is in the selection, which is the point:
+// its local collectors used to run before any other database was offered one,
+// so it came first on every scrape whatever the rest were doing.
+func TestCollectOffersADifferentDatabaseFirstEachScrape(t *testing.T) {
+	dsn := liveDSN(t)
+	collectorScopes["stat_fixture_order"] = scopeDatabase
+	t.Cleanup(func() { delete(collectorScopes, "stat_fixture_order") })
+
+	// Three databases including the configured one, with one name sorting
+	// before it and one after. Names that all sort after the configured
+	// database are the arrangement that missed the real failure: a rule
+	// choosing the first name after the one chosen last skips a database whose
+	// name comes before the configured one, and a fixture with no such database
+	// cannot see it.
+	admin, err := newInstance(dsn)
+	if err != nil {
+		t.Fatalf("building the admin instance: %s", err)
+	}
+	if err := admin.setup(context.Background()); err != nil {
+		t.Fatalf("connecting: %s", err)
+	}
+	t.Cleanup(func() { admin.Close() })
+	for _, name := range []string{"a_review_order", "z_review_order"} {
+		if _, err := admin.getDB().Exec("CREATE DATABASE " + name); err != nil {
+			t.Skipf("cannot create %s, so this server cannot stage the case: %s", name, err)
+		}
+		t.Cleanup(func() {
+			_, _ = admin.getDB().Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+		})
+	}
+
+	store := rotation.New()
+	selected := []string{controlName, "a_review_order", "z_review_order"}
+
+	firstOf := make([]string, 0, len(selected))
+	for scrape := 0; scrape < len(selected); scrape++ {
+		var mu sync.Mutex
+		order := []string{}
+		local := map[string]Collector{"stat_fixture_order": orderRecordingCollector{mu: &mu, order: &order}}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		p := PostgresCollector{
+			Collectors:       local,
+			logger:           log.NewNopLogger(),
+			ctx:              ctx,
+			connSema:         semaphore.NewWeighted(1),
+			dbWorkers:        1,
+			includeDatabases: dbselect.Of(selected),
+			lastSuccess:      lastsuccess.New(),
+			rotation:         store,
+			instance:         &instance{dsn: dsn, name: "live"},
+		}
+
+		ch := make(chan prometheus.Metric, 1<<16)
+		p.Collect(ch)
+		close(ch)
+		for range ch {
+		}
+		cancel()
+
+		mu.Lock()
+		got := append([]string(nil), order...)
+		mu.Unlock()
+
+		// The premise. Without every selected database running, the first one
+		// is not evidence about an order.
+		if len(got) != len(selected) {
+			t.Fatalf("scrape %d ran on %v, want all %d selected databases", scrape, got, len(selected))
+		}
+		firstOf = append(firstOf, got[0])
+	}
+
+	seen := map[string]bool{}
+	for _, name := range firstOf {
+		if seen[name] {
+			t.Errorf("the databases offered the first attempt were %v, want a different one each scrape", firstOf)
+			break
+		}
+		seen[name] = true
+	}
 }

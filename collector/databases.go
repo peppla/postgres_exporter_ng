@@ -29,29 +29,43 @@ package collector
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
+	"github.com/percona/postgres_exporter/internal/targetid"
 )
 
-// catalogQuery lists the databases this role may connect to, including the one
-// the connection is on, which is flagged.
+// catalogQuery lists every database the server has, says which one the
+// connection is on, and says which of them this role may collect from.
 //
 // Returning the connection's own database rather than excluding it is what
-// lets every target be named without a second round trip. "Connectable" here
-// is a catalog property: datallowconn, not a template, and the role holding
-// CONNECT. A database that later fails to answer is still part of this set and
-// is reported as a failure rather than dropped from it.
-const catalogQuery = `SELECT datname, datname = current_database() AS is_current
-	FROM pg_database
-	WHERE datallowconn = true
-	  AND datistemplate = false
-	  AND has_database_privilege(current_user, datname, 'connect')`
+// lets every target be named without a second round trip.
+//
+// Eligibility is a column rather than a WHERE clause, so that one read answers
+// two questions that look the same and are not. Which databases may be
+// collected from is datallowconn, not a template, and the role holding
+// CONNECT. Which databases exist is all of them. A filtered read cannot
+// authorise forgetting a database, because a database that lost CONNECT is
+// missing from it for a reason that has nothing to do with existing, and
+// removing its history on that basis would throw away the record at the moment
+// it explains something.
+//
+// A database that later fails to answer is still eligible and is reported as a
+// failure rather than dropped.
+const catalogQuery = `SELECT datname, datname = current_database() AS is_current,
+	       datallowconn AND NOT datistemplate
+	         AND has_database_privilege(current_user, datname, 'connect') AS eligible
+	FROM pg_database`
 
 // dbTarget is one database the collectors will run against.
 type dbTarget struct {
 	datname string
 	dsn     string
+	// target is the identity of this database's connection, which is what its
+	// records are keyed by.
+	target string
 	// control marks the database the configured connection is on. Its
 	// connection is the one cluster-wide collectors use, so it is opened
 	// whether or not it is in the selected set.
@@ -61,6 +75,16 @@ type dbTarget struct {
 	// control database from database-local collection does not stop its
 	// connection being used for cluster metrics.
 	skipDatabaseLocal bool
+
+	// baselineConnected marks a target this scrape has already connected to
+	// once, for the cluster-wide work and the catalogue read. Only the
+	// configured connection database is ever marked.
+	//
+	// It exists so a deferral does not contradict an observation. The
+	// connection to this database was made and it worked. If its own turn for
+	// database-local work never comes, saying it could not be reached would
+	// publish an assertion against something already seen.
+	baselineConnected bool
 }
 
 // dbSelection is what one pass over the catalog decided.
@@ -82,6 +106,26 @@ type dbSelection struct {
 	// total it would otherwise report is 1, which looks exactly like a
 	// one-database server.
 	catalogRead bool
+	// inventory is every database the server reported, eligible or not, and
+	// is set only when the read completed. It is what authorises forgetting a
+	// database, and only a complete unfiltered read can.
+	inventory []string
+	// taken is when the catalogue read began, which is the generation of the
+	// inventory. Before the read rather than after it: what it may authorise
+	// forgetting is what was already there when it started looking.
+	taken time.Time
+	// release ends the holds this selection took on the connections it built.
+	// Called when the request is done with them, which is not when one
+	// database's collection finishes: a request can record under a connection
+	// at any point before it ends.
+	release []func()
+}
+
+// done ends every hold this selection took.
+func (s dbSelection) done() {
+	for _, release := range s.release {
+		release()
+	}
 }
 
 // selectDatabases reads the catalog over the control connection and applies
@@ -92,8 +136,9 @@ type dbSelection struct {
 // by marking it, not by dropping it: its connection is what the cluster-wide
 // collectors run on, and §4.0b says cluster-wide collection keeps working when
 // database-local collection for that database does not.
-func selectDatabases(ctx context.Context, inst *instance, exclude, include dbselect.List) (dbSelection, error) {
+func selectDatabases(ctx context.Context, inst *instance, exclude, include dbselect.List, store *lastsuccess.Store) (dbSelection, error) {
 	controlName, _ := config.DatabaseFromDSN(inst.dsn)
+	seed, _ := targetid.ID(inst.dsn)
 
 	// controlTargetFor applies the rule to the configured database. It runs on
 	// every path, including the ones where discovery failed: a database the
@@ -143,7 +188,8 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 		return sel, err
 	}
 
-	names, catalogControl, err := readCatalog(ctx, inst)
+	taken := time.Now()
+	names, inventory, catalogControl, err := readCatalog(ctx, inst)
 	if err != nil {
 		return alone(err)
 	}
@@ -151,7 +197,8 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 		controlName = catalogControl
 	}
 
-	sel := dbSelection{ok: true, catalogRead: true, discovered: len(names)}
+	sel := dbSelection{ok: true, catalogRead: true, discovered: len(names),
+		inventory: inventory, taken: taken}
 	if catalogControl != "" {
 		sel.discovered++
 	}
@@ -172,7 +219,13 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 			sel.ok = false
 			continue
 		}
-		sel.targets = append(sel.targets, dbTarget{datname: name, dsn: dsn})
+		// Registered as built from this connection, which is what lets this
+		// server's catalogue decide its state is gone, and held until this
+		// request is done with it. Registered here because here is where the
+		// connection string is built.
+		id, _ := targetid.ID(dsn)
+		sel.release = append(sel.release, store.Own(seed, id, name))
+		sel.targets = append(sel.targets, dbTarget{datname: name, dsn: dsn, target: id})
 	}
 
 	return sel, nil
@@ -184,18 +237,24 @@ func selectDatabases(ctx context.Context, inst *instance, exclude, include dbsel
 // The server's answer is preferred over the name parsed from the DSN, because
 // a connection string need not carry a database at all: libpq then falls back
 // to the user name, and the catalog knows what that resolved to.
-func readCatalog(ctx context.Context, inst *instance) (names []string, control string, err error) {
+func readCatalog(ctx context.Context, inst *instance) (names, inventory []string, control string, err error) {
 	rows, err := inst.getDB().QueryContext(ctx, catalogQuery)
 	if err != nil {
-		return nil, "", fmt.Errorf("listing databases: %w", err)
+		return nil, nil, "", fmt.Errorf("listing databases: %w", err)
 	}
 	defer rows.Close() // nolint: errcheck
 
 	for rows.Next() {
 		var name string
-		var current bool
-		if err := rows.Scan(&name, &current); err != nil {
-			return nil, "", fmt.Errorf("reading databases: %w", err)
+		var current, eligible bool
+		if err := rows.Scan(&name, &current, &eligible); err != nil {
+			return nil, nil, "", fmt.Errorf("reading databases: %w", err)
+		}
+		// Every database the server has, templates and unreachable ones
+		// included. This is the half that says what exists.
+		inventory = append(inventory, name)
+		if !eligible {
+			continue
 		}
 		if current {
 			control = name
@@ -204,9 +263,9 @@ func readCatalog(ctx context.Context, inst *instance) (names []string, control s
 		names = append(names, name)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("reading databases: %w", err)
+		return nil, nil, "", fmt.Errorf("reading databases: %w", err)
 	}
-	return names, control, nil
+	return names, inventory, control, nil
 }
 
 // controlTarget returns the target for the configured connection, which is

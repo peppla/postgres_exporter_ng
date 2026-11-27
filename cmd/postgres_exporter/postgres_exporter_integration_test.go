@@ -26,6 +26,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http/httptest"
 	"net/url"
@@ -515,8 +516,11 @@ func (s *IntegrationSuite) TestAutoDiscoverDatabases(c *C) {
 	defer server.Close()
 
 	// The same catalog discovery is built from, asked for directly.
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	c.Assert(len(catalog) > 1, Equals, true,
 		Commentf("the fixture server has one database, so discovery was never exercised"))
 
@@ -815,8 +819,11 @@ func (s *IntegrationSuite) TestCollectorSelectionExcludesDatabases(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	others := otherThanCurrent(catalog)
 	c.Assert(len(others) > 0, Equals, true,
 		Commentf("the fixture server has one database, so exclusion cannot be exercised"))
@@ -1545,8 +1552,11 @@ func (s *IntegrationSuite) TestApplicationQueryDatabaseSelection(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	control, found := currentName(catalog)
 	c.Assert(found, Equals, true)
 	others := otherThanCurrent(catalog)
@@ -2054,7 +2064,7 @@ func scrapeHTTP(dsn string, limits budget.Limits, header string, collect ...stri
 	rec := httptest.NewRecorder()
 
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
-		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits), querycache.New(), lastsuccess.New(),
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{}, limits, NewCollectionGate(limits), querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
 
 	start := time.Now()
@@ -2273,7 +2283,7 @@ uncached_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2419,8 +2429,11 @@ func (s *IntegrationSuite) TestTwoDatabasesOnOneHostKeepSeparateCacheEntries(c *
 	admin, err := NewServer(configured)
 	c.Assert(err, IsNil)
 	defer admin.Close()
-	catalog, err := queryDatabases(context.Background(), admin)
+	allDatabases, err := queryDatabases(context.Background(), admin)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	control, found := currentName(catalog)
 	c.Assert(found, Equals, true)
 	others := otherThanCurrent(catalog)
@@ -2445,7 +2458,7 @@ two_targets:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured, secondTarget},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2556,7 +2569,7 @@ role_targets:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{asRole(roles[0]), asRole(roles[1])},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2622,7 +2635,7 @@ freshness_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{withoutDatabase.String()},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), querycache.New(), lastsuccess.New(),
+		limits, NewCollectionGate(limits), querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2675,7 +2688,7 @@ label_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), querycache.New(), lastsuccess.New(),
+		limits, NewCollectionGate(limits), querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() (int, string) {
@@ -2776,7 +2789,7 @@ context_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{withSearchPath(schemas[0]), withSearchPath(schemas[1])},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -2855,7 +2868,7 @@ fallback_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{target},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), querycache.New(), lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), querycache.New(), NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
 	rec := httptest.NewRecorder()
@@ -2931,7 +2944,7 @@ resolution_probe:
 	// absent, which is not what this is about.
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), globalCollectorsForTest(),
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func(query string) string {
 		req := httptest.NewRequest("GET", "/metrics"+query, nil)
@@ -3017,7 +3030,7 @@ overlap_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -3114,7 +3127,7 @@ slow_two:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), []string{configured},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
 	rec := httptest.NewRecorder()
@@ -3165,7 +3178,7 @@ edited_probe:
 	limits := budget.Defaults()
 	h := Handler(log.NewNopLogger(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		limits, NewCollectionGate(limits), cache, lastsuccess.New(), dbselect.Absent(), dbselect.Absent())
+		limits, NewCollectionGate(limits), cache, NewStores(), dbselect.Absent(), dbselect.Absent())
 
 	scrape := func() string {
 		req := httptest.NewRequest("GET", "/metrics?collect[]=custom_query.lr", nil)
@@ -3291,8 +3304,11 @@ func (s *IntegrationSuite) TestClusterOnlyScrapeCoversNoDatabases(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	c.Assert(len(catalog) > 1, Equals, true,
 		Commentf("the fixture server has one database, so a count of zero cannot be told from a count of one"))
 
@@ -3461,8 +3477,11 @@ func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
 	server, err := NewServer(strings.Split(dsn, ",")[0])
 	c.Assert(err, IsNil)
 	defer server.Close()
-	catalog, err := queryDatabases(context.Background(), server)
+	allDatabases, err := queryDatabases(context.Background(), server)
 	c.Assert(err, IsNil)
+	// The read returns every database the server has now, so the eligible
+	// set is derived here. It is what this test has always been about.
+	catalog := eligible(allDatabases)
 	others := otherThanCurrent(catalog)
 	c.Assert(len(others) > 0, Equals, true,
 		Commentf("the fixture server has one database, so selection cannot be exercised"))
@@ -3482,9 +3501,9 @@ func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
 	c.Assert(err, IsNil)
 
 	limits := budget.Defaults()
-	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+	registry, _, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), NewStores(),
 		excludeSelection, includeSelection)
 	c.Assert(err, IsNil)
 	families, err := registry.Gather()
@@ -3566,9 +3585,9 @@ func (s *IntegrationSuite) TestReplicationCollectorsAgainstServer(c *C) {
 	c.Assert(err, IsNil)
 
 	limits := budget.Defaults()
-	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+	registry, _, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
 	c.Assert(err, IsNil)
 	families, err := registry.Gather()
@@ -3689,9 +3708,9 @@ func (s *IntegrationSuite) TestPublicationCollectorCoversEveryDatabase(c *C) {
 	c.Assert(err, IsNil)
 
 	limits := budget.Defaults()
-	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+	registry, _, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
-		Filters{EnablePostgresCollector: true}, limits, querycache.New(), lastsuccess.New(),
+		Filters{EnablePostgresCollector: true}, limits, querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
 	c.Assert(err, IsNil)
 	families, err := registry.Gather()
@@ -3715,4 +3734,185 @@ func (s *IntegrationSuite) TestPublicationCollectorCoversEveryDatabase(c *C) {
 		Commentf("the publication in the connected database is missing or mislabelled: %v", found))
 	c.Check(found[therePub], Equals, other,
 		Commentf("the publication in %s was not collected, so the collector ran on one database only: %v", other, found))
+}
+
+// TestForgettingIsAuthorisedOnlyByTheServerStillHavingTheDatabase drives the
+// cleanup through real requests against a real server.
+//
+// Two databases that stop being collected for different reasons. One is
+// dropped, so the server no longer has it and its history may go. The other
+// stops accepting connections, so it leaves the eligible set while remaining in
+// the server, and its history has to stay: losing the right to connect is not
+// the same as ceasing to exist, and a read that filtered on connectability
+// could not tell them apart.
+func (s *IntegrationSuite) TestForgettingIsAuthorisedOnlyByTheServerStillHavingTheDatabase(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	admin, err := sql.Open("postgres", dsn)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const dropped, closed = "cleanup_dropped", "cleanup_closed"
+	for _, name := range []string{dropped, closed} {
+		if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+			c.Skip("cannot create databases on this server: " + err.Error())
+		}
+		defer admin.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)") // nolint: errcheck
+	}
+
+	// Discovery on, or the only database scraped is the one in the connection
+	// string and neither of the two above is ever collected.
+	previous := *autoDiscoverDatabases
+	*autoDiscoverDatabases = true
+	defer func() { *autoDiscoverDatabases = previous }()
+
+	// One handler and one set of stores for every request, because what is
+	// under test is what survives from one scrape to the next.
+	limits := budget.Defaults()
+	stores := NewStores()
+	h := Handler(log.NewNopLogger(), []string{dsn},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), stores,
+		dbselect.Absent(), dbselect.Absent())
+
+	scrape := func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics?collect[]=exporter", nil))
+		c.Assert(rec.Code, Equals, 200)
+	}
+
+	// A discovered database is collected over its own connection, so its
+	// record is under that connection's identity and not under the seed's.
+	// Looking under the seed finds nothing for any discovered database, which
+	// makes every assertion below pass against a cleanup that removes nothing.
+	seed := identityOf(dsn)
+	connectionTo := func(name string) (string, bool) {
+		for id, database := range stores.LastSuccess.Owned(seed) {
+			if database == name {
+				return id, true
+			}
+		}
+		return "", false
+	}
+	recorded := func(target, name string) bool {
+		_, ok := stores.LastSuccess.At(lastsuccess.Key{
+			Engine: lastsuccess.EngineQuery, Target: target, Database: name, Collector: "exporter",
+		})
+		return ok
+	}
+
+	// Both collected, so both have a record to lose.
+	scrape()
+	droppedTarget, ok := connectionTo(dropped)
+	c.Assert(ok, Equals, true,
+		Commentf("no connection was built for %s, so it was never discovered", dropped))
+	closedTarget, ok := connectionTo(closed)
+	c.Assert(ok, Equals, true,
+		Commentf("no connection was built for %s, so it was never discovered", closed))
+	c.Assert(recorded(droppedTarget, dropped), Equals, true,
+		Commentf("%s was never collected, so this says nothing about forgetting it", dropped))
+	c.Assert(recorded(closedTarget, closed), Equals, true,
+		Commentf("%s was never collected, so this says nothing about keeping it", closed))
+
+	_, err = admin.Exec("DROP DATABASE " + dropped + " WITH (FORCE)")
+	c.Assert(err, IsNil)
+	// Still on the server, and no longer connectable, which is what a filtered
+	// read cannot tell from being dropped.
+	_, err = admin.Exec("ALTER DATABASE " + closed + " WITH ALLOW_CONNECTIONS false")
+	c.Assert(err, IsNil)
+	defer admin.Exec("ALTER DATABASE " + closed + " WITH ALLOW_CONNECTIONS true") // nolint: errcheck
+
+	scrape()
+
+	c.Check(recorded(droppedTarget, dropped), Equals, false,
+		Commentf("a database the server no longer has kept its history"))
+	c.Check(recorded(closedTarget, closed), Equals, true,
+		Commentf("a database that is still there lost its history because it stopped accepting connections"))
+}
+
+// TestARecreatedDatabaseDoesNotInheritTheOldOnesHistory is the shape the
+// cleanup was found missing in.
+//
+// A database is dropped, a scrape reads a catalogue that confirms it is gone,
+// and then a database of the same name is created. It is a different database:
+// a different object with a different OID and none of the old one's contents.
+// If the drop did not remove the old history, the new database reports a last
+// success it never had, and it reports it while failing.
+func (s *IntegrationSuite) TestARecreatedDatabaseDoesNotInheritTheOldOnesHistory(c *C) {
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	admin, err := sql.Open("postgres", dsn)
+	c.Assert(err, IsNil)
+	defer admin.Close()
+
+	const name = "cleanup_recreated"
+	if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+		c.Skip("cannot create databases on this server: " + err.Error())
+	}
+	defer admin.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)") // nolint: errcheck
+
+	previous := *autoDiscoverDatabases
+	*autoDiscoverDatabases = true
+	defer func() { *autoDiscoverDatabases = previous }()
+
+	limits := budget.Defaults()
+	stores := NewStores()
+	h := Handler(log.NewNopLogger(), []string{dsn},
+		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
+		limits, NewCollectionGate(limits), querycache.New(), stores,
+		dbselect.Absent(), dbselect.Absent())
+
+	scrape := func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics?collect[]=exporter", nil))
+		c.Assert(rec.Code, Equals, 200)
+	}
+
+	seed := identityOf(dsn)
+	connectionTo := func(database string) (string, bool) {
+		for id, d := range stores.LastSuccess.Owned(seed) {
+			if d == database {
+				return id, true
+			}
+		}
+		return "", false
+	}
+	at := func(target string) (time.Time, bool) {
+		return stores.LastSuccess.At(lastsuccess.Key{
+			Engine: lastsuccess.EngineQuery, Target: target, Database: name, Collector: "exporter",
+		})
+	}
+
+	scrape()
+	target, ok := connectionTo(name)
+	c.Assert(ok, Equals, true, Commentf("no connection was built for %s, so it was never discovered", name))
+	before, ok := at(target)
+	c.Assert(ok, Equals, true,
+		Commentf("%s was never collected, so this says nothing about what a recreated one inherits", name))
+
+	_, err = admin.Exec("DROP DATABASE " + name + " WITH (FORCE)")
+	c.Assert(err, IsNil)
+
+	// One complete catalogue read with the database absent. This is what
+	// authorises removing it, and nothing before this point does.
+	scrape()
+	if _, ok := at(target); ok {
+		c.Fatalf("%s kept its history through a scrape that read a catalogue without it", name)
+	}
+
+	_, err = admin.Exec("CREATE DATABASE " + name)
+	c.Assert(err, IsNil)
+
+	// Scraped again so the connection is built for the new database. The
+	// connection string is the same one, so it has the same identity, and
+	// anything the drop had left under it would be read here.
+	scrape()
+
+	again, ok := connectionTo(name)
+	c.Assert(ok, Equals, true)
+	c.Assert(again, Equals, target,
+		Commentf("the recreated database got a different connection identity, so this no longer tests inheritance"))
+
+	after, ok := at(target)
+	if ok && !after.After(before) {
+		c.Fatalf("the recreated %s reports a last success of %v, which belongs to the database that was dropped", name, after)
+	}
 }

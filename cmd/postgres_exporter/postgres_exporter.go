@@ -34,6 +34,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/fanout"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/percona/postgres_exporter/internal/versioncache"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
@@ -460,7 +461,18 @@ type Exporter struct {
 	queryCache *querycache.Cache
 	// lastSuccess outlives this exporter too, for the same reason: how long a
 	// database has been failing cannot be answered from one scrape.
-	lastSuccess       *lastsuccess.Store
+	lastSuccess *lastsuccess.Store
+	// rotation outlives this exporter for the same kind of reason: where the
+	// last scrape of this profile started is the one thing a new one cannot
+	// work out for itself. Nil means the sorted order every scrape.
+	rotation *rotation.Store
+
+	// onSeedRead and onTargetCollected record the order the work happened in.
+	// Nil in a running exporter: the order is only observable from outside by
+	// watching connections, and a test that watches connections cannot tell a
+	// seed read from a database collection on the same address.
+	onSeedRead        func(seed string)
+	onTargetCollected func(target string)
 	userQueriesPath   map[MetricResolution]string
 	resolutionEnabled MetricResolution
 	enabled           bool
@@ -602,6 +614,18 @@ func WithQueryCache(cache *querycache.Cache) ExporterOpt {
 	}
 }
 
+// WithRotation sets the process-owned schedule of which selected database is
+// offered the first attempt.
+//
+// Without one the order is the sorted order every scrape, which is what left a
+// selected set that does not fit the budget giving the same prefix every
+// opportunity and the rest none.
+func WithRotation(store *rotation.Store) ExporterOpt {
+	return func(e *Exporter) {
+		e.rotation = store
+	}
+}
+
 // WithLastSuccess configures the process-owned record of when each database
 // was last collected without error.
 func WithLastSuccess(store *lastsuccess.Store) ExporterOpt {
@@ -687,6 +711,9 @@ func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt)
 
 		server, err = NewServer(dsn, opts...)
 		if err != nil {
+			if lastAttempt(errCount, retries) {
+				return nil, err
+			}
 			if werr := waitBeforeRetry(ctx, errCount); werr != nil {
 				return nil, err
 			}
@@ -695,6 +722,9 @@ func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt)
 
 		if err = server.Ping(ctx); err != nil {
 			server.Close()
+			if lastAttempt(errCount, retries) {
+				return nil, err
+			}
 			if werr := waitBeforeRetry(ctx, errCount); werr != nil {
 				return nil, err
 			}
@@ -703,6 +733,18 @@ func (e *Exporter) GetServer(ctx context.Context, dsn string, opts ...ServerOpt)
 		break
 	}
 	return server, nil
+}
+
+// lastAttempt says whether the attempt that just failed was the final one.
+//
+// The loop returns on its next turn when the count passes the limit, so waiting
+// after the last attempt buys nothing: no further attempt follows it. The wait
+// is a second, cut short only by the request ending, and discovery holds a
+// connection permit throughout it. A login refused immediately could therefore
+// spend the rest of a short budget doing nothing, leaving the whole fan-out
+// deferred.
+func lastAttempt(errCount, retries int) bool {
+	return errCount >= retries
 }
 
 func (e *Exporter) setupInternalMetrics() {
@@ -842,10 +884,22 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	e.totalScrapes.Inc()
 
-	d := discovery{ok: true, discovered: len(e.dsn)}
 	if e.autoDiscoverDatabases {
-		d = e.discoverDatabaseDSNs()
-	} else {
+		// Counted from zero, because every database here comes from a
+		// catalogue read. Starting from the seed count adds each seed twice.
+		d := discovery{ok: true}
+		// Released when this request is finished with the connections it
+		// discovered, after the last thing that can record under one of them.
+		defer d.done()
+		errorsCount, connectionErrorsCount, deferredCount := e.discoverAndCollect(ch, &d)
+		e.finishScrape(d, errorsCount, connectionErrorsCount, deferredCount)
+		return
+	}
+
+	// No discovery, so the seeds themselves are the databases and the count is
+	// how many were configured.
+	d := discovery{ok: true, discovered: len(e.dsn)}
+	{
 		// No discovery, so no catalog and no names. The targets are the
 		// configured DSNs as given, identified by server only.
 		for _, dsn := range e.dsn {
@@ -865,22 +919,214 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	e.coverage.setSelection(e.autoDiscoverDatabases, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
 
 	errorsCount, connectionErrorsCount, deferredCount := e.scrapeTargets(ch, d.targets)
+	e.finishScrape(d, errorsCount, connectionErrorsCount, deferredCount)
+}
 
+// discoverAndCollect reads one seed, collects the databases it yielded, and
+// only then reads the next.
+//
+// Discovery used to finish for every seed before any collection began, so one
+// seed that stalls spends the whole budget and databases already found wait
+// behind it with nothing left to run in. Measured against a stalled endpoint:
+// four requests in a row discovered the healthy seed and collected none of its
+// databases.
+//
+// The seed order rotates on the same schedule the databases use, so the seed
+// that goes first is not the same one every scrape. That is what gives a
+// healthy seed its turn on the scrapes where it is not behind the stalled one,
+// which no amount of ordering within a seed can do.
+//
+// The intent is recorded as each seed yields it rather than once at the end, so
+// a scrape cut short still reports what it had meant to cover.
+func (e *Exporter) discoverAndCollect(ch chan<- prometheus.Metric, d *discovery) (failed, connectionFailures, deferred int) {
+	// Settled before any seed is read, and not touched while they are. The
+	// other discovery entry point does this too, and this path does not go
+	// through it.
+	e.masterDSN = masterSeed(e.dsn)
+
+	// Across seeds, not within one. Two configured seeds with the same
+	// credentials on the same server and different connection databases
+	// discover the same databases, and the old single map dropped the repeat.
+	// Per-seed maps appended together do not, so the same database was
+	// selected and collected twice.
+	seen := make(map[string]struct{})
+
+	// Every database this request will walk, as the schedule names them. Each
+	// seed's batch is scheduled against the whole request's membership rather
+	// than against its own, because a key fed one seed's members forgets the
+	// other seed's waiting turns and restarts them.
+	for _, seed := range e.rotateSeeds(e.dsn) {
+		if e.onSeedRead != nil {
+			e.onSeedRead(seed)
+		}
+
+		batch := make([]scrapeTarget, 0, 8)
+		for _, t := range e.discoverSeed(seed, d) {
+			if _, repeat := seen[t.dsn]; repeat {
+				continue
+			}
+			seen[t.dsn] = struct{}{}
+			batch = append(batch, t)
+		}
+
+		d.targets = append(d.targets, batch...)
+		sortTargets(d.targets)
+		// Extended, not replaced. Setting the selection again for the next
+		// seed used to clear the outcomes the seeds before it had recorded.
+		e.coverage.extendSelection(true, d.ok, d.discovered, d.targets, d.excluded, d.notIncluded)
+
+		f, c, def := e.scrapeTargets(ch, batch)
+		failed += f
+		connectionFailures += c
+		deferred += def
+	}
+	return failed, connectionFailures, deferred
+}
+
+// rotateSeeds puts the configured seeds in the order this request's schedule
+// says, so the seed read first is not the same one every scrape.
+//
+// Its own schedule, separate from the one the databases within a seed use: they
+// are different sets and a turn in one is not a turn in the other.
+func (e *Exporter) rotateSeeds(seeds []string) []string {
+	if len(seeds) == 0 {
+		return seeds
+	}
+	members := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		members = append(members, identityOf(seed))
+	}
+	key := rotation.Key{Engine: "query", Target: e.scheduleTarget(), Profile: e.collectorName + " seeds"}
+	out := make([]string, 0, len(seeds))
+	for _, i := range rotation.Order(e.rotation.Next(key, members), len(seeds)) {
+		out = append(out, seeds[i])
+	}
+	return out
+}
+
+// finishScrape publishes what the whole scrape came to.
+func (e *Exporter) finishScrape(d discovery, errorsCount, connectionErrorsCount, deferredCount int) {
 	e.coverage.setOutcome(len(d.targets), errorsCount, deferredCount)
 
+	up, failedScrape := health(len(d.targets), deferredCount, connectionErrorsCount, errorsCount, d)
+	e.psqlUp.Set(up)
+	e.error.Set(failedScrape)
+}
+
+// health is what this scrape says about the server and about itself.
+//
+// Split out because it has to answer for work the fan-out never started as well
+// as work it did, and those two came from different places: the fan-out's own
+// counts, and what discovery saw before the fan-out began. Reading only the
+// first is how a scrape that could not log in at all reported the server as up.
+//
+// up is 1 when something connected, 0 when something tried to connect and
+// nothing succeeded, and 1 when nothing tried, because work that never started
+// says nothing about the server either way. failed is 1 when anything went
+// wrong, discovery included.
+//
+// A connection that worked counts whenever it happened, in discovery or in the
+// fan-out, and one connection context failing does not unmake another's
+// success. Anything less makes the answer depend on how much budget was left
+// rather than on what the scrape observed. What went wrong is reported by
+// failed below and by the per-database outcomes.
+func health(targets, deferred, connectionErrors, errors int, d discovery) (up, failed float64) {
+	// A target that was attempted and did not fail at the connection is one
+	// that connected, and so is a seed whose catalogue this scrape read.
+	fanOutConnected := targets - deferred - connectionErrors
+
 	switch {
-	case connectionErrorsCount >= len(d.targets):
-		e.psqlUp.Set(0)
+	case fanOutConnected > 0 || d.connectSuccesses > 0:
+		up = 1
+	case connectionErrors > 0 || d.connectFailures > 0:
+		up = 0
 	default:
-		e.psqlUp.Set(1) // Didn't fail, can mark connection as up for this scrape.
+		up = 1
 	}
 
-	switch errorsCount {
-	case 0:
-		e.error.Set(0)
-	default:
-		e.error.Set(1)
+	if errors > 0 || !d.ok {
+		failed = 1
 	}
+	return up, failed
+}
+
+// rotateTargets puts this request's targets in the order its schedule says.
+//
+// One schedule over everything the request selected, not one per server. Two
+// earlier shapes were wrong and both starve a target rather than drop one.
+//
+// Grouping by server and keeping the groups in the order they first appear
+// leaves the same server ahead of every other on every request. Rotating inside
+// a group moves nothing between groups, so when the first server's attempt
+// consumes the budget a later server is never attempted, however often its own
+// single-member schedule advances. Measured on one target each at two hosts:
+// twelve calls, the same host first every time.
+//
+// Naming the members by database, and keying the schedule by the host and port,
+// collapses two configured connections that differ only in role, credentials or
+// search_path and happen to reach the same database. They supply the same member
+// name, and the first index matching the chosen name is always the same target,
+// so the other never gets a turn. Measured on role_a and role_b over one
+// endpoint and database: twelve calls, role_a first every time. The public
+// server label is a host and port by construction and cannot tell those apart.
+//
+// So the members are the per-target identities this process assigns per
+// connection string, which differ for two roles over one database and for two
+// databases over one connection, and the schedule belongs to the request's
+// configured set and its profile.
+//
+// A rotation and not a selection: every target is still returned, so a database
+// that gets no attempt is still reported as deferred by name.
+func (e *Exporter) rotateTargets(targets []scrapeTarget) []scrapeTarget {
+	// Nothing to rotate and no seed to name a schedule with, so there is also
+	// nothing this call could reconcile. One target is different: the schedule
+	// still has to be told, or the members this seed no longer has stay in it.
+	if len(targets) == 0 {
+		return targets
+	}
+
+	// Keyed by the seed these targets came from, not by the whole request.
+	//
+	// A scrape that discovers one seed at a time hands this one seed's
+	// databases at a time, and a schedule told only those members drops every
+	// member it is not told about. So the other seed's waiting turns were
+	// thrown away and restarted on every request, and a third database in each
+	// seed was never offered first across eight of them.
+	//
+	// One schedule per seed keeps each seed's own waiting list, and the seed
+	// order has a schedule of its own above this.
+	//
+	// The seed goes into the key as the identity this process assigns it, not
+	// as the connection string. The string carries a password, and this map
+	// lives as long as the process: keying on it put one credential per seed
+	// ever discovered somewhere a heap dump would print.
+	seed := targets[0].seed
+	members := make([]string, 0, len(targets))
+	for _, t := range targets {
+		members = append(members, t.identity)
+	}
+
+	key := rotation.Key{Engine: "query", Target: e.scheduleTarget() + " " + identityOf(seed), Profile: e.collectorName}
+	out := make([]scrapeTarget, 0, len(targets))
+	for _, i := range rotation.Order(e.rotation.Next(key, members), len(targets)) {
+		out = append(out, targets[i])
+	}
+	return out
+}
+
+// scheduleTarget identifies the configured set this request works over.
+//
+// The seed connection strings, as the identities this process assigns them, so
+// two exporters configured with different sets keep their own schedules and the
+// same set keeps one across requests. Identities rather than the strings
+// themselves, because a connection string carries a password.
+func (e *Exporter) scheduleTarget() string {
+	ids := make([]string, 0, len(e.dsn))
+	for _, dsn := range e.dsn {
+		ids = append(ids, identityOf(dsn))
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
 }
 
 // scrapeTargets runs the per-database fan-out and returns how many targets
@@ -895,6 +1141,10 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 	var errorsCount atomic.Int32
 	var connectionErrorsCount atomic.Int32
 	var deferredCount atomic.Int32
+
+	// Rotated, so the database offered the first attempt is not the same one
+	// every scrape.
+	targets = e.rotateTargets(targets)
 
 	// A fixed number of workers, each taking the next database as it finishes
 	// the last. Reaching that number is not a reason to leave a database out:
@@ -930,6 +1180,17 @@ func (e *Exporter) scrapeTargets(ch chan<- prometheus.Metric, targets []scrapeTa
 				return
 			}
 			defer permit.Release()
+
+			// Held for as long as this database is being collected. A
+			// catalogue read that started before this work can finish during
+			// it, and its list is then older than whatever this is in the
+			// middle of doing. A database being collected right now is not one
+			// to decide is gone.
+			defer e.lastSuccess.Hold(target.identity)()
+
+			if e.onTargetCollected != nil {
+				e.onTargetCollected(target.dsn)
+			}
 			if err := e.scrapeDSN(ch, &target); err != nil {
 				errorsCount.Add(1)
 

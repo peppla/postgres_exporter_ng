@@ -17,12 +17,14 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"regexp"
 	"strconv"
 	"time"
 
 	"github.com/go-kit/log/level"
 	"github.com/lib/pq"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/targetid"
 )
 
 // convert a string to the corresponding ColumnUsage
@@ -188,6 +190,39 @@ func parseFingerprint(url string) (string, error) {
 	}
 
 	return fingerprint, nil
+}
+
+// plainTargetName matches a target that cannot be carrying a credential.
+//
+// An allow list rather than a search for the places a password hides. The
+// characters a connection string needs to carry one, which are at least the
+// separators, the quote and the space, are all outside this.
+var plainTargetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// loggableTarget is a probe target with any credential in it removed.
+//
+// The target comes from the request and need not be a name. A URL carries a
+// password in its user info and again in a password query parameter, and a
+// keyword string carries one in a password field whose value may be quoted and
+// contain an escaped quote. Logging it as given put a password into the log of
+// a request that was refused before it reached a server.
+//
+// The redaction is the connection parser's own, so it cannot understand less
+// of the syntax than the thing that builds the connection. A target that
+// parser cannot understand is logged as its identity instead, because a string
+// nothing could parse may still hold a password.
+//
+// A name with nothing in it that could carry a credential is logged as it is,
+// because an operator reading a refusal wants to know which target it was.
+func loggableTarget(target string) string {
+	if plainTargetName.MatchString(target) {
+		return target
+	}
+	if redacted, err := config.Loggable(target); err == nil {
+		return redacted
+	}
+	id, _ := targetid.ID(target)
+	return "target " + id
 }
 
 func loggableDSN(dsn string) string {

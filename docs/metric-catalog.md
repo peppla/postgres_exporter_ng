@@ -127,8 +127,25 @@ not any collector succeeded.
 | `pg_scrape_collector_success` | gauge | boolean | 15-19 | Whether one collector finished on one database. `datname` is empty for a cluster collector, which Prometheus treats as absent. Absent for a collector this scrape never started, which is in `pg_scrape_collector_deferred` instead. |
 | `pg_scrape_collector_deferred` | gauge | boolean | 15-19 | One per collector this scrape did not start on this database, labelled `reason` with `scrape_deadline` for a turn that came after the scrape ran out of time, or `scrape_cancelled` for a scrape that was cancelled. No SQL ran, so this is not a collector that failed and there is no `pg_scrape_collector_success` beside it. The connection was already open and already held its permit, so `no_connection_permit` cannot appear here. `datname` is empty for a cluster collector. |
 | `pg_scrape_collector_duration_seconds` | gauge | seconds | 15-19 | How long one collector took on one database. |
-| `pg_collector_database_last_success_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When the database-local collectors this request selected last all ran on this database without error in one scrape. The selection is remembered rather than labelled: a request for a subset gets the time that subset last completed and cannot read or move another selection's time, and two scrape jobs with different `collect[]` sets are separated by their own target labels. Published on the paths that collected nothing too, so a database that is failing keeps the time it was last covered. One record per selection per database is held in the process, which is bounded by how many `collect[]` profiles are scraped. Nothing removes a record while the process runs: the store records and reads, and bounded cleanup is not implemented yet. The `target` label is this process's identity for the connection; it is not stable across restarts. |
+| `pg_collector_database_last_success_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When the database-local collectors this request selected last all ran on this database without error in one scrape. Absent means no success is retained for this target and scope: either none was recorded, or the record was removed because a complete reading of the server no longer listed that database. It is not a collection at the epoch. The selection is remembered rather than labelled: a request for a subset gets the time that subset last completed and cannot read or move another selection's time, and two scrape jobs with different `collect[]` sets are separated by their own target labels. Published on the paths that collected nothing too, so a database that is failing keeps the time it was last covered. One record per selection per database is held in the process, which is bounded by how many `collect[]` profiles are scraped. Nothing removes a record while the process runs: the store records and reads, and bounded cleanup is not implemented yet. The `target` label is this process's identity for the connection; it is not stable across restarts. |
 | `pg_collector_last_success_timestamp_seconds` | gauge | seconds since the epoch | 15-19 | When this collector last ran on this database without error. Absent for a collector this process has never run successfully there, which is not the same as one that last succeeded at the epoch. Published on the paths that run no collector too, so a database that cannot be connected to keeps the time it last worked, and omitted for a database the configuration no longer selects while that state is kept for a request that selects it again. The `target` label is this process's identity for the connection; it is not stable across restarts. |
+
+### Exposition errors
+
+`promhttp_metric_handler_errors_total{cause="gathering"}` counts requests whose
+metric gathering failed. Each failed gather increments it once, regardless of
+the number of rejected metrics. The endpoint can return HTTP 200 with partial
+metrics in this case.
+
+The counter persists across requests to this endpoint and resets when the
+process restarts. It includes failures across the endpoint's collection
+selections. The handler increments it after gathering, so the updated value
+appears in a subsequent response.
+
+Database connection and SQL collection health are separate. `pg_up` and
+`pg_exporter_last_scrape_error` can report successful collection while gathering
+rejects samples. A duplicate can leave other samples from the same family in the
+response. Do not depend on which conflicting sample survives.
 
 ## database
 
