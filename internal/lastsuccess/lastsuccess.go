@@ -110,6 +110,21 @@ type Store struct {
 	// held counts the scrapes currently working on each target, so a cleanup
 	// cannot remove the history of work that is still running.
 	held map[string]int
+	// live says whether a connection is still reachable by something other
+	// than a relation: one this process is configured with, or one holding a
+	// slot of its own. Nil means nothing is.
+	//
+	// A relation is how one connection says it built another, and a
+	// connection can be live without any relation pointing at it. A probe
+	// target is its own connection and derives nothing, so another context
+	// retiring and finding no relation left on it would take its history even
+	// while it is being probed. The store cannot know either of those things,
+	// so it asks.
+	live func(string) bool
+	// pending is the connections a retirement could not finish because work
+	// was holding them. The hold being dropped is what finishes it, so that a
+	// retirement deferred is not a retirement abandoned.
+	pending map[string]struct{}
 	// edges says which seeds built each derived connection and which database
 	// it opens.
 	//
@@ -157,7 +172,8 @@ type record struct {
 
 // New returns an empty store.
 func New() *Store {
-	return &Store{seen: make(map[Key]record), held: map[string]int{}, edges: map[string]edge{}}
+	return &Store{seen: make(map[Key]record), held: map[string]int{},
+		edges: map[string]edge{}, pending: map[string]struct{}{}}
 }
 
 // Record notes that this key was collected without error at t.
@@ -293,11 +309,7 @@ func (s *Store) Hold(target string) func() {
 
 	var once sync.Once
 	return func() {
-		once.Do(func() {
-			s.mtx.Lock()
-			defer s.mtx.Unlock()
-			s.release(target)
-		})
+		once.Do(func() { s.release(target) })
 	}
 }
 
@@ -335,11 +347,7 @@ func (s *Store) Own(seed, target, database string) func() {
 
 	var once sync.Once
 	return func() {
-		once.Do(func() {
-			s.mtx.Lock()
-			defer s.mtx.Unlock()
-			s.release(target)
-		})
+		once.Do(func() { s.release(target) })
 	}
 }
 
@@ -361,13 +369,92 @@ func (s *Store) Owned(seed string) map[string]string {
 	return out
 }
 
-// release drops one hold on a target. The caller holds the lock.
-func (s *Store) release(target string) {
-	if s.held[target] <= 1 {
-		delete(s.held, target)
+// WatchLive tells the store how to ask whether a connection is reachable by
+// something other than a relation.
+//
+// Set once, by whoever knows the configuration and the slots. It is used only
+// to finish a retirement that work was holding up, and it is called with this
+// store's lock not held: answering it reaches into the admission, and the
+// admission is what calls into here, so taking the two in both orders is how
+// that stops.
+func (s *Store) WatchLive(live func(string) bool) {
+	if s == nil {
 		return
 	}
-	s.held[target]--
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.live = live
+}
+
+// drop lets go of one hold and says whether a retirement was waiting on it.
+// The caller holds the lock.
+func (s *Store) drop(target string) (finish bool) {
+	if s.held[target] > 1 {
+		s.held[target]--
+		return false
+	}
+	delete(s.held, target)
+	if _, waiting := s.pending[target]; waiting {
+		delete(s.pending, target)
+		return true
+	}
+	return false
+}
+
+// release lets go of one hold and finishes any retirement that was waiting on
+// it. The caller must not hold the lock.
+func (s *Store) release(target string) {
+	s.mtx.Lock()
+	finish := s.drop(target)
+	s.mtx.Unlock()
+	if finish {
+		s.finishPending(target)
+	}
+}
+
+// finishPending completes a retirement that work was holding up.
+//
+// With no lock held, because the first thing it does reaches outside this
+// store. A connection taken up again while that question was being asked goes
+// back to waiting rather than being retired underneath whoever took it.
+func (s *Store) finishPending(target string) {
+	if s.live != nil && s.live(target) {
+		return
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.held[target] > 0 {
+		s.pending[target] = struct{}{}
+		return
+	}
+	if s.hasOwner(target) {
+		return
+	}
+	s.retire(map[string]struct{}{target: {}})
+}
+
+// hasOwner says whether any seed still claims to have built this connection.
+// The caller holds the lock.
+func (s *Store) hasOwner(target string) bool {
+	e, ok := s.edges[target]
+	return ok && len(e.seeds) > 0
+}
+
+// retire removes the records and relations of connections nothing reaches,
+// and returns how many records went. The caller holds the lock.
+func (s *Store) retire(targets map[string]struct{}) int {
+	removed := 0
+	for key := range s.seen {
+		if _, ok := targets[key.Target]; !ok {
+			continue
+		}
+		delete(s.seen, key)
+		removed++
+	}
+	for target := range targets {
+		delete(s.edges, target)
+	}
+	return removed
 }
 
 // ForgetProfile removes what one collection profile alone was keeping.
@@ -419,53 +506,54 @@ func (s *Store) ForgetProfile(engine, selection string) int {
 // that stops being probed for long enough to lose its slot takes with it the
 // connections it built and its own, and nothing else.
 //
-// What decides is who else built a connection. A connection this context
-// built is retired only when no other seed built it too, so one shared with a
-// configured connection or with another probe context stays. The context's own
-// connection is retired only when nothing derived it either, which is what
-// keeps a probe of a database some other connection discovered from removing
-// that connection's history.
+// What decides is whether anything still reaches a connection. Another seed
+// that built it, which is a relation. This process being configured with it,
+// or a slot of its own being held, neither of which is a relation: a probe
+// target derives nothing, so a connection can be live with nothing pointing at
+// it. Those two are what live answers, and a retirement without that
+// answer takes a configured connection's history because another context
+// happened to discover it. It is passed in rather than asked for, because
+// what answers it is the admission, and the admission is what called this.
 //
-// Work in flight needs no check here. A context's slot is held for as long as
-// a request for it runs, so a context that has lost its slot has no request
-// of its own running, and any other request working on one of its connections
-// built that connection from its own seed and so left a seed behind.
-func (s *Store) ForgetContext(target string) int {
+// Work in flight defers rather than skips. A connection being collected is
+// left alone and retired when that work lets go, so a retirement deferred is
+// not a retirement abandoned.
+func (s *Store) ForgetContext(target string, live func(string) bool) int {
 	if s == nil || target == "" {
 		return 0
 	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	gone := map[string]struct{}{}
+	candidates := map[string]struct{}{}
 	for child, e := range s.edges {
 		if _, built := e.seeds[target]; !built {
 			continue
 		}
 		delete(e.seeds, target)
-		if len(e.seeds) == 0 {
-			gone[child] = struct{}{}
-		}
+		candidates[child] = struct{}{}
 	}
-	// The context's own connection, unless something else derived it. A probe
-	// of a database a configured connection also discovers is the same
-	// connection reached two ways, and the configured one did not expire.
-	if e, ok := s.edges[target]; !ok || len(e.seeds) == 0 {
-		gone[target] = struct{}{}
-	}
+	// The context's own connection, which may be one something else derived
+	// or one this process is configured with.
+	candidates[target] = struct{}{}
 
-	removed := 0
-	for key := range s.seen {
-		if _, ok := gone[key.Target]; !ok {
+	gone := map[string]struct{}{}
+	for candidate := range candidates {
+		if s.hasOwner(candidate) {
 			continue
 		}
-		delete(s.seen, key)
-		removed++
+		if live != nil && live(candidate) {
+			continue
+		}
+		if s.held[candidate] > 0 {
+			// Work is using it. Finished when that work lets go, rather than
+			// left to nothing.
+			s.pending[candidate] = struct{}{}
+			continue
+		}
+		gone[candidate] = struct{}{}
 	}
-	for child := range gone {
-		delete(s.edges, child)
-	}
-	return removed
+	return s.retire(gone)
 }
 
 // Apply records what a complete inventory saw and removes what it proves gone.

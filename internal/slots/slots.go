@@ -91,7 +91,13 @@ type Store struct {
 	now func() time.Time
 	// onRelease is told about a slot that went idle, so its owner can drop
 	// what that name alone was keeping.
-	onRelease func(Key)
+	//
+	// It is handed the names that still hold a slot, because it runs with
+	// this store's lock held and so cannot ask. Asking would mean reaching
+	// back into here from the stores it is about to change, and those are the
+	// stores this call reaches into, which is the pair of orders a deadlock
+	// is made of.
+	onRelease func(k Key, stillHeld map[Key]struct{})
 }
 
 type slot struct {
@@ -103,7 +109,7 @@ type slot struct {
 }
 
 // New returns a store. onRelease may be nil.
-func New(l Limits, onRelease func(Key)) *Store {
+func New(l Limits, onRelease func(k Key, stillHeld map[Key]struct{})) *Store {
 	return &Store{limits: l, slots: map[Key]*slot{}, now: time.Now, onRelease: onRelease}
 }
 
@@ -232,9 +238,14 @@ func (s *Store) admitNew(k Key, now time.Time) bool {
 // here, so there is no second order for the two to be taken in.
 func (s *Store) retire(k Key) {
 	delete(s.slots, k)
-	if s.onRelease != nil {
-		s.onRelease(k)
+	if s.onRelease == nil {
+		return
 	}
+	held := make(map[Key]struct{}, len(s.slots))
+	for name := range s.slots {
+		held[name] = struct{}{}
+	}
+	s.onRelease(k, held)
 }
 
 // idleOf returns the slots of one kind that nothing is holding and that have
@@ -282,6 +293,22 @@ func (s *Store) Sweep() int {
 		s.retire(k)
 	}
 	return len(going)
+}
+
+// Holds says whether this name has a slot right now.
+//
+// For the stores that have to know a connection is still being asked about
+// before they retire what it was keeping. A name being retired has already
+// lost its slot when its release runs, so this answers false for it and true
+// for every other name that still holds one.
+func (s *Store) Holds(k Key) bool {
+	if s == nil {
+		return false
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	_, ok := s.slots[k]
+	return ok
 }
 
 // Held is how many slots of one kind are held, for the tests that bound this.

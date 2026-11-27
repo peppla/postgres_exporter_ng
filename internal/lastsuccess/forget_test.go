@@ -638,7 +638,7 @@ func TestRetiringAContextTakesItsOwnedStateWithIt(t *testing.T) {
 	s.Own(probe, child, "other")()
 	s.Record(Key{Engine: EngineQuery, Target: child, Database: "other"}, time.Now())
 
-	if removed := s.ForgetContext(probe); removed != 2 {
+	if removed := s.ForgetContext(probe, nil); removed != 2 {
 		t.Errorf("%d records removed, want both the connection's own and the one it built", removed)
 	}
 	if s.Len() != 0 {
@@ -677,7 +677,7 @@ func TestRetiringAContextLeavesWhatAnotherStillOwns(t *testing.T) {
 	probeKey := Key{Engine: EngineQuery, Target: probe, Database: "probed"}
 	s.Record(probeKey, time.Now())
 
-	if removed := s.ForgetContext(probe); removed != 1 {
+	if removed := s.ForgetContext(probe, nil); removed != 1 {
 		t.Errorf("%d records removed, want only the connection nothing else built", removed)
 	}
 	if _, ok := s.At(sharedKey); !ok {
@@ -691,5 +691,119 @@ func TestRetiringAContextLeavesWhatAnotherStillOwns(t *testing.T) {
 	}
 	if _, ok := s.Owned(configured)[shared]; !ok {
 		t.Error("the configured seed lost its relation to a connection it built")
+	}
+}
+
+// TestRetiringAContextLeavesAConnectionSomethingElseReaches is the ownership
+// a relation does not record.
+//
+// A context discovers another connection and says so, which is a relation.
+// That connection can also be one this process is configured with, or one
+// with a probe context of its own, and neither of those is a relation: a probe
+// target derives nothing, so a live connection can have nothing pointing at
+// it. Deciding from the relations alone took their history when the
+// discovering context went quiet.
+func TestRetiringAContextLeavesAConnectionSomethingElseReaches(t *testing.T) {
+	for _, reach := range []string{"configured", "probed"} {
+		t.Run(reach, func(t *testing.T) {
+			s := New()
+			const discoverer, child = "discoverer", "child"
+
+			// The discovering context built it, which is the relation.
+			s.Own(discoverer, child, "b")()
+			key := Key{Engine: EngineQuery, Target: child, Database: "b"}
+			s.Record(key, time.Now())
+
+			// And something that is not a relation reaches it too.
+			live := func(id string) bool { return id == child }
+
+			if removed := s.ForgetContext(discoverer, live); removed != 0 {
+				t.Errorf("%d records removed, want 0: the connection is %s", removed, reach)
+			}
+			if _, ok := s.At(key); !ok {
+				t.Errorf("a connection that is %s lost its history when the context that discovered it went quiet", reach)
+			}
+
+			// What comes back for it is its own retirement, not another pass
+			// over the context that discovered it. A configured connection
+			// has none, which is the point of it.
+			if reach == "configured" {
+				return
+			}
+			if removed := s.ForgetContext(child, nil); removed != 1 {
+				t.Errorf("%d records removed when the connection's own context went quiet, want 1", removed)
+			}
+		})
+	}
+}
+
+// TestARetirementWorkHeldUpIsFinishedAfterwards keeps a deferral from being an
+// abandonment.
+//
+// A connection being collected is left alone by a retirement, and something
+// has to come back for it. Nothing did: the context that would have retired it
+// has already lost its slot, so there is no later retirement to catch it.
+func TestARetirementWorkHeldUpIsFinishedAfterwards(t *testing.T) {
+	s := New()
+	const discoverer, child = "discoverer", "child"
+
+	s.Own(discoverer, child, "b")()
+	key := Key{Engine: EngineQuery, Target: child, Database: "b"}
+	s.Record(key, time.Now())
+
+	// Work in flight on that connection, through a plain hold rather than a
+	// relation, so nothing else is keeping it.
+	busy := s.Hold(child)
+
+	if removed := s.ForgetContext(discoverer, nil); removed != 0 {
+		t.Fatalf("%d records removed while work was holding the connection", removed)
+	}
+	if _, ok := s.At(key); !ok {
+		t.Fatal("a connection being collected lost its history")
+	}
+
+	busy()
+	if _, ok := s.At(key); ok {
+		t.Error("the retirement that work held up was never finished")
+	}
+	if len(s.Owned(discoverer)) != 0 {
+		t.Error("the relation outlived the records it was for")
+	}
+}
+
+// TestAConnectionTakenUpAgainIsNotRetired covers the moment between asking
+// whether anything still reaches a connection and acting on the answer.
+func TestAConnectionTakenUpAgainIsNotRetired(t *testing.T) {
+	s := New()
+	const discoverer, child = "discoverer", "child"
+
+	s.Own(discoverer, child, "b")()
+	key := Key{Engine: EngineQuery, Target: child, Database: "b"}
+	s.Record(key, time.Now())
+
+	busy := s.Hold(child)
+	if removed := s.ForgetContext(discoverer, nil); removed != 0 {
+		t.Fatalf("%d records removed while work was holding the connection", removed)
+	}
+
+	// Answering the question takes long enough for another request to take the
+	// connection up, which is the window this is about.
+	var second func()
+	s.WatchLive(func(string) bool {
+		if second == nil {
+			second = s.Hold(child)
+		}
+		return false
+	})
+
+	busy()
+	if _, ok := s.At(key); !ok {
+		t.Error("a connection taken up again while the question was being asked was retired underneath it")
+	}
+	if second != nil {
+		second()
+	}
+	if _, ok := s.At(key); ok {
+		t.Error("the retirement was not finished once the second request let go")
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/lib/pq"
 	"github.com/percona/postgres_exporter/config"
+	"github.com/percona/postgres_exporter/internal/targetid"
 )
 
 // convert a string to the corresponding ColumnUsage
@@ -191,28 +192,37 @@ func parseFingerprint(url string) (string, error) {
 	return fingerprint, nil
 }
 
-// passwordKeyword matches the password field of a keyword connection string.
-var passwordKeyword = regexp.MustCompile(`(?i)\bpassword\s*=\s*('[^']*'|\S+)`)
+// plainTargetName matches a target that cannot be carrying a credential.
+//
+// An allow list rather than a search for the places a password hides. The
+// characters a connection string needs to carry one, which are at least the
+// separators, the quote and the space, are all outside this.
+var plainTargetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 // loggableTarget is a probe target with any credential in it removed.
 //
-// The target comes from the request and need not be a name. A URL can carry a
-// password in its user info, a keyword connection string can carry one in a
-// password field, and both arrive through the same parameter. Logging it as
-// given put a password into the log of a request that was refused before it
-// reached a server.
+// The target comes from the request and need not be a name. A URL carries a
+// password in its user info and again in a password query parameter, and a
+// keyword string carries one in a password field whose value may be quoted and
+// contain an escaped quote. Logging it as given put a password into the log of
+// a request that was refused before it reached a server.
 //
-// A target that carries neither is logged as it is, because an operator
-// reading a refusal wants to know which target it was.
+// The redaction is the connection parser's own, so it cannot understand less
+// of the syntax than the thing that builds the connection. A target that
+// parser cannot understand is logged as its identity instead, because a string
+// nothing could parse may still hold a password.
+//
+// A name with nothing in it that could carry a credential is logged as it is,
+// because an operator reading a refusal wants to know which target it was.
 func loggableTarget(target string) string {
-	if u, err := url.Parse(target); err == nil && u.User != nil {
-		u.User = url.UserPassword(u.User.Username(), "PASSWORD_REMOVED")
-		return u.String()
+	if plainTargetName.MatchString(target) {
+		return target
 	}
-	if passwordKeyword.MatchString(target) {
-		return passwordKeyword.ReplaceAllString(target, "password=PASSWORD_REMOVED")
+	if redacted, err := config.Loggable(target); err == nil {
+		return redacted
 	}
-	return target
+	id, _ := targetid.ID(target)
+	return "target " + id
 }
 
 func loggableDSN(dsn string) string {

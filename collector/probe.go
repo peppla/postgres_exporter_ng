@@ -98,8 +98,18 @@ func (pc *ProbeCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
+	// Held from here, so a cleanup cannot retire this connection's history
+	// underneath the work that is reading or writing it.
+	target, _ := targetid.ID(pc.instance.dsn)
+	defer pc.lastSuccess.Hold(target)()
+
 	if err := pc.connSema.Acquire(pc.ctx, 1); err != nil {
 		level.Warn(pc.logger).Log("msg", "Failed to acquire semaphore", "err", err)
+		// No collector runs, so each one's last success is what is still
+		// known about it. Returning silently dropped the freshness series at
+		// exactly the moment an operator reads it to find out how long this
+		// has been going on.
+		publishRetained(ch, pc.lastSuccess, pc.collectors, target, "")
 		return
 	}
 	defer pc.connSema.Release(1)
@@ -108,14 +118,10 @@ func (pc *ProbeCollector) Collect(ch chan<- prometheus.Metric) {
 	err := pc.instance.setup(pc.ctx)
 	if err != nil {
 		level.Error(pc.logger).Log("msg", "Error opening connection to database", "err", err)
+		publishRetained(ch, pc.lastSuccess, pc.collectors, target, "")
 		return
 	}
 	defer pc.instance.Close()
-
-	// Held while these collectors run, so a cleanup cannot retire this
-	// connection's history underneath the work that is writing it.
-	target, _ := targetid.ID(pc.instance.dsn)
-	defer pc.lastSuccess.Hold(target)()
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(pc.collectors))

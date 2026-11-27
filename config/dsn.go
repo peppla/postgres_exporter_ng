@@ -64,6 +64,25 @@ func (d DSN) GetConnectionString() string {
 	return u.String()
 }
 
+// Loggable is a connection string with its password removed, using the same
+// parser the driver's string is built from.
+//
+// Exported so that nothing else has to work out where a password can hide. A
+// URL carries one in its user info and again in a password query parameter, a
+// keyword string carries one in a password field whose value may be quoted and
+// may contain an escaped quote, and a pattern that understands less of that
+// syntax than this parser does will let one through. It has.
+//
+// An input this parser cannot understand returns an error rather than itself,
+// because a string nothing could parse may still hold a password.
+func Loggable(in string) (string, error) {
+	d, err := dsnFromString(in)
+	if err != nil {
+		return "", err
+	}
+	return d.String(), nil
+}
+
 // dsnFromString parses a connection string into a dsn. It will attempt to parse the string as
 // a URL and as a set of key=value pairs. If both attempts fail, dsnFromString will return an error.
 func dsnFromString(in string) (DSN, error) {

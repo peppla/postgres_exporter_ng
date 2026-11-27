@@ -108,7 +108,22 @@ func NewStoresWithLimits(l slots.Limits, configured []string) Stores {
 		permanent[id] = struct{}{}
 	}
 
-	s.Slots = slots.New(l, func(k slots.Key) {
+	// Whether a connection is still reachable by something that is not a
+	// relation. A configured connection always is, and a probe connection is
+	// while it holds a slot, which it does for as long as it is being probed.
+	// Neither of those is a relation, so without this a context retiring takes
+	// the history of a connection it merely discovered.
+	//
+	// This one is for the retirement a hold deferred, which runs with no store
+	// lock held and so may ask the admission directly.
+	s.LastSuccess.WatchLive(func(id string) bool {
+		if _, forever := permanent[id]; forever {
+			return true
+		}
+		return s.Slots.Holds(slots.Key{Kind: slots.Context, Name: id})
+	})
+
+	s.Slots = slots.New(l, func(k slots.Key, stillHeld map[slots.Key]struct{}) {
 		switch k.Kind {
 		case slots.Profile:
 			engine, selection, ok := strings.Cut(k.Name, ":")
@@ -128,7 +143,17 @@ func NewStoresWithLimits(l slots.Limits, configured []string) Stores {
 				// configuration is what keeps it and that did not expire.
 				return
 			}
-			records := s.LastSuccess.ForgetContext(k.Name)
+			// The same question, answered from what the admission handed
+			// over rather than by asking it, because this runs under its
+			// lock.
+			live := func(id string) bool {
+				if _, forever := permanent[id]; forever {
+					return true
+				}
+				_, held := stillHeld[slots.Key{Kind: slots.Context, Name: id}]
+				return held
+			}
+			records := s.LastSuccess.ForgetContext(k.Name, live)
 			schedules := s.Rotation.ForgetContext(k.Name)
 			if records > 0 || schedules > 0 {
 				level.Info(logger).Log("msg", "Released a probe connection that stopped being probed",

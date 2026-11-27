@@ -202,9 +202,20 @@ func TestAnUnknownCollectorIsStillA400(t *testing.T) {
 func TestAProbeTargetIsNotLoggedWithItsPassword(t *testing.T) {
 	const password = "hunter2-correct-horse"
 	for _, target := range []string{
+		// The user info.
 		"postgresql://reader:" + password + "@db:5432/app?sslmode=disable",
+		// A query parameter, which the connection parser accepts and an
+		// earlier redaction left behind.
+		"postgresql://db:5432/app?password=" + password,
+		// Both at once, where the user info is redacted and the query is not.
+		"postgresql://reader:other@db:5432/app?password=" + password,
+		// A keyword field.
 		"host=db port=5432 user=reader password=" + password + " dbname=app",
+		// A quoted keyword field.
 		"host=db password='" + password + "' dbname=app",
+		// A quoted field with an escaped quote in it, which stopped a pattern
+		// that understood less of the syntax than the parser does.
+		`host=db password='be\'fore` + password + `' dbname=app`,
 	} {
 		got := loggableTarget(target)
 		if strings.Contains(got, password) {

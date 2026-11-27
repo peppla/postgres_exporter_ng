@@ -18,12 +18,18 @@
 package collector
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-kit/log"
 	"github.com/percona/postgres_exporter/internal/dbselect"
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/targetid"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/sync/semaphore"
 )
 
 // catalogueThatLoses gives every connection the version lookup and a catalogue
@@ -136,5 +142,70 @@ func TestBuiltInCollectionKeepsADatabaseItCanNoLongerReach(t *testing.T) {
 
 	if _, _, ok := store.Latest(lastsuccess.EngineCollector, lastsuccess.OneCollector, target, "outcome_local"); !ok {
 		t.Error("a database that is still there lost its history because it stopped accepting connections")
+	}
+}
+
+// TestAProbeThatCannotConnectStillSaysWhenItLastWorked is the freshness
+// contract on the path that runs no collector.
+//
+// A probe whose connection is refused returns with nothing collected. Saying
+// nothing about when each collector last worked drops that series at exactly
+// the moment an operator reads it to find out how long this has been going
+// on, and the other engine already publishes it on its equivalent paths.
+//
+// A collector that has never succeeded here still has no timestamp, because
+// there is nothing to say about it.
+func TestAProbeThatCannotConnectStillSaysWhenItLastWorked(t *testing.T) {
+	targetid.Clear()
+	t.Cleanup(targetid.Clear)
+
+	store := lastsuccess.New()
+	const dsn = "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	target, _ := targetid.ID(dsn)
+
+	worked := time.Now().Add(-time.Hour)
+	store.Record(lastsuccess.Key{Engine: lastsuccess.EngineCollector, Target: target,
+		Collector: "outcome_local"}, worked)
+
+	inst, err := newInstance(dsn)
+	if err != nil {
+		t.Fatalf("building the instance: %s", err)
+	}
+	pc := &ProbeCollector{
+		collectors:  map[string]Collector{"outcome_local": quietCollector{}, "never_ran": quietCollector{}},
+		logger:      log.NewNopLogger(),
+		instance:    inst,
+		connSema:    semaphore.NewWeighted(1),
+		ctx:         context.Background(),
+		lastSuccess: store,
+	}
+
+	ch := make(chan prometheus.Metric, 16)
+	pc.Collect(ch)
+	close(ch)
+
+	found := map[string]float64{}
+	for metric := range ch {
+		pb := &dto.Metric{}
+		if err := metric.Write(pb); err != nil {
+			t.Fatalf("writing a metric: %s", err)
+		}
+		var name string
+		for _, pair := range pb.GetLabel() {
+			if pair.GetName() == "collector" {
+				name = pair.GetValue()
+			}
+		}
+		found[name] = pb.GetGauge().GetValue()
+	}
+
+	want := float64(worked.UnixNano()) / 1e9
+	if got, ok := found["outcome_local"]; !ok {
+		t.Errorf("a probe that could not connect published nothing about when its collector last worked: %v", found)
+	} else if got != want {
+		t.Errorf("the retained time is %v, want %v", got, want)
+	}
+	if _, ok := found["never_ran"]; ok {
+		t.Error("a collector that has never succeeded was given a timestamp")
 	}
 }

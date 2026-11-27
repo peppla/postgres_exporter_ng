@@ -136,7 +136,7 @@ func TestASlotInUseIsNeverReleased(t *testing.T) {
 func TestAQuietSlotIsReleasedAndItsOwnerTold(t *testing.T) {
 	c := newClock()
 	var told []Key
-	s := New(Limits{Profiles: 2, Idle: time.Minute}, func(k Key) {
+	s := New(Limits{Profiles: 2, Idle: time.Minute}, func(k Key, _ map[Key]struct{}) {
 		told = append(told, k)
 	}).WithClock(c.now)
 
@@ -261,7 +261,7 @@ func TestRetirementAndReadmissionAreOrdered(t *testing.T) {
 	var wg sync.WaitGroup
 	var retired []Key
 
-	s = New(Limits{Profiles: 1, Idle: time.Minute}, func(k Key) {
+	s = New(Limits{Profiles: 1, Idle: time.Minute}, func(k Key, _ map[Key]struct{}) {
 		retired = append(retired, k)
 		retiring.Store(true)
 		wg.Add(1)

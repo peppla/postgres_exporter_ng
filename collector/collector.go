@@ -928,7 +928,7 @@ func (p PostgresCollector) retainedForControl(ch chan<- prometheus.Metric, dsn, 
 		if database == "" || !p.controlSelected(database) {
 			continue
 		}
-		p.publishRetainedOne(ch, target, database, name)
+		publishRetainedOne(ch, p.lastSuccess, target, database, name)
 	}
 
 	// The database as a whole, resolved the same way and gated the same way,
@@ -995,20 +995,30 @@ func (p PostgresCollector) publishDatabaseFreshness(ch chan<- prometheus.Metric,
 // that has never succeeded here, and nothing is recorded: this says what was
 // already known.
 func (p PostgresCollector) publishRetained(ch chan<- prometheus.Metric, collectors map[string]Collector, target, datname string) {
+	publishRetained(ch, p.lastSuccess, collectors, target, datname)
+}
+
+// publishRetained publishes what each collector last did on one connection.
+//
+// A free function because the probe endpoint needs the same thing on its own
+// early returns and is not a PostgresCollector. A path that runs no collector
+// has to say what was already known, or the freshness series goes missing at
+// the moment it is being read to find out how long something has been broken.
+func publishRetained(ch chan<- prometheus.Metric, store *lastsuccess.Store, collectors map[string]Collector, target, datname string) {
 	for name := range collectors {
-		p.publishRetainedOne(ch, target, datname, name)
+		publishRetainedOne(ch, store, target, datname, name)
 	}
 }
 
 // publishRetainedOne publishes what one collector last did on one database.
-func (p PostgresCollector) publishRetainedOne(ch chan<- prometheus.Metric, target, datname, name string) {
+func publishRetainedOne(ch chan<- prometheus.Metric, store *lastsuccess.Store, target, datname, name string) {
 	key := lastsuccess.Key{
 		Engine:    lastsuccess.EngineCollector,
 		Target:    target,
 		Database:  datname,
 		Collector: name,
 	}
-	if when, ok := p.lastSuccess.At(key); ok {
+	if when, ok := store.At(key); ok {
 		ch <- prometheus.MustNewConstMetric(collectorLastSuccessDesc, prometheus.GaugeValue,
 			float64(when.UnixNano())/1e9, name, datname, target)
 	}
