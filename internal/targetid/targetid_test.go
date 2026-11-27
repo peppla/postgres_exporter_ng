@@ -67,15 +67,68 @@ func TestOneIdentityPerConnectionString(t *testing.T) {
 
 // TestAnIdentityCarriesNothingFromTheString keeps credentials out of what ends
 // up in a metric label.
+//
+// The parts looked for all contain a character hexadecimal does not use. A
+// substring of the hex alphabet is not evidence of anything: "db" turns up in
+// about one identity in nine by chance, which failed this on PostgreSQL 19 in
+// the matrix at 60cb548 while the same code passed on the other four majors.
+// A case that fails one run in nine is a case that says nothing.
+//
+// The shape is checked as well, because a value that is not a fixed-width hex
+// string is a different question from what it carries.
 func TestAnIdentityCarriesNothingFromTheString(t *testing.T) {
 	Clear()
 	defer Clear()
 
-	id, _ := ID("postgresql://reader:hunter2@db:5432/app")
-	for _, part := range []string{"hunter2", "reader", "db", "app"} {
+	id, _ := ID("postgresql://reader:hunter2zz@dbhost:5432/appname")
+	for _, part := range []string{"hunter2zz", "reader", "dbhost", "appname", "postgresql"} {
 		if strings.Contains(id, part) {
 			t.Errorf("the identity %q carries %q from the connection string", id, part)
 		}
+	}
+	if len(id) != Width {
+		t.Errorf("the identity %q is %d characters, want %d", id, len(id), Width)
+	}
+	for _, c := range id {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			t.Errorf("the identity %q is not hexadecimal", id)
+			break
+		}
+	}
+}
+
+// TestOneCharacterOfTheStringChangesTheWholeIdentity is the property that
+// makes a connection context its own.
+//
+// Two connections that differ in one character are different contexts and must
+// not share an identity, and a reader of two identities must not be able to
+// tell how close the strings behind them are.
+func TestOneCharacterOfTheStringChangesTheWholeIdentity(t *testing.T) {
+	Clear()
+	defer Clear()
+
+	const base = "postgresql://reader:secret@db:5432/app?sslmode=disable"
+	const nearly = "postgresql://reader:secret@db:5432/apq?sslmode=disable"
+	if base == nearly || len(base) != len(nearly) {
+		t.Fatal("the two fixtures are not one character apart, so this proves nothing")
+	}
+	first, _ := ID(base)
+	second, _ := ID(nearly)
+
+	if first == second {
+		t.Fatalf("two connection strings differing in one character share the identity %q", first)
+	}
+	same := 0
+	for i := range first {
+		if first[i] == second[i] {
+			same++
+		}
+	}
+	// Two unrelated hex strings agree in about one position in sixteen. A
+	// derivation that carried the input through would agree in nearly all of
+	// them.
+	if same > Width/2 {
+		t.Errorf("the identities %q and %q agree in %d of %d positions", first, second, same, Width)
 	}
 }
 
