@@ -786,14 +786,14 @@ func TestAConnectionTakenUpAgainIsNotRetired(t *testing.T) {
 		t.Fatalf("%d records removed while work was holding the connection", removed)
 	}
 
-	// Answering the question takes long enough for another request to take the
-	// connection up, which is the window this is about.
+	// Another request takes the connection up while the question is being
+	// answered, which is the window this is about.
 	var second func()
-	s.WatchLive(func(string) bool {
+	s.WatchLive(func(_ string, act func(bool)) {
 		if second == nil {
 			second = s.Hold(child)
 		}
-		return false
+		act(false)
 	})
 
 	busy()

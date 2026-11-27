@@ -79,6 +79,10 @@ type Stores struct {
 	// the two things no catalogue read can bound because a request mints
 	// them.
 	Slots *slots.Store
+	// live is the check installed on LastSuccess, kept so that a test can
+	// wrap the real one rather than build a copy of it and then prove
+	// something about the copy.
+	live func(target string, act func(reachable bool))
 }
 
 // NewStores builds the state that outlives a request, with no admission limit
@@ -114,14 +118,21 @@ func NewStoresWithLimits(l slots.Limits, configured []string) Stores {
 	// Neither of those is a relation, so without this a context retiring takes
 	// the history of a connection it merely discovered.
 	//
-	// This one is for the retirement a hold deferred, which runs with no store
-	// lock held and so may ask the admission directly.
-	s.LastSuccess.WatchLive(func(id string) bool {
-		if _, forever := permanent[id]; forever {
-			return true
-		}
-		return s.Slots.Holds(slots.Key{Kind: slots.Context, Name: id})
-	})
+	// This one is for the retirement a hold deferred. It runs with no store
+	// lock held, so it may reach the admission, and it does what it decides
+	// while the admission is held still, because a connection admitted
+	// between the answer and the act is one whose fresh state would then be
+	// deleted on the strength of an answer taken before it arrived.
+	s.live = func(id string, act func(bool)) {
+		s.Slots.While(func(holds func(slots.Key) bool) {
+			if _, forever := permanent[id]; forever {
+				act(true)
+				return
+			}
+			act(holds(slots.Key{Kind: slots.Context, Name: id}))
+		})
+	}
+	s.LastSuccess.WatchLive(func(id string, act func(bool)) { s.live(id, act) })
 
 	s.Slots = slots.New(l, func(k slots.Key, stillHeld map[slots.Key]struct{}) {
 		switch k.Kind {

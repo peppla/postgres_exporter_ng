@@ -295,6 +295,30 @@ func (s *Store) Sweep() int {
 	return len(going)
 }
 
+// While runs f with the slots held still, handing it a way to ask what holds
+// one.
+//
+// For a caller that has to act on the answer, not just read it. Asking and
+// then acting leaves a gap, and a name admitted in that gap is a name whose
+// state the caller is about to delete on the strength of an answer that was
+// true before it arrived. Nothing can be admitted or retired while f runs.
+//
+// f may take the locks of the stores this one's releases reach into, which is
+// the order those releases already take them in. It must not call back into
+// this store.
+func (s *Store) While(f func(holds func(Key) bool)) {
+	if s == nil {
+		f(func(Key) bool { return false })
+		return
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	f(func(k Key) bool {
+		_, ok := s.slots[k]
+		return ok
+	})
+}
+
 // Holds says whether this name has a slot right now.
 //
 // For the stores that have to know a connection is still being asked about

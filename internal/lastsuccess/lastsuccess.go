@@ -110,9 +110,9 @@ type Store struct {
 	// held counts the scrapes currently working on each target, so a cleanup
 	// cannot remove the history of work that is still running.
 	held map[string]int
-	// live says whether a connection is still reachable by something other
-	// than a relation: one this process is configured with, or one holding a
-	// slot of its own. Nil means nothing is.
+	// live answers whether a connection is still reachable by something other
+	// than a relation, and runs the act it is given before that answer can
+	// change. Nil means nothing is reachable that way.
 	//
 	// A relation is how one connection says it built another, and a
 	// connection can be live without any relation pointing at it. A probe
@@ -120,7 +120,7 @@ type Store struct {
 	// retiring and finding no relation left on it would take its history even
 	// while it is being probed. The store cannot know either of those things,
 	// so it asks.
-	live func(string) bool
+	live func(target string, act func(reachable bool))
 	// pending is the connections a retirement could not finish because work
 	// was holding them. The hold being dropped is what finishes it, so that a
 	// retirement deferred is not a retirement abandoned.
@@ -372,12 +372,19 @@ func (s *Store) Owned(seed string) map[string]string {
 // WatchLive tells the store how to ask whether a connection is reachable by
 // something other than a relation.
 //
-// Set once, by whoever knows the configuration and the slots. It is used only
-// to finish a retirement that work was holding up, and it is called with this
-// store's lock not held: answering it reaches into the admission, and the
-// admission is what calls into here, so taking the two in both orders is how
-// that stops.
-func (s *Store) WatchLive(live func(string) bool) {
+// Set once, by whoever knows the configuration and the slots.
+//
+// It takes the act rather than returning the answer, because a retirement has
+// to act on it. Asking and then acting leaves a gap, and a connection admitted
+// in that gap is one whose fresh state the retirement then deletes on the
+// strength of an answer that was true before it arrived. Checking the holds
+// again afterwards does not close that: a probe lets go of a connection
+// before it lets go of its slot.
+//
+// It is called with this store's lock not held, and takes it inside the act.
+// Answering reaches into the admission, and the admission is what calls into
+// here, so the two are always taken in that order and never the other.
+func (s *Store) WatchLive(live func(target string, act func(reachable bool))) {
 	if s == nil {
 		return
 	}
@@ -414,15 +421,31 @@ func (s *Store) release(target string) {
 
 // finishPending completes a retirement that work was holding up.
 //
-// With no lock held, because the first thing it does reaches outside this
-// store. A connection taken up again while that question was being asked goes
-// back to waiting rather than being retired underneath whoever took it.
+// With no lock of this store held on the way in, because the first thing it
+// does reaches outside. What it does reach out to holds the admission still
+// for as long as this runs, so nothing can be admitted between the answer and
+// what is done with it.
+//
+// A connection taken up again by work, or claimed by a seed, while that was
+// happening goes back to waiting rather than being retired underneath
+// whoever took it.
 func (s *Store) finishPending(target string) {
-	if s.live != nil && s.live(target) {
+	if s.live == nil {
+		s.finish(target, false)
 		return
 	}
+	s.live(target, func(reachable bool) { s.finish(target, reachable) })
+}
+
+// finish retires a connection unless something still reaches it. Called from
+// inside the admission's own hold, so the answer it was given cannot have
+// gone stale.
+func (s *Store) finish(target string, reachable bool) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if reachable {
+		return
+	}
 	if s.held[target] > 0 {
 		s.pending[target] = struct{}{}
 		return

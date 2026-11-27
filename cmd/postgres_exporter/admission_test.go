@@ -269,3 +269,132 @@ func TestRetiringAProbeConnectionLeavesTheConfiguredOnesAlone(t *testing.T) {
 		t.Error("a probe connection that expired kept its state, so the slot count is bounded and the state is not")
 	}
 }
+
+// TestADeferredCleanupCannotEraseAReadmittedConnection is the gap between
+// asking whether anything still reaches a connection and acting on the answer.
+//
+// A probe lets go of a connection before it lets go of its slot, so checking
+// the holds again after the answer does not close it. A connection admitted
+// between the two has a slot, has recorded a fresh success and has let go of
+// its collection hold, and the older cleanup then deletes that fresh record on
+// the strength of an answer taken before any of it happened.
+//
+// The answer and what is done with it are one step now, with the admission
+// held still across both.
+func TestADeferredCleanupCannotEraseAReadmittedConnection(t *testing.T) {
+	const configured = "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	stores := NewStoresWithLimits(slots.Limits{Contexts: 4, Idle: time.Nanosecond}, []string{configured})
+
+	const discoverer, child = "discoverer", "child"
+
+	// A context discovered the connection, and work is holding it.
+	stores.LastSuccess.Own(discoverer, child, "b")()
+	busy := stores.LastSuccess.Hold(child)
+
+	// That context expires, and the cleanup for the connection it discovered
+	// is held up by the work.
+	release, _, ok := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: discoverer})
+	if !ok {
+		t.Fatal("the discovering context was refused")
+	}
+	release()
+	if swept := stores.Slots.Sweep(); swept == 0 {
+		t.Fatal("nothing expired, so there is no deferred cleanup to race")
+	}
+
+	// The readmission happens after the cleanup has its answer, which is the
+	// ordering this is about. The real check runs and then this waits, so
+	// what is wrapped is the production one rather than a copy of it.
+	key := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: child, Database: "b"}
+	var newLease func()
+	var readmitted sync.WaitGroup
+	production := stores.live
+	stores.LastSuccess.WatchLive(func(id string, act func(bool)) {
+		production(id, func(reachable bool) {
+			if id == child && newLease == nil {
+				readmitted.Add(1)
+				go func() {
+					defer readmitted.Done()
+					// Admitted in its own right, recording a success, then
+					// done collecting. Its slot is still held, which is what
+					// a probe looks like between one request's collection
+					// ending and the request ending.
+					lease, _, ok := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: child})
+					if !ok {
+						return
+					}
+					newLease = lease
+					collecting := stores.LastSuccess.Hold(child)
+					stores.LastSuccess.Record(key, time.Now())
+					collecting()
+				}()
+				// Long enough for that to finish if anything lets it.
+				time.Sleep(50 * time.Millisecond)
+			}
+			act(reachable)
+		})
+	})
+
+	// The older work ends, which is what finishes the deferred cleanup.
+	busy()
+	readmitted.Wait()
+	if newLease != nil {
+		defer newLease()
+	}
+
+	if _, ok := stores.LastSuccess.At(key); !ok {
+		t.Error("a deferred cleanup deleted the record of a connection admitted after it took its answer")
+	}
+}
+
+// TestTheRetirementHappensInsideTheAnswer is the shape that closes the gap,
+// asserted where a race cannot be relied on to show it.
+//
+// The previous case says a connection readmitted during the answer keeps its
+// record, and it says that whether the retirement runs inside the answer or
+// just after it, because the window after it is narrow. What makes the window
+// not exist is the retirement happening while the admission is still held,
+// and that is observable: by the time the check hands back, the retirement it
+// authorised has already happened.
+func TestTheRetirementHappensInsideTheAnswer(t *testing.T) {
+	stores := NewStoresWithLimits(slots.Limits{Contexts: 4, Idle: time.Nanosecond}, nil)
+
+	const discoverer, child = "discoverer", "child"
+	stores.LastSuccess.Own(discoverer, child, "b")()
+	key := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: child, Database: "b"}
+	stores.LastSuccess.Record(key, time.Now())
+	busy := stores.LastSuccess.Hold(child)
+
+	release, _, ok := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: discoverer})
+	if !ok {
+		t.Fatal("the discovering context was refused")
+	}
+	release()
+	if swept := stores.Slots.Sweep(); swept == 0 {
+		t.Fatal("nothing expired, so there is no deferred cleanup")
+	}
+	if _, ok := stores.LastSuccess.At(key); !ok {
+		t.Fatal("the record went while work was holding the connection, so there is nothing deferred")
+	}
+
+	var settled bool
+	production := stores.live
+	stores.LastSuccess.WatchLive(func(id string, act func(bool)) {
+		production(id, func(reachable bool) {
+			act(reachable)
+			if id == child {
+				_, stillThere := stores.LastSuccess.At(key)
+				settled = !stillThere
+			}
+		})
+	})
+
+	busy()
+
+	if !settled {
+		t.Error("the check handed back before the retirement it authorised had happened, which is the window an admission fits in")
+	}
+	if _, ok := stores.LastSuccess.At(key); ok {
+		t.Error("the deferred retirement never happened at all")
+	}
+}
