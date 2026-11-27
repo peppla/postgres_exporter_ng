@@ -24,6 +24,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/rotation"
 	"github.com/percona/postgres_exporter/internal/slots"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
@@ -83,7 +84,7 @@ type Stores struct {
 // NewStores builds the state that outlives a request, with no admission limit
 // configured, so nothing is refused and nothing is released.
 func NewStores() Stores {
-	return NewStoresWithLimits(slots.Limits{})
+	return NewStoresWithLimits(slots.Limits{}, nil)
 }
 
 // NewStoresWithLimits builds it with the admission limits set.
@@ -95,21 +96,44 @@ func NewStores() Stores {
 // bounded by the collectors and the connections instead. Not the ownership
 // relations either, because another profile may still be collecting that
 // connection.
-func NewStoresWithLimits(l slots.Limits) Stores {
+// configured is the connections this process is configured with. Their state
+// belongs to the configuration, which does not expire, so a probe of one of
+// them losing its slot must not take it away.
+func NewStoresWithLimits(l slots.Limits, configured []string) Stores {
 	s := Stores{LastSuccess: lastsuccess.New(), Rotation: rotation.New()}
+
+	permanent := make(map[string]struct{}, len(configured))
+	for _, dsn := range configured {
+		id, _ := targetid.ID(dsn)
+		permanent[id] = struct{}{}
+	}
+
 	s.Slots = slots.New(l, func(k slots.Key) {
-		if k.Kind != slots.Profile {
-			return
-		}
-		engine, selection, ok := strings.Cut(k.Name, ":")
-		if !ok || selection == "" {
-			return
-		}
-		records := s.LastSuccess.ForgetProfile(engine, selection)
-		schedules := s.Rotation.ForgetProfile(engine, selection)
-		if records > 0 || schedules > 0 {
-			level.Info(logger).Log("msg", "Released a collection profile that stopped being scraped",
-				"engine", engine, "records", records, "schedules", schedules)
+		switch k.Kind {
+		case slots.Profile:
+			engine, selection, ok := strings.Cut(k.Name, ":")
+			if !ok || selection == "" {
+				return
+			}
+			records := s.LastSuccess.ForgetProfile(engine, selection)
+			schedules := s.Rotation.ForgetProfile(engine, selection)
+			if records > 0 || schedules > 0 {
+				level.Info(logger).Log("msg", "Released a collection profile that stopped being scraped",
+					"engine", engine, "records", records, "schedules", schedules)
+			}
+		case slots.Context:
+			if _, forever := permanent[k.Name]; forever {
+				// A probe of a connection this process is configured with.
+				// The slot goes and the state stays, because the
+				// configuration is what keeps it and that did not expire.
+				return
+			}
+			records := s.LastSuccess.ForgetContext(k.Name)
+			schedules := s.Rotation.ForgetContext(k.Name)
+			if records > 0 || schedules > 0 {
+				level.Info(logger).Log("msg", "Released a probe connection that stopped being probed",
+					"target", k.Name, "records", records, "schedules", schedules)
+			}
 		}
 	})
 	return s

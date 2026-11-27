@@ -384,6 +384,15 @@ func (s *Store) release(target string) {
 // that connection, and a relation removed under a live record is a record
 // nothing owns.
 //
+// Nothing here consults the holds, and it must not. A hold says some request
+// is working on that connection, which under another profile is true while
+// this profile is being retired and says nothing about this profile's records.
+// Skipping on it left a retired profile's record alive for as long as any
+// other profile kept the connection busy, with no slot and nothing scheduled
+// to come back for it. The protection this needs is the slot's own: a slot in
+// use is never released, so a profile reaching here has no request of its own
+// running.
+//
 // It returns how many records it removed.
 func (s *Store) ForgetProfile(engine, selection string) int {
 	if s == nil || selection == "" {
@@ -397,13 +406,64 @@ func (s *Store) ForgetProfile(engine, selection string) int {
 		if key.Engine != engine || key.About != WholeSelection || key.Collector != selection {
 			continue
 		}
-		if s.held[key.Target] > 0 {
-			// A request is working on this connection, and expiry does not
-			// reach work in flight.
+		delete(s.seen, key)
+		removed++
+	}
+	return removed
+}
+
+// ForgetContext removes the state a connection context alone was keeping, and
+// returns how many records went.
+//
+// For the admission that bounds the probe endpoint's connections. A context
+// that stops being probed for long enough to lose its slot takes with it the
+// connections it built and its own, and nothing else.
+//
+// What decides is who else built a connection. A connection this context
+// built is retired only when no other seed built it too, so one shared with a
+// configured connection or with another probe context stays. The context's own
+// connection is retired only when nothing derived it either, which is what
+// keeps a probe of a database some other connection discovered from removing
+// that connection's history.
+//
+// Work in flight needs no check here. A context's slot is held for as long as
+// a request for it runs, so a context that has lost its slot has no request
+// of its own running, and any other request working on one of its connections
+// built that connection from its own seed and so left a seed behind.
+func (s *Store) ForgetContext(target string) int {
+	if s == nil || target == "" {
+		return 0
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	gone := map[string]struct{}{}
+	for child, e := range s.edges {
+		if _, built := e.seeds[target]; !built {
+			continue
+		}
+		delete(e.seeds, target)
+		if len(e.seeds) == 0 {
+			gone[child] = struct{}{}
+		}
+	}
+	// The context's own connection, unless something else derived it. A probe
+	// of a database a configured connection also discovers is the same
+	// connection reached two ways, and the configured one did not expire.
+	if e, ok := s.edges[target]; !ok || len(e.seeds) == 0 {
+		gone[target] = struct{}{}
+	}
+
+	removed := 0
+	for key := range s.seen {
+		if _, ok := gone[key.Target]; !ok {
 			continue
 		}
 		delete(s.seen, key)
 		removed++
+	}
+	for child := range gone {
+		delete(s.edges, child)
 	}
 	return removed
 }

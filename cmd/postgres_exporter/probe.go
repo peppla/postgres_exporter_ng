@@ -106,7 +106,7 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		held, refused, admitted := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: id})
 		if !admitted {
 			contextsRejected.Inc()
-			level.Warn(logger).Log("msg", "Refused a probe connection", "target", target)
+			level.Warn(logger).Log("msg", "Refused a probe connection", "target", loggableTarget(target))
 			http.Error(w, "probe connection refused: every connection slot is held by one that is still being probed, "+refused.Name,
 				http.StatusServiceUnavailable)
 			return
@@ -114,7 +114,9 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		defer held()
 		defer stores.Slots.Sweep()
 
-		tl := log.With(logger, "target", target)
+		// Redacted, because this label is attached to every line this request
+		// logs and the target comes from the request.
+		tl := log.With(logger, "target", loggableTarget(target))
 
 		registry := prometheus.NewRegistry()
 
@@ -154,7 +156,7 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		registry.MustRegister(exporter)
 
 		// Run the probe
-		pc, err := collector.NewProbeCollector(ctx, tl, excludeDatabases, registry, dsns[0], connSema)
+		pc, err := collector.NewProbeCollector(ctx, tl, excludeDatabases, registry, dsns[0], connSema, stores.LastSuccess)
 		if err != nil {
 			level.Error(logger).Log("msg", "Error creating probe collector", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)

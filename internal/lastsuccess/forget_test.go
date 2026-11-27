@@ -582,21 +582,114 @@ func TestForgettingAProfileLeavesWhatOtherProfilesRead(t *testing.T) {
 	}
 }
 
-// TestAProfileBeingScrapedKeepsItsRecords keeps expiry off work in flight.
-func TestAProfileBeingScrapedKeepsItsRecords(t *testing.T) {
+// TestAnotherProfilesWorkDoesNotProtectARetiredOne is the hold this must not
+// consult.
+//
+// A hold says some request is working on that connection. Under another
+// profile that is true while this profile is being retired, and it says
+// nothing about this profile's records. Skipping on it left a retired
+// profile's record alive for as long as any other profile kept the connection
+// busy, with no slot and nothing scheduled to come back for it.
+//
+// What protects a profile being scraped is its slot, which is never released
+// while a request holds it, so a profile reaching here has no request of its
+// own running.
+func TestAnotherProfilesWorkDoesNotProtectARetiredOne(t *testing.T) {
 	s := New()
 	const target = "1/app"
-	release := s.Own("1", target, "app")
 
-	selection := Selection([]string{"stat_database"})
-	key := Key{Engine: EngineCollector, About: WholeSelection, Target: target, Database: "app", Collector: selection}
-	s.Record(key, time.Now())
+	going := Selection([]string{"stat_database"})
+	staying := Selection([]string{"stat_user_tables"})
+	mine := Key{Engine: EngineCollector, About: WholeSelection, Target: target, Database: "app", Collector: going}
+	theirs := Key{Engine: EngineCollector, About: WholeSelection, Target: target, Database: "app", Collector: staying}
+	s.Own("1", target, "app")()
+	s.Record(mine, time.Now())
+	s.Record(theirs, time.Now())
 
-	if removed := s.ForgetProfile(EngineCollector, selection); removed != 0 {
-		t.Errorf("%d records removed while a request was holding the connection", removed)
+	// The other profile is collecting that connection right now.
+	busy := s.Own("1", target, "app")
+	defer busy()
+
+	if removed := s.ForgetProfile(EngineCollector, going); removed != 1 {
+		t.Errorf("%d records removed, want the retired profile's one", removed)
 	}
-	release()
-	if removed := s.ForgetProfile(EngineCollector, selection); removed != 1 {
-		t.Errorf("%d records removed once the request finished, want 1", removed)
+	if _, ok := s.At(mine); ok {
+		t.Error("a retired profile's record survived because another profile was busy with the connection")
+	}
+	if _, ok := s.At(theirs); !ok {
+		t.Error("the busy profile's own record went with the retired one")
+	}
+}
+
+// TestRetiringAContextTakesItsOwnedStateWithIt is what a released connection
+// slot has to do.
+//
+// Releasing only the slot bounds the count of connections and not the state
+// behind them: four contexts admitted and expired in turn left four sets of
+// records and relations with no slot left to come back for them.
+func TestRetiringAContextTakesItsOwnedStateWithIt(t *testing.T) {
+	s := New()
+	const probe = "probe"
+
+	// The connection the probe itself opens, and one it discovered.
+	own := Key{Engine: EngineQuery, Target: probe, Database: "app"}
+	s.Record(own, time.Now())
+	child := probe + "/other"
+	s.Own(probe, child, "other")()
+	s.Record(Key{Engine: EngineQuery, Target: child, Database: "other"}, time.Now())
+
+	if removed := s.ForgetContext(probe); removed != 2 {
+		t.Errorf("%d records removed, want both the connection's own and the one it built", removed)
+	}
+	if s.Len() != 0 {
+		t.Errorf("%d records remain", s.Len())
+	}
+	if len(s.Owned(probe)) != 0 {
+		t.Errorf("the relations of a retired connection remain: %v", s.Owned(probe))
+	}
+}
+
+// TestRetiringAContextLeavesWhatAnotherStillOwns covers the connections two
+// seeds reach.
+//
+// A probe and a configured connection can build the same connection for the
+// same database, and a probe can name a database some configured connection
+// discovered. Neither is the probe's to take away when it stops being probed.
+func TestRetiringAContextLeavesWhatAnotherStillOwns(t *testing.T) {
+	s := New()
+	const probe, configured = "probe", "seed"
+
+	// A connection both of them built.
+	shared := "shared"
+	s.Own(probe, shared, "app")()
+	s.Own(configured, shared, "app")()
+	sharedKey := Key{Engine: EngineQuery, Target: shared, Database: "app"}
+	s.Record(sharedKey, time.Now())
+
+	// A connection only the probe built.
+	only := "only"
+	s.Own(probe, only, "other")()
+	onlyKey := Key{Engine: EngineQuery, Target: only, Database: "other"}
+	s.Record(onlyKey, time.Now())
+
+	// The probe's own connection is one the configured seed discovered.
+	s.Own(configured, probe, "probed")()
+	probeKey := Key{Engine: EngineQuery, Target: probe, Database: "probed"}
+	s.Record(probeKey, time.Now())
+
+	if removed := s.ForgetContext(probe); removed != 1 {
+		t.Errorf("%d records removed, want only the connection nothing else built", removed)
+	}
+	if _, ok := s.At(sharedKey); !ok {
+		t.Error("a connection a configured seed also built lost its history to a probe expiring")
+	}
+	if _, ok := s.At(probeKey); !ok {
+		t.Error("a connection a configured seed discovered lost its history because a probe named it")
+	}
+	if _, ok := s.At(onlyKey); ok {
+		t.Error("a connection only the probe built kept its history")
+	}
+	if _, ok := s.Owned(configured)[shared]; !ok {
+		t.Error("the configured seed lost its relation to a connection it built")
 	}
 }

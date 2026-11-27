@@ -132,22 +132,13 @@ func (s *Store) Admit(keys ...Key) (release func(), refused Key, ok bool) {
 	if s == nil {
 		return func() {}, Key{}, true
 	}
-	release, refused, ok, released := s.admit(keys)
-	// Outside the lock. What a release does is drop the state that name alone
-	// was keeping, in other stores, and calling into them from under this
-	// lock is how two locks end up being taken in two orders.
-	for _, k := range released {
-		if s.onRelease != nil {
-			s.onRelease(k)
-		}
-	}
-	return release, refused, ok
-}
-
-func (s *Store) admit(keys []Key) (release func(), refused Key, ok bool, released []Key) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	return s.admit(keys)
+}
 
+// admit does the work. The caller holds the lock.
+func (s *Store) admit(keys []Key) (release func(), refused Key, ok bool) {
 	now := s.now()
 	taken := make([]Key, 0, len(keys))
 	// The slots this call brought into being, as against the ones it joined.
@@ -180,11 +171,9 @@ func (s *Store) admit(keys []Key) (release func(), refused Key, ok bool, release
 			taken = append(taken, k)
 			continue
 		}
-		freed, admitted := s.admitNew(k, now)
-		released = append(released, freed...)
-		if !admitted {
+		if !s.admitNew(k, now) {
 			rollback()
-			return func() {}, k, false, released
+			return func() {}, k, false
 		}
 		s.slots[k] = &slot{inFlight: 1, used: now}
 		created[k] = struct{}{}
@@ -202,32 +191,50 @@ func (s *Store) admit(keys []Key) (release func(), refused Key, ok bool, release
 				}
 			}
 		})
-	}, Key{}, true, released
+	}, Key{}, true
 }
 
-// admitNew makes room for a name that has no slot, and says which slots it
-// freed doing so. The caller holds the lock.
-func (s *Store) admitNew(k Key, now time.Time) (freed []Key, ok bool) {
+// admitNew makes room for a name that has no slot. The caller holds the lock.
+func (s *Store) admitNew(k Key, now time.Time) bool {
 	limit := s.limitFor(k.Kind)
 	if limit <= 0 {
 		// No limit configured, so nothing is refused.
-		return nil, true
+		return true
 	}
 	if s.countOf(k.Kind) < limit {
-		return nil, true
+		return true
 	}
 	// Full. A slot nobody has asked for in longer than the window, and which
 	// no request is holding, can go. Oldest first, so the one that has been
 	// quiet longest is the one that makes room.
 	if s.limits.Idle <= 0 {
-		return nil, false
+		return false
 	}
 	idle := s.idleOf(k.Kind, now)
 	if len(idle) == 0 {
-		return nil, false
+		return false
 	}
-	delete(s.slots, idle[0])
-	return idle[:1], true
+	s.retire(idle[0])
+	return true
+}
+
+// retire removes a slot and drops what that name alone was keeping, with the
+// lock still held.
+//
+// Under the lock on purpose. Removing the slot and then dropping its state
+// outside the lock leaves a gap in which another request can be admitted under
+// the same name and publish, and the callback that follows then deletes what
+// the new admission has just written while its lease is held. Keeping the two
+// together means a name is never half retired.
+//
+// The lock order is this one first. What a release does is reach into the
+// stores that hold records and schedules, and nothing in those reaches back
+// here, so there is no second order for the two to be taken in.
+func (s *Store) retire(k Key) {
+	delete(s.slots, k)
+	if s.onRelease != nil {
+		s.onRelease(k)
+	}
 }
 
 // idleOf returns the slots of one kind that nothing is holding and that have
@@ -264,20 +271,15 @@ func (s *Store) Sweep() int {
 		return 0
 	}
 	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	now := s.now()
 	var going []Key
 	for _, kind := range []Kind{Profile, Context} {
 		going = append(going, s.idleOf(kind, now)...)
 	}
 	for _, k := range going {
-		delete(s.slots, k)
-	}
-	s.mtx.Unlock()
-
-	for _, k := range going {
-		if s.onRelease != nil {
-			s.onRelease(k)
-		}
+		s.retire(k)
 	}
 	return len(going)
 }

@@ -425,3 +425,41 @@ func TestForgettingAProfileLeavesTheOthers(t *testing.T) {
 		t.Error("the other engine's schedule for the same profile went with it")
 	}
 }
+
+// TestForgettingAContextLeavesTheOthers covers the schedules a released
+// connection slot takes with it.
+//
+// A key's target is built by joining connection identities with separators an
+// identity cannot contain, so a whole-field match is exact and no identity is
+// a prefix of another.
+func TestForgettingAContextLeavesTheOthers(t *testing.T) {
+	s := New()
+	// The second identity has the first as a prefix, which is what a
+	// substring match cannot tell apart from the identity itself. Real
+	// identities are all the same width so one cannot be a prefix of another,
+	// and this is here so a change to that width does not quietly turn the
+	// match into a substring one.
+	const probe, other = "aaaa1111", "aaaa1111bbbb"
+	for _, k := range []Key{
+		{Engine: "query", Target: probe, Profile: "exporter"},
+		{Engine: "query", Target: probe + " " + probe, Profile: "exporter"},
+		{Engine: "query", Target: other + "," + probe, Profile: "exporter"},
+		{Engine: "query", Target: other, Profile: "exporter"},
+		{Engine: "query", Target: other + " " + other, Profile: "exporter"},
+	} {
+		s.Next(k, []string{"a", "b"})
+	}
+	if s.Len() != 5 {
+		t.Fatalf("%d schedules, want 5", s.Len())
+	}
+
+	if removed := s.ForgetContext(probe); removed != 3 {
+		t.Errorf("%d schedules removed, want the three that name that connection", removed)
+	}
+	if s.Waiting(Key{Engine: "query", Target: other, Profile: "exporter"}) == 0 {
+		t.Error("another connection's schedule went with it")
+	}
+	if s.Waiting(Key{Engine: "query", Target: other + " " + other, Profile: "exporter"}) == 0 {
+		t.Error("another connection's per-seed schedule went with it")
+	}
+}

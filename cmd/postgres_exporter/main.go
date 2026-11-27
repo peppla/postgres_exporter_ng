@@ -29,6 +29,7 @@ import (
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/pgclamp"
 	"github.com/percona/postgres_exporter/internal/querycache"
+	"github.com/percona/postgres_exporter/internal/slots"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	vc "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -220,7 +221,9 @@ func main() {
 	queryCache := querycache.New()
 	// What no single scrape can answer: when each database was last collected
 	// without error, and where the last scrape of a profile got to.
-	stores := NewStores()
+	// The configured connections go in, so a probe of one of them losing its
+	// slot does not take the configuration's own state with it.
+	stores := NewStoresWithLimits(slots.Limits{}, dsns)
 	http.Handle(*metricsPath, Handler(logger, dsns, connSema, globalCollectors, limits, collectionGate, queryCache, stores,
 		excludeSelection, includeSelection))
 

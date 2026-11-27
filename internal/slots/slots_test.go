@@ -2,6 +2,7 @@ package slots
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -240,5 +241,62 @@ func TestConcurrentAdmissionIsSafe(t *testing.T) {
 
 	if held := s.Held(Profile); held > 4 {
 		t.Errorf("%d profiles hold a slot, want at most 4", held)
+	}
+}
+
+// TestRetirementAndReadmissionAreOrdered is the gap between removing a slot
+// and dropping what it was keeping.
+//
+// Removing the slot under the lock and running the callback after it leaves a
+// moment in which another request is admitted under the same name and
+// publishes, and the callback that follows then deletes what the new admission
+// has just written while its lease is held.
+//
+// The second request here is what a real one would do in that moment. What it
+// must not be is admitted while the retirement is still running.
+func TestRetirementAndReadmissionAreOrdered(t *testing.T) {
+	c := newClock()
+	var s *Store
+	var retiring, admittedDuring atomic.Bool
+	var wg sync.WaitGroup
+	var retired []Key
+
+	s = New(Limits{Profiles: 1, Idle: time.Minute}, func(k Key) {
+		retired = append(retired, k)
+		retiring.Store(true)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			release, _, ok := s.Admit(profile(k.Name))
+			if !ok {
+				return
+			}
+			if retiring.Load() {
+				admittedDuring.Store(true)
+			}
+			release()
+		}()
+		// Long enough for that request to get in if anything lets it.
+		time.Sleep(100 * time.Millisecond)
+		retiring.Store(false)
+	}).WithClock(c.now)
+
+	release, _, ok := s.Admit(profile("a"))
+	if !ok {
+		t.Fatal("the first request was refused")
+	}
+	release()
+
+	c.advance(time.Hour)
+	if released := s.Sweep(); released != 1 {
+		t.Fatalf("a sweep released %d slots, want 1", released)
+	}
+	wg.Wait()
+
+	if len(retired) != 1 || retired[0] != profile("a") {
+		t.Fatalf("the owner was told about %v", retired)
+	}
+	if admittedDuring.Load() {
+		t.Error("a name was readmitted while what it was keeping was still being dropped")
 	}
 }

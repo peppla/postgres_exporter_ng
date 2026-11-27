@@ -29,6 +29,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/percona/postgres_exporter/internal/budget"
 	"github.com/percona/postgres_exporter/internal/dbselect"
+	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/slots"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,8 +50,9 @@ func handlerWithSlots(t *testing.T, l slots.Limits) (http.Handler, Stores) {
 	// about flag parsing rather than about admission.
 	enableDefaultCollectors(t)
 	limits := budget.Defaults()
-	stores := NewStoresWithLimits(l)
-	h := Handler(log.NewNopLogger(), []string{"postgresql://u:p@127.0.0.1:1/app?sslmode=disable"},
+	const dsn = "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	stores := NewStoresWithLimits(l, []string{dsn})
+	h := Handler(log.NewNopLogger(), []string{dsn},
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
 		limits, NewCollectionGate(limits), querycache.New(), stores,
 		dbselect.Absent(), dbselect.Absent())
@@ -188,5 +190,71 @@ func TestAnUnknownCollectorIsStillA400(t *testing.T) {
 	}
 	if held := stores.Slots.Held(slots.Profile); held != 0 {
 		t.Errorf("%d profile slots held by a request that was never valid", held)
+	}
+}
+
+// TestAProbeTargetIsNotLoggedWithItsPassword keeps a credential out of the log
+// of a request that never reached a server.
+//
+// The probe's target comes from the request and need not be a name. A URL can
+// carry a password in its user info and a keyword connection string can carry
+// one in a password field, and both arrive through the same parameter.
+func TestAProbeTargetIsNotLoggedWithItsPassword(t *testing.T) {
+	const password = "hunter2-correct-horse"
+	for _, target := range []string{
+		"postgresql://reader:" + password + "@db:5432/app?sslmode=disable",
+		"host=db port=5432 user=reader password=" + password + " dbname=app",
+		"host=db password='" + password + "' dbname=app",
+	} {
+		got := loggableTarget(target)
+		if strings.Contains(got, password) {
+			t.Errorf("the loggable form of a target is %q, which carries the password", got)
+		}
+	}
+
+	// A target that carries no credential is logged as it is, so an operator
+	// reading a refusal knows which target it was.
+	const plain = "primary-eu-west"
+	if got := loggableTarget(plain); got != plain {
+		t.Errorf("a target with no credential in it is logged as %q, want %q", got, plain)
+	}
+}
+
+// TestRetiringAProbeConnectionLeavesTheConfiguredOnesAlone is why the store is
+// told which connections are configured.
+//
+// A probe can name a connection this process is configured with. Its state
+// belongs to the configuration, which does not expire, so the probe's slot
+// going must not take it away.
+func TestRetiringAProbeConnectionLeavesTheConfiguredOnesAlone(t *testing.T) {
+	const configured = "postgresql://u:p@127.0.0.1:1/app?sslmode=disable"
+	const probed = "postgresql://u:p@127.0.0.1:2/app?sslmode=disable"
+	stores := NewStoresWithLimits(slots.Limits{Contexts: 1, Idle: time.Nanosecond}, []string{configured})
+
+	configuredID := identityOf(configured)
+	probedID := identityOf(probed)
+	now := time.Now()
+	configuredKey := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: configuredID, Database: "app"}
+	probedKey := lastsuccess.Key{Engine: lastsuccess.EngineQuery, Target: probedID, Database: "app"}
+	stores.LastSuccess.Record(configuredKey, now)
+	stores.LastSuccess.Record(probedKey, now)
+
+	// Both held a slot and both have gone quiet.
+	for _, id := range []string{configuredID, probedID} {
+		release, _, ok := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: id})
+		if !ok {
+			t.Fatalf("%s was refused", id)
+		}
+		release()
+	}
+	if released := stores.Slots.Sweep(); released == 0 {
+		t.Fatal("nothing was released, so this says nothing about what a release takes")
+	}
+
+	if _, ok := stores.LastSuccess.At(configuredKey); !ok {
+		t.Error("a probe of a configured connection expiring took the configuration's own state with it")
+	}
+	if _, ok := stores.LastSuccess.At(probedKey); ok {
+		t.Error("a probe connection that expired kept its state, so the slot count is bounded and the state is not")
 	}
 }

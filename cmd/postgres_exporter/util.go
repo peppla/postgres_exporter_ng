@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -188,6 +189,30 @@ func parseFingerprint(url string) (string, error) {
 	}
 
 	return fingerprint, nil
+}
+
+// passwordKeyword matches the password field of a keyword connection string.
+var passwordKeyword = regexp.MustCompile(`(?i)\bpassword\s*=\s*('[^']*'|\S+)`)
+
+// loggableTarget is a probe target with any credential in it removed.
+//
+// The target comes from the request and need not be a name. A URL can carry a
+// password in its user info, a keyword connection string can carry one in a
+// password field, and both arrive through the same parameter. Logging it as
+// given put a password into the log of a request that was refused before it
+// reached a server.
+//
+// A target that carries neither is logged as it is, because an operator
+// reading a refusal wants to know which target it was.
+func loggableTarget(target string) string {
+	if u, err := url.Parse(target); err == nil && u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "PASSWORD_REMOVED")
+		return u.String()
+	}
+	if passwordKeyword.MatchString(target) {
+		return passwordKeyword.ReplaceAllString(target, "password=PASSWORD_REMOVED")
+	}
+	return target
 }
 
 func loggableDSN(dsn string) string {

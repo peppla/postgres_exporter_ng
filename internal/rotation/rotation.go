@@ -30,6 +30,7 @@
 package rotation
 
 import (
+	"strings"
 	"sync"
 )
 
@@ -216,6 +217,44 @@ func (s *Store) ForgetProfile(engine, profile string) int {
 		removed++
 	}
 	return removed
+}
+
+// ForgetContext removes the schedules of one connection context, and returns
+// how many went.
+//
+// For the admission that bounds the probe endpoint's connections. A key's
+// Target is built by joining connection identities with separators, and an
+// identity is fixed-width hexadecimal, so it cannot contain one. Matching
+// whole fields is therefore exact: a context is in a key or it is not, and no
+// identity is a prefix of another.
+func (s *Store) ForgetContext(id string) int {
+	if s == nil || id == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for k := range s.waiting {
+		if !mentions(k.Target, id) {
+			continue
+		}
+		delete(s.waiting, k)
+		removed++
+	}
+	return removed
+}
+
+// mentions says whether a key's target is built from this identity.
+func mentions(target, id string) bool {
+	for _, field := range strings.FieldsFunc(target, func(r rune) bool {
+		return r == ' ' || r == ','
+	}) {
+		if field == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Waiting is how many names a schedule is holding, for the tests that bound
