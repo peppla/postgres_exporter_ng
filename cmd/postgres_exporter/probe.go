@@ -24,6 +24,8 @@ import (
 	"github.com/percona/postgres_exporter/collector"
 	"github.com/percona/postgres_exporter/config"
 	"github.com/percona/postgres_exporter/internal/budget"
+	"github.com/percona/postgres_exporter/internal/slots"
+	"github.com/percona/postgres_exporter/internal/targetid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
@@ -87,6 +89,30 @@ func handleProbe(logger log.Logger, excludeDatabases []string, connSema *semapho
 		}
 
 		// TODO(@sysadmind): Timeout
+
+		// A slot for this connection, taken before any SQL and after the
+		// target has been validated above.
+		//
+		// This endpoint's target comes from the request, so nothing
+		// configures how many distinct connections it will be asked about. It
+		// keeps a schedule and a last-success history per connection, which is
+		// what makes it a Prometheus target rather than a one-off check, and
+		// which is also what grows without a limit here.
+		//
+		// Named by the connection's identity rather than by the target
+		// string, so two spellings of one connection are one slot and a
+		// connection string does not end up in a map key.
+		id, _ := targetid.ID(dsn.GetConnectionString())
+		held, refused, admitted := stores.Slots.Admit(slots.Key{Kind: slots.Context, Name: id})
+		if !admitted {
+			contextsRejected.Inc()
+			level.Warn(logger).Log("msg", "Refused a probe connection", "target", target)
+			http.Error(w, "probe connection refused: every connection slot is held by one that is still being probed, "+refused.Name,
+				http.StatusServiceUnavailable)
+			return
+		}
+		defer held()
+		defer stores.Slots.Sweep()
 
 		tl := log.With(logger, "target", target)
 

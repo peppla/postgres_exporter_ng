@@ -536,3 +536,67 @@ func TestARelationOutlivesOneProfilesRecord(t *testing.T) {
 		t.Error("the record a census could not remove was removed anyway")
 	}
 }
+
+// TestForgettingAProfileLeavesWhatOtherProfilesRead is what a released slot
+// may and may not take with it.
+//
+// A whole-selection record exists because that selection was scraped. A
+// per-collector record is about one collector on one database and is read by
+// every profile that includes that collector, so it belongs to none of them
+// and is bounded by the collectors and the connections instead. The ownership
+// relation stays for the same reason: another profile may still be collecting
+// that connection.
+func TestForgettingAProfileLeavesWhatOtherProfilesRead(t *testing.T) {
+	s := New()
+	const target = "1/app"
+	s.Own("1", target, "app")()
+
+	now := time.Now()
+	going := Selection([]string{"stat_database", "stat_user_tables"})
+	staying := Selection([]string{"stat_database"})
+	mine := Key{Engine: EngineCollector, About: WholeSelection, Target: target, Database: "app", Collector: going}
+	theirs := Key{Engine: EngineCollector, About: WholeSelection, Target: target, Database: "app", Collector: staying}
+	shared := Key{Engine: EngineCollector, Target: target, Database: "app", Collector: "stat_database"}
+	other := Key{Engine: EngineQuery, About: WholeSelection, Target: target, Database: "app", Collector: going}
+	for _, key := range []Key{mine, theirs, shared, other} {
+		s.Record(key, now)
+	}
+
+	if removed := s.ForgetProfile(EngineCollector, going); removed != 1 {
+		t.Errorf("%d records removed, want the one that profile alone was keeping", removed)
+	}
+	if _, ok := s.At(mine); ok {
+		t.Error("the released profile's own record survived")
+	}
+	if _, ok := s.At(theirs); !ok {
+		t.Error("another profile's record went with it")
+	}
+	if _, ok := s.At(shared); !ok {
+		t.Error("a per-collector record, which every profile including that collector reads, went with it")
+	}
+	if _, ok := s.At(other); !ok {
+		t.Error("the other engine's record for the same selection went with it")
+	}
+	if _, ok := s.Owned("1")[target]; !ok {
+		t.Error("the ownership relation went with a profile, leaving live records with no owner")
+	}
+}
+
+// TestAProfileBeingScrapedKeepsItsRecords keeps expiry off work in flight.
+func TestAProfileBeingScrapedKeepsItsRecords(t *testing.T) {
+	s := New()
+	const target = "1/app"
+	release := s.Own("1", target, "app")
+
+	selection := Selection([]string{"stat_database"})
+	key := Key{Engine: EngineCollector, About: WholeSelection, Target: target, Database: "app", Collector: selection}
+	s.Record(key, time.Now())
+
+	if removed := s.ForgetProfile(EngineCollector, selection); removed != 0 {
+		t.Errorf("%d records removed while a request was holding the connection", removed)
+	}
+	release()
+	if removed := s.ForgetProfile(EngineCollector, selection); removed != 1 {
+		t.Errorf("%d records removed once the request finished, want 1", removed)
+	}
+}

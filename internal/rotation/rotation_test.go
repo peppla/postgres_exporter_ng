@@ -397,3 +397,31 @@ func TestASelectionThatCollapsesLeavesNothingWaiting(t *testing.T) {
 		t.Errorf("a selection with nothing in it kept %d schedules", s.Len())
 	}
 }
+
+// TestForgettingAProfileLeavesTheOthers is what a released slot takes with it
+// from this store.
+func TestForgettingAProfileLeavesTheOthers(t *testing.T) {
+	s := New()
+	going, staying := "wide", "narrow"
+	for _, k := range []Key{
+		{Engine: "collector", Target: "1", Profile: going},
+		{Engine: "collector", Target: "2", Profile: going},
+		{Engine: "collector", Target: "1", Profile: staying},
+		{Engine: "query", Target: "1", Profile: going},
+	} {
+		s.Next(k, []string{"a", "b"})
+	}
+	if s.Len() != 4 {
+		t.Fatalf("%d schedules, want 4", s.Len())
+	}
+
+	if removed := s.ForgetProfile("collector", going); removed != 2 {
+		t.Errorf("%d schedules removed, want that profile's two", removed)
+	}
+	if s.Waiting(Key{Engine: "collector", Target: "1", Profile: staying}) == 0 {
+		t.Error("another profile's schedule went with it")
+	}
+	if s.Waiting(Key{Engine: "query", Target: "1", Profile: going}) == 0 {
+		t.Error("the other engine's schedule for the same profile went with it")
+	}
+}

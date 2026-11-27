@@ -192,6 +192,32 @@ func (s *Store) Len() int {
 	return len(s.waiting)
 }
 
+// ForgetProfile removes the schedules one collection profile alone was
+// keeping, and returns how many went.
+//
+// For the admission that bounds the profiles. A schedule exists because a
+// profile is being scraped, and a profile that has stopped being scraped for
+// long enough to lose its slot takes its waiting lists with it. Another
+// profile's schedule over the same connections is a different key and is left
+// alone.
+func (s *Store) ForgetProfile(engine, profile string) int {
+	if s == nil || profile == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for k := range s.waiting {
+		if k.Engine != engine || k.Profile != profile {
+			continue
+		}
+		delete(s.waiting, k)
+		removed++
+	}
+	return removed
+}
+
 // Waiting is how many names a schedule is holding, for the tests that bound
 // this.
 func (s *Store) Waiting(k Key) int {

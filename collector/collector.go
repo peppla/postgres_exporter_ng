@@ -1031,6 +1031,18 @@ func (p PostgresCollector) byScope() (cluster, local map[string]Collector) {
 	return cluster, local
 }
 
+// Profile is the canonical set of database-local collectors this request
+// selected, which is the name its retained per-database state is kept under.
+//
+// Exported so the handler can ask for the slot that state needs before
+// serving the request, which is before any SQL. Empty when nothing
+// database-local was selected, and then there is no per-database state and
+// nothing to admit.
+func (p PostgresCollector) Profile() string {
+	_, local := p.byScope()
+	return selectionOf(local)
+}
+
 // selectionOf is the canonical form of the database-local collectors a request
 // selected, which is the context its database-level freshness belongs to.
 //

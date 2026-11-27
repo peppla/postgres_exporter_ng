@@ -370,6 +370,44 @@ func (s *Store) release(target string) {
 	s.held[target]--
 }
 
+// ForgetProfile removes what one collection profile alone was keeping.
+//
+// For the admission that bounds the profiles nothing else can bound. When a
+// profile stops being scraped for long enough to lose its slot, the records
+// that exist only because it was scraped go with it.
+//
+// Only the whole-selection records of that selection. A per-collector record
+// is about one collector on one database and is read by every profile that
+// includes that collector, so it belongs to none of them and is bounded by the
+// collectors and the connections rather than by the profiles. The ownership
+// relations stay for the same reason: another profile may still be collecting
+// that connection, and a relation removed under a live record is a record
+// nothing owns.
+//
+// It returns how many records it removed.
+func (s *Store) ForgetProfile(engine, selection string) int {
+	if s == nil || selection == "" {
+		return 0
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	removed := 0
+	for key := range s.seen {
+		if key.Engine != engine || key.About != WholeSelection || key.Collector != selection {
+			continue
+		}
+		if s.held[key.Target] > 0 {
+			// A request is working on this connection, and expiry does not
+			// reach work in flight.
+			continue
+		}
+		delete(s.seen, key)
+		removed++
+	}
+	return removed
+}
+
 // Apply records what a complete inventory saw and removes what it proves gone.
 //
 // Both halves are one step under one lock. Between them the store would say a

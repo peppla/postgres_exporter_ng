@@ -23,6 +23,7 @@ import (
 	"github.com/percona/postgres_exporter/internal/lastsuccess"
 	"github.com/percona/postgres_exporter/internal/querycache"
 	"github.com/percona/postgres_exporter/internal/rotation"
+	"github.com/percona/postgres_exporter/internal/slots"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/semaphore"
@@ -73,11 +74,53 @@ type Stores struct {
 	LastSuccess *lastsuccess.Store
 	// Rotation is which selected database is offered the first attempt.
 	Rotation *rotation.Store
+	// Slots admits the collection profiles and probe connections, which are
+	// the two things no catalogue read can bound because a request mints
+	// them.
+	Slots *slots.Store
 }
 
-// NewStores builds the state that outlives a request.
+// NewStores builds the state that outlives a request, with no admission limit
+// configured, so nothing is refused and nothing is released.
 func NewStores() Stores {
-	return Stores{LastSuccess: lastsuccess.New(), Rotation: rotation.New()}
+	return NewStoresWithLimits(slots.Limits{})
+}
+
+// NewStoresWithLimits builds it with the admission limits set.
+//
+// Releasing a profile's slot drops what that profile alone was keeping, which
+// is its whole-selection records and its schedules. Not the per-collector
+// records: those are about one collector on one database and are read by every
+// profile that includes that collector, so they belong to none of them and are
+// bounded by the collectors and the connections instead. Not the ownership
+// relations either, because another profile may still be collecting that
+// connection.
+func NewStoresWithLimits(l slots.Limits) Stores {
+	s := Stores{LastSuccess: lastsuccess.New(), Rotation: rotation.New()}
+	s.Slots = slots.New(l, func(k slots.Key) {
+		if k.Kind != slots.Profile {
+			return
+		}
+		engine, selection, ok := strings.Cut(k.Name, ":")
+		if !ok || selection == "" {
+			return
+		}
+		records := s.LastSuccess.ForgetProfile(engine, selection)
+		schedules := s.Rotation.ForgetProfile(engine, selection)
+		if records > 0 || schedules > 0 {
+			level.Info(logger).Log("msg", "Released a collection profile that stopped being scraped",
+				"engine", engine, "records", records, "schedules", schedules)
+		}
+	})
+	return s
+}
+
+// profileKey names the slot one engine's selection needs.
+//
+// The engine is in the name because the two choose their collectors
+// independently and a selection in one is not a selection in the other.
+func profileKey(engine, selection string) slots.Key {
+	return slots.Key{Kind: slots.Profile, Name: engine + ":" + selection}
 }
 
 func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, limits budget.Limits, gate *semaphore.Weighted, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) http.Handler {
@@ -149,7 +192,7 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 			return
 		}
 
-		registry, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache,
+		registry, needs, err := makeRegistry(ctx, dsns, connSema, globalCollectors, f, limits, queryCache,
 			stores, excludeSelection, includeSelection)
 		if err != nil {
 			// Only a request that named collectors turns a build failure into
@@ -159,6 +202,37 @@ func Handler(logger log.Logger, dsns []string, connSema *semaphore.Weighted, glo
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		// Every slot this request needs, or none of them, and before any SQL.
+		//
+		// A collection profile is whatever set of collectors a request asks
+		// for, so without a limit the state kept behind them grows for as
+		// long as the process runs. A profile that has a slot keeps it until
+		// it stops being asked for; one arriving when every slot is held is
+		// refused here rather than served without the state it needs.
+		//
+		// Refused rather than served, because a profile with no slot has no
+		// schedule either, and a selection that does not fit the budget would
+		// then be offered the same first database on every request. That is
+		// the starvation the schedule exists to prevent, and serving it as a
+		// success would be a path that quietly does not meet the fairness
+		// contract.
+		//
+		// The selection was parsed and the registry built before this, so a
+		// request that was going to be refused for naming an unknown collector
+		// is still refused for that and does not reserve anything.
+		slotsHeld, refused, admitted := stores.Slots.Admit(needs...)
+		if !admitted {
+			profilesRejected.Inc()
+			level.Warn(logger).Log("msg", "Refused a collection profile", "profile", refused.Name)
+			http.Error(w, "collection profile "+refused.Name+" refused: every profile slot is held by a profile that is still being scraped",
+				http.StatusServiceUnavailable)
+			return
+		}
+		defer slotsHeld()
+		// After the holds are given back, so a profile this request was using
+		// is not released while it is still using it.
+		defer stores.Slots.Sweep()
 
 		// Delegate http serving to Prometheus client library, which will call collector.Collect.
 		//
@@ -305,14 +379,18 @@ func (f Filters) postgresCollectors() []string {
 // names came from the request. Everything else is logged and the registry is
 // returned with whatever could be built, which is the behaviour a scrape has
 // always had.
-func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, error) {
+func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weighted, globalCollectors map[string]prometheus.Collector, filters Filters, limits budget.Limits, queryCache *querycache.Cache, stores Stores, excludeSelection, includeSelection dbselect.List) (*prometheus.Registry, []slots.Key, error) {
 	registry := prometheus.NewRegistry()
+	// The profiles this request will keep state under. Collected while the
+	// registry is built, which runs no SQL, so the request can be refused
+	// before it touches a server.
+	var needs []slots.Key
 
 	// Always, whatever was selected. A refused request serves no metrics of
 	// its own, so the count has to reach a scraper through the requests that
 	// were not refused, and the counter is package-level so it survives the
 	// registry being rebuilt per request.
-	registry.MustRegister(collectionRejected)
+	registry.MustRegister(collectionRejected, profilesRejected, contextsRejected)
 
 	excludedDatabases := strings.Split(*excludeDatabases, ",")
 	logger.Log("msg", "Excluded databases", "databases", fmt.Sprintf("%v", excludedDatabases))
@@ -446,14 +524,17 @@ func makeRegistry(ctx context.Context, dsns []string, connSema *semaphore.Weight
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())
 			if len(filters.postgresCollectors()) > 0 {
-				return nil, err
+				return nil, nil, err
 			}
 		} else {
 			registry.MustRegister(pe)
+			if profile := pe.Profile(); profile != "" {
+				needs = append(needs, profileKey(lastsuccess.EngineCollector, profile))
+			}
 		}
 	}
 
-	return registry, nil
+	return registry, needs, nil
 }
 
 func (e *Exporter) loadCustomQueries(ctx context.Context, res MetricResolution, version semver.Version, server *Server) {
@@ -548,6 +629,30 @@ var collectionRejected = prometheus.NewCounter(prometheus.CounterOpts{
 	Subsystem: "exporter",
 	Name:      "collection_requests_rejected_total",
 	Help:      "Collection requests refused because the configured number were already in flight. Refused before any SQL runs, and never queued.",
+})
+
+// profilesRejected counts requests refused because every profile slot was
+// held.
+//
+// Separate from the gate's counter, because the two say different things. The
+// gate says this process is busy right now and the request should be retried.
+// This says the number of distinct collection profiles being scraped is larger
+// than this exporter is configured to keep state for, which retrying does not
+// fix and which an operator has to decide about.
+var profilesRejected = prometheus.NewCounter(prometheus.CounterOpts{
+	Namespace: "pg",
+	Subsystem: "exporter",
+	Name:      "collection_profiles_rejected_total",
+	Help:      "Collection requests refused because every profile slot was held by a profile still being scraped. Refused before any SQL runs.",
+})
+
+// contextsRejected counts probe requests refused because every connection slot
+// was held.
+var contextsRejected = prometheus.NewCounter(prometheus.CounterOpts{
+	Namespace: "pg",
+	Subsystem: "exporter",
+	Name:      "probe_connections_rejected_total",
+	Help:      "Probe requests refused because every connection slot was held by a connection still being probed. Refused before any SQL runs.",
 })
 
 // NewCollectionGate builds the gate that limits how many collections run at

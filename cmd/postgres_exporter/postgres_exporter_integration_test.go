@@ -3501,7 +3501,7 @@ func (s *IntegrationSuite) TestMonitoringDatabaseKeysSelectDatabases(c *C) {
 	c.Assert(err, IsNil)
 
 	limits := budget.Defaults()
-	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+	registry, _, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
 		Filters{EnablePostgresCollector: true}, limits, querycache.New(), NewStores(),
 		excludeSelection, includeSelection)
@@ -3585,7 +3585,7 @@ func (s *IntegrationSuite) TestReplicationCollectorsAgainstServer(c *C) {
 	c.Assert(err, IsNil)
 
 	limits := budget.Defaults()
-	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+	registry, _, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
 		Filters{EnablePostgresCollector: true}, limits, querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
@@ -3708,7 +3708,7 @@ func (s *IntegrationSuite) TestPublicationCollectorCoversEveryDatabase(c *C) {
 	c.Assert(err, IsNil)
 
 	limits := budget.Defaults()
-	registry, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
+	registry, _, err := makeRegistry(context.Background(), strings.Split(dsn, ","),
 		semaphore.NewWeighted(limits.Connections), map[string]prometheus.Collector{},
 		Filters{EnablePostgresCollector: true}, limits, querycache.New(), NewStores(),
 		dbselect.Absent(), dbselect.Absent())
